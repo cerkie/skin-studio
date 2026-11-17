@@ -83,57 +83,92 @@ pub struct SliderGeom {
     pub quads: Vec<Range<u32>>,
     /// Per path point: vertex range of its round cap.
     pub caps: Vec<Range<u32>>,
+    /// Per path point: a cap kept apart from the strip, drawn only when the body is trimmed exactly there.
+    pub extra: Vec<Option<Range<u32>>>,
     /// Per path point: how far along the path it is (0 to 1, by length), so trimming follows the ball exactly.
     pub cum: Vec<f32>,
 }
 
+impl SliderGeom {
+    /// Whether the body can end, rounded, at path point `i`.
+    fn can_end_at(&self, i: usize) -> bool {
+        self.caps[i].start != self.caps[i].end || self.extra[i].is_some()
+    }
+
+    /// The first point at or after `i` that can end the body.
+    fn end_from(&self, mut i: usize) -> usize {
+        while i + 1 < self.caps.len() && !self.can_end_at(i) {
+            i += 1;
+        }
+        i
+    }
+
+    /// The last point at or before `i` that can end the body.
+    fn end_before(&self, mut i: usize) -> usize {
+        while i > 0 && !self.can_end_at(i) {
+            i -= 1;
+        }
+        i
+    }
+}
+
 fn build_geom(pts: &[P], origin: P, radius: f32) -> SliderGeom {
     // thin out nearly collinear dense points so long sliders stay cheap
-    let mut keep: Vec<P> = vec![pts[0]];
+    let mut orig: Vec<P> = vec![pts[0]];
     for p in &pts[1..pts.len() - 1] {
-        let l = keep.last().unwrap();
+        let l = orig.last().unwrap();
         if (p[0] - l[0]).hypot(p[1] - l[1]) >= 1.5 {
-            keep.push(*p);
+            orig.push(*p);
         }
     }
-    keep.push(*pts.last().unwrap());
-    // long straight stretches get extra points, so the body can be trimmed close to the ball
-    let mut dense: Vec<P> = vec![keep[0]];
-    for w2 in keep.windows(2) {
+    orig.push(*pts.last().unwrap());
+    // Long straight stretches get extra points so the body can be trimmed close to the ball. Those points carry no cap in the
+    // main strip (caps spaced along a straight edge would scallop the outline); every fourth one has a spare cap that is
+    // drawn on its own when the body is trimmed exactly there.
+    struct Pt {
+        p: P,
+        orig: bool,
+        spare_cap: bool,
+    }
+    let mut keep: Vec<Pt> = vec![Pt { p: orig[0], orig: true, spare_cap: false }];
+    for w2 in orig.windows(2) {
         let l = (w2[1][0] - w2[0][0]).hypot(w2[1][1] - w2[0][1]);
         let n = (l / 3.5).ceil().max(1.0) as usize;
         for k in 1..=n {
             let u = k as f32 / n as f32;
-            dense.push([w2[0][0] + (w2[1][0] - w2[0][0]) * u, w2[0][1] + (w2[1][1] - w2[0][1]) * u]);
+            keep.push(Pt { p: [w2[0][0] + (w2[1][0] - w2[0][0]) * u, w2[0][1] + (w2[1][1] - w2[0][1]) * u], orig: k == n, spare_cap: k < n && k % 4 == 0 });
         }
     }
-    let keep = dense;
     let mut cum = vec![0.0f32];
     for w2 in keep.windows(2) {
-        cum.push(cum.last().unwrap() + (w2[1][0] - w2[0][0]).hypot(w2[1][1] - w2[0][1]));
+        cum.push(cum.last().unwrap() + (w2[1].p[0] - w2[0].p[0]).hypot(w2[1].p[1] - w2[0].p[1]));
     }
     let total = cum.last().copied().unwrap_or(1.0).max(1e-6);
     for c in cum.iter_mut() {
         *c /= total;
     }
     let w = |p: P| [p[0] + origin[0], p[1] + origin[1]];
-    let mut g = SliderGeom { verts: vec![], quads: vec![], caps: vec![], cum };
+    let mut g = SliderGeom { verts: vec![], quads: vec![], caps: vec![], extra: vec![], cum };
     // a circumscribed polygon: the flat sides sit exactly on the circle, so caps meet the strips without notches
-    for (i, p) in keep.iter().enumerate() {
-        // the two ends are round for good; the points between only matter when the body is trimmed to the ball
-        let CAP: usize = if i == 0 || i + 1 == keep.len() { 48 } else { 32 };
-        let rim = radius / (std::f32::consts::PI / CAP as f32).cos();
-        let c = w(*p);
-        let s = g.verts.len() as u32;
+    const CAP: usize = 48;
+    let rim = radius / (std::f32::consts::PI / CAP as f32).cos();
+    let cap_verts = |c: P, out: &mut Vec<[f32; 3]>| {
         for k in 0..CAP {
             let (a0, a1) = (k as f32 / CAP as f32 * std::f32::consts::TAU, (k + 1) as f32 / CAP as f32 * std::f32::consts::TAU);
-            g.verts.push([c[0], c[1], 0.0]);
-            g.verts.push([c[0] + rim * (a0 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a0 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
-            g.verts.push([c[0] + rim * (a1 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a1 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
+            out.push([c[0], c[1], 0.0]);
+            out.push([c[0] + rim * (a0 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a0 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
+            out.push([c[0] + rim * (a1 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a1 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
+        }
+    };
+    for (i, pt) in keep.iter().enumerate() {
+        let c = w(pt.p);
+        let s = g.verts.len() as u32;
+        if pt.orig {
+            cap_verts(c, &mut g.verts);
         }
         g.caps.push(s..g.verts.len() as u32);
         if i + 1 < keep.len() {
-            let (a, b) = (w(*p), w(keep[i + 1]));
+            let (a, b) = (w(pt.p), w(keep[i + 1].p));
             let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
             let l = dx.hypot(dy).max(1e-6);
             let (nx, ny) = (-dy / l * radius, dx / l * radius);
@@ -144,6 +179,16 @@ fn build_geom(pts: &[P], origin: P, radius: f32) -> SliderGeom {
                 g.verts.push(v(p, off, d));
             }
             g.quads.push(s..g.verts.len() as u32);
+        }
+    }
+    // the spare caps, after everything else
+    for pt in &keep {
+        if pt.spare_cap {
+            let s = g.verts.len() as u32;
+            cap_verts(w(pt.p), &mut g.verts);
+            g.extra.push(Some(s..g.verts.len() as u32));
+        } else {
+            g.extra.push(None);
         }
     }
     g
@@ -561,14 +606,14 @@ impl Scene {
                         let nseg = g.quads.len();
                         let snake_in = frac(t, appear, appear + self.preempt / 3.0);
                         let mut from = 0usize;
-                        let mut to = g.cum.partition_point(|&c| c < snake_in).min(nseg);
+                        let mut to = g.end_from(g.cum.partition_point(|&c| c < snake_in).min(nseg));
                         if t >= o.time {
                             to = nseg;
                             let total = s.span_duration * s.slides as f32;
                             let prog = ((t - o.time) / total).clamp(0.0, 1.0) * s.slides as f32;
                             if s.slides % 2 == 1 && prog >= (s.slides - 1) as f32 && t <= end {
                                 let at = prog - (s.slides - 1) as f32;
-                                from = g.cum.partition_point(|&c| c <= at).saturating_sub(1).min(nseg.saturating_sub(1));
+                                from = g.end_before(g.cum.partition_point(|&c| c <= at).saturating_sub(1).min(nseg.saturating_sub(1)));
                             }
                         }
                         if t > end {

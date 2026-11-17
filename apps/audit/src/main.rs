@@ -71,7 +71,7 @@ fn main() {
         if name == "Custom image..." {
             continue;
         }
-        let mut s = presets::default_settings();
+        let mut s = presets::base_settings();
         s["fps"] = json!(60);
         s["props"]["x"] = json!([[0, 0.2, "linear"], ["end", 0.8, "linear"]]);
         engine_set_source(&mut s, name);
@@ -83,7 +83,7 @@ fn main() {
     for (page, chunk) in names.chunks(8).enumerate() {
         let mut rows = Vec::new();
         for (i, name) in chunk.iter().enumerate() {
-            let mut s = presets::default_settings();
+            let mut s = presets::base_settings();
             s["fps"] = json!(60);
             presets::apply_effect(&mut s, name);
             println!("effect {}: {name} canvas {}x{}", page * 8 + i, s["width"], s["height"]);

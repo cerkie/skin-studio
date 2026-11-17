@@ -61,6 +61,8 @@ impl<S: rodio::Source<Item = f32>> rodio::Source for CountSrc<S> {
 }
 
 struct Audio {
+    /// The player's speed. A seek is requested in output time (the player multiplies it by the speed), the song position is not.
+    speed: f32,
     /// Eases the sound in after a map starts (and a seek or speed change), so there is no click.
     born: std::time::Instant,
     gain: f32,
@@ -193,7 +195,7 @@ impl Audio {
         let ms = ms.max(0.0);
         self.count.store((ms as f64 / 1000.0 * self.per_sec) as u64, std::sync::atomic::Ordering::Relaxed);
         self.ignore_until = std::time::Instant::now() + Duration::from_millis(250);
-        let _ = self.player.try_seek(Duration::from_secs_f32(ms / 1000.0));
+        let _ = self.player.try_seek(Duration::from_secs_f32(ms / 1000.0 / self.speed.max(0.05)));
     }
 
     fn seek_events(&mut self, t: f32) {
@@ -238,9 +240,8 @@ fn open_audio(map: &Beatmap, samples: std::collections::HashMap<String, Sample>,
     let file = std::fs::File::open(&path).map_err(|e| eprintln!("audio: {}: {e}", path.display())).ok()?;
     let dec = rodio::Decoder::try_from(file).map_err(|e| eprintln!("audio: cannot decode {}: {e}", path.display())).ok()?;
     let player = rodio::Player::connect_new(sink.mixer());
-    // silent and paused until the first frame: seeking a playing decoder lets a burst of the song's first samples out
+    // silent while it seeks, so any burst of the song's first samples is not heard; the gain then fades in
     player.set_volume(0.0);
-    player.pause();
     let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     use rodio::Source as _;
     let per_sec = dec.sample_rate().get() as f64 * dec.channels().get() as f64;
@@ -250,7 +251,7 @@ fn open_audio(map: &Beatmap, samples: std::collections::HashMap<String, Sample>,
             eprintln!("audio: seek failed ({e:?})");
         }
     }
-    let mut a = Audio { born: std::time::Instant::now(), gain: 0.0, ignore_until: std::time::Instant::now(), count, per_sec, sink, player, samples, volume, events, next_event: 0, loops, active: None };
+    let mut a = Audio { speed: 1.0, born: std::time::Instant::now(), gain: 0.0, ignore_until: std::time::Instant::now(), count, per_sec, sink, player, samples, volume, events, next_event: 0, loops, active: None };
     a.set_volume(volume);
     a.seek_events(start_ms);
     a.player.play();
@@ -405,8 +406,10 @@ impl Session {
         let (n_events, n_loops) = (events.len(), loops.len());
         let clock0 = cfg.resume.map(|(c, _)| c.clamp(start_ms, end_ms)).unwrap_or(start_ms);
         let audio = if cfg.audio { open_audio(&map, samples, events, loops, (clock0 - cfg.offset_ms).max(0.0), cfg.volume) } else { None };
-        if let Some(a) = &audio {
+        let mut audio = audio;
+        if let Some(a) = &mut audio {
             a.player.set_speed(cfg.speed.clamp(0.05, 4.0));
+            a.speed = cfg.speed.clamp(0.05, 4.0);
         }
         let info = format!(
             "{} [{}] | skin {} | {} objects | loaded in {:.0} ms | audio {}",
@@ -523,8 +526,9 @@ impl Session {
     /// Play slower or faster; the music follows (and changes pitch with it, as it does with half or double time).
     pub fn set_speed(&mut self, speed: f32) {
         self.speed = speed.clamp(0.05, 4.0);
-        if let Some(a) = &self.audio {
+        if let Some(a) = &mut self.audio {
             a.player.set_speed(self.speed);
+            a.speed = self.speed;
         }
         self.seek_audio();
     }

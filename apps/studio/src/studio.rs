@@ -18,27 +18,21 @@ use crate::state::{self, HistoryEntry};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
-    Effect,
-    Source,
+    Animation,
     Timing,
     Motion,
-    Color,
-    Finish,
+    Look,
     Preview,
-    History,
-    Import,
+    Export,
 }
 
-pub const TABS: [(Tab, &str); 9] = [
-    (Tab::Effect, "Effect"),
-    (Tab::Source, "Source"),
+pub const TABS: [(Tab, &str); 6] = [
+    (Tab::Animation, "Animation"),
     (Tab::Timing, "Timing"),
     (Tab::Motion, "Motion"),
-    (Tab::Color, "Color"),
-    (Tab::Finish, "Finish"),
+    (Tab::Look, "Look"),
     (Tab::Preview, "Preview"),
-    (Tab::History, "History"),
-    (Tab::Import, "Import"),
+    (Tab::Export, "Export"),
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -137,7 +131,7 @@ impl Studio {
             atlas: None,
             atlas_gen: 0,
             skins,
-            tab: Tab::Effect,
+            tab: Tab::Animation,
             bufs: HashMap::new(),
             status: String::new(),
             status_shown: String::new(),
@@ -512,7 +506,7 @@ impl Studio {
             self.path = None;
             self.bufs.clear();
             self.edited();
-            self.tab = Tab::Effect;
+            self.tab = Tab::Animation;
         }
     }
 
@@ -522,7 +516,7 @@ impl Studio {
             self.path = None;
             self.bufs.clear();
             self.edited();
-            self.tab = Tab::Effect;
+            self.tab = Tab::Animation;
         }
     }
 

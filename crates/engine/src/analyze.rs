@@ -380,7 +380,7 @@ fn infer_seamless(frames: &[Img], ratio: usize, fps: f32, notes: &mut Vec<String
     let amax = frames[ip].px.iter().map(|p| p[3]).fold(0.0, f32::max).min(0.999);
     let t0_full = (400.0 * amax).max(350.0);
     let t_on = vis[0] as f32 * flen;
-    let mut st = presets::default_settings();
+    let mut st = presets::base_settings();
     let o = st.as_object_mut().unwrap();
     o.insert("preset".into(), json!(SEAMLESS));
     o.insert("sl_cs".into(), json!((cs * 100.0).round() / 100.0));
@@ -459,7 +459,7 @@ fn infer_classic(frames: &[Img], ratio: usize, fps: f32, notes: &mut Vec<String>
     errs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     let second = errs.get(1).map(|e| e.1).unwrap_or(9.0);
     let chosen = errs.first().filter(|b| b.1 < 0.3 && (b.1 < 0.1 || second > 1.35 * b.1)).cloned();
-    let mut st = presets::default_settings();
+    let mut st = presets::base_settings();
     let mut custom = None;
     let nat_stats: Stats;
     match chosen {

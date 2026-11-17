@@ -17,13 +17,19 @@ pub fn easings() -> Vec<String> {
     data()["easings"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
+/// The settings a new session starts from: the baked-in default animation.
 pub fn default_settings() -> Value {
+    data()["startup"].clone()
+}
+
+/// Neutral settings (a static line): what missing keys and effect presets are built on.
+pub fn base_settings() -> Value {
     data()["default"].clone()
 }
 
 /// Sources the editor offers, in order: drawn presets, the seamless line, a custom image.
 pub fn source_names() -> Vec<String> {
-    let mut v: Vec<String> = crate::sources::NAMES.iter().map(|s| s.to_string()).collect();
+    let mut v: Vec<String> = crate::sources::OFFERED.iter().map(|s| s.to_string()).collect();
     v.push(crate::settings::SEAMLESS.to_string());
     v.push("Custom image...".to_string());
     v
@@ -32,8 +38,14 @@ pub fn source_names() -> Vec<String> {
 /// Apply an effect preset on top of the property defaults (the Python `apply_effect`).
 pub fn apply_effect(s: &mut Value, name: &str) {
     let Some(e) = data()["effects"].get(name) else { return };
-    let d = default_settings();
+    let d = base_settings();
     let obj = s.as_object_mut().expect("settings object");
+    // every preset brings its own timing, so nothing is kept from the one before
+    for k in ["speed", "shift", "lead", "tail", "disappear", "duration", "copies", "no_loop"] {
+        if let Some(v) = d.get(k) {
+            obj.insert(k.into(), v.clone());
+        }
+    }
     let mut props = d["props"].clone();
     if let Some(p) = e["props"].as_object() {
         for (k, v) in p {

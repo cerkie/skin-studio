@@ -18,7 +18,7 @@ pub const PROPS: [(&str, &str); 7] = [
 
 /// Files saved by older versions of the Python tool name sources that no longer exist.
 pub fn migrate(mut s: Value) -> Value {
-    let mut merged = presets::default_settings();
+    let mut merged = presets::base_settings();
     if let (Some(m), Some(o)) = (merged.as_object_mut(), s.as_object_mut()) {
         for (k, v) in o.iter() {
             m.insert(k.clone(), v.clone());
@@ -28,7 +28,8 @@ pub fn migrate(mut s: Value) -> Value {
     if let Some(p) = s["preset"].as_str().map(String::from) {
         let newp = match p.as_str() {
             "Thin line" | "Thick line" | "Soft glow line" | "Dashed line" | "Dotted line" | "Double line" | "Tapered line" | "Fade-edge line" | "Comet" => Some(engine::settings::SEAMLESS),
-            "Arrow chain" => Some("Arrow"),
+            "Arrow chain" => Some("Chevron (bold)"),
+            "Seamless line (CS-matched)" => Some(engine::settings::SEAMLESS),
             "Dot chain" => Some("Dot"),
             _ => None,
         };
@@ -58,7 +59,7 @@ pub fn fmt_num(v: &Value) -> String {
 
 /// Set one top-level setting from the text a field produced, keeping the type of the default.
 pub fn set_field(s: &mut Value, id: &str, text: &str) -> bool {
-    let def = presets::default_settings();
+    let def = presets::base_settings();
     let Some(d) = def.get(id) else { return false };
     let new = match d {
         Value::Bool(_) => json!(text == "1"),

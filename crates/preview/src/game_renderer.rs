@@ -376,10 +376,19 @@ impl GameRenderer {
                         let v1 = self.base[s.geom] + g.caps[last].end;
                         pass.set_vertex_buffer(0, self.verts.slice(..));
                         pass.set_vertex_buffer(1, self.slider_insts.slice(..));
-                        pass.set_pipeline(&self.prepass_pipe);
-                        pass.draw(v0..v1, *si as u32..*si as u32 + 1);
-                        pass.set_pipeline(&self.body_pipe);
-                        pass.draw(v0..v1, *si as u32..*si as u32 + 1);
+                        // the strip, then the spare caps where the body is trimmed to a point that has none in the strip
+                        let mut ranges = vec![v0..v1];
+                        for i in [first, last] {
+                            if let Some(Some(x)) = g.extra.get(i) {
+                                ranges.push(self.base[s.geom] + x.start..self.base[s.geom] + x.end);
+                            }
+                        }
+                        for pipe in [&self.prepass_pipe, &self.body_pipe] {
+                            pass.set_pipeline(pipe);
+                            for r in &ranges {
+                                pass.draw(r.clone(), *si as u32..*si as u32 + 1);
+                            }
+                        }
                     }
                 }
             }

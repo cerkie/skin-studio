@@ -58,7 +58,9 @@ pub struct Settings {
 /// No animation needs more than the 1000 fps the preview targets; higher values only cost memory.
 pub const MAX_FPS: f32 = 1000.0;
 
-pub const SEAMLESS: &str = "Seamless line (CS-matched)";
+pub const SEAMLESS: &str = "Seamless line";
+/// The name older settings files use for the seamless line.
+const SEAMLESS_OLD: &str = "Seamless line (CS-matched)";
 
 fn f(v: &Value, k: &str, d: f32) -> f32 {
     v.get(k).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d)
@@ -108,7 +110,7 @@ impl Settings {
             ];
         }
         Settings {
-            preset: s(v, "preset", "Arrow"),
+            preset: { let p = s(v, "preset", "Chevron (bold)"); if p == SEAMLESS_OLD { SEAMLESS.to_string() } else { p } },
             image: s(v, "image", ""),
             fps: f(v, "fps", 60.0).clamp(1.0, MAX_FPS),
             speed: f(v, "speed", 1.0),

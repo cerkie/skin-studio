@@ -17,6 +17,10 @@ pub const NAMES: [&str; 11] = [
     "Spark (glow dot)", "Tick (bar)",
 ];
 
+/// The sources the editor offers. (`NAMES` also holds the older arrow shapes and the spark, which are still drawn for old
+/// settings files and recognised when importing.)
+pub const OFFERED: [&str; 8] = ["Chevron (thin)", "Chevron (bold)", "Double chevron", "Triangle", "Dot", "Diamond", "Ring", "Tick (bar)"];
+
 /// Default canvas (1x design px) for each source, as in the Python tool.
 pub fn default_canvas(name: &str) -> (usize, usize) {
     match name {

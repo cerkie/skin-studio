@@ -164,7 +164,7 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
         ui.scope_builder(egui::UiBuilder::new().max_rect(side), |ui| {
             ui.add_space(10.0);
             for (tab, name) in TABS {
-                let icon = TABS.iter().position(|(t, _)| *t == tab).unwrap_or(0);
+                let icon = match tab { Tab::Animation => 0, Tab::Timing => 2, Tab::Motion => 3, Tab::Look => 4, Tab::Preview => 6, Tab::Export => 8 };
                 if th::sidebar_item(ui, name, icon, st.tab == tab && st.search.trim().is_empty()).clicked() {
                     st.tab = tab;
                     st.search.clear();
@@ -177,22 +177,19 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
         ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_width(body.width());
-                ui.spacing_mut().item_spacing = Vec2::new(0.0, 10.0);
+                ui.spacing_mut().item_spacing = Vec2::new(0.0, 8.0);
                 if !st.search.trim().is_empty() {
                     search_results(ui, st);
                     return;
                 }
                 th::section_header(ui, TABS.iter().find(|(t, _)| *t == st.tab).map(|(_, n)| *n).unwrap_or(""));
                 match st.tab {
-                    Tab::Effect => tab_effect(ui, st),
-                    Tab::Source => tab_source(ui, st),
+                    Tab::Animation => tab_animation(ui, st),
                     Tab::Timing => tab_timing(ui, st),
                     Tab::Motion => tab_motion(ui, st),
-                    Tab::Color => tab_color(ui, st),
-                    Tab::Finish => tab_finish(ui, st),
+                    Tab::Look => tab_look(ui, st),
                     Tab::Preview => tab_preview(ui, st, out),
-                    Tab::History => tab_history(ui, st),
-                    Tab::Import => tab_import(ui, st),
+                    Tab::Export => tab_export(ui, st),
                 }
                 ui.add_space(40.0);
             });
@@ -533,14 +530,14 @@ fn choice(ui: &mut Ui, st: &mut Studio, id: &str, label: &str, items: &[&str]) {
 // ------------------------------------------------------------------------------------------------ tabs
 /// Every setting a search can find, and the tab it lives on.
 const SEARCHABLE: &[(Tab, &str)] = &[
-    (Tab::Effect, "Start from an effect"), (Tab::Effect, "Source image"), (Tab::Effect, "Custom image"),
-    (Tab::Source, "Canvas width"), (Tab::Source, "Canvas height"), (Tab::Source, "Seamless line"), (Tab::Source, "Circle size CS"), (Tab::Source, "Approach rate AR"), (Tab::Source, "Soften"), (Tab::Source, "Tightness"), (Tab::Source, "Thickness"), (Tab::Source, "Tile overlap"),
-    (Tab::Timing, "Frame rate fps"), (Tab::Timing, "Speed"), (Tab::Timing, "Appear after"), (Tab::Timing, "Disappear at"), (Tab::Timing, "Blank at the end"), (Tab::Timing, "Fade in"), (Tab::Timing, "Fade out"), (Tab::Timing, "Copies in a row"), (Tab::Timing, "Play forward and back"), (Tab::Timing, "Play once"), (Tab::Timing, "Export sizes 1x 2x"),
+    (Tab::Animation, "Start from an effect preset"), (Tab::Animation, "Source image"), (Tab::Animation, "Custom image"), (Tab::Animation, "Canvas width"), (Tab::Animation, "Canvas height"),
+    (Tab::Animation, "Seamless line"), (Tab::Animation, "Circle size CS"), (Tab::Animation, "Approach rate AR"), (Tab::Animation, "Soften"), (Tab::Animation, "Tightness"), (Tab::Animation, "Thickness"), (Tab::Animation, "Tile overlap"),
+    (Tab::Timing, "Frame rate fps"), (Tab::Timing, "Speed"), (Tab::Timing, "Time shift"), (Tab::Timing, "Fit the speed to the window"), (Tab::Timing, "Appear after"), (Tab::Timing, "Disappear at"), (Tab::Timing, "Blank at the end"),
+    (Tab::Timing, "Fade in"), (Tab::Timing, "Fade out"), (Tab::Timing, "Copies in a row"), (Tab::Timing, "Play forward and back"), (Tab::Timing, "Play once"),
     (Tab::Motion, "Position keyframes"), (Tab::Motion, "Scale keyframes"), (Tab::Motion, "Rotation keyframes"), (Tab::Motion, "Opacity keyframes"), (Tab::Motion, "Blur keyframes"), (Tab::Motion, "Easing"),
-    (Tab::Color, "Color keys"), (Tab::Color, "Add a color"), (Tab::Color, "Color animation"),
-    (Tab::Finish, "Outline"), (Tab::Finish, "Outline color"), (Tab::Finish, "Drop shadow"), (Tab::Finish, "Shadow blur"), (Tab::Finish, "Debanding"), (Tab::Finish, "Grain dither"),
-    (Tab::Preview, "Skin"), (Tab::Preview, "Hit sounds"), (Tab::Preview, "Map"), (Tab::Preview, "Random maps lazer stable library"), (Tab::Preview, "Interface font"), (Tab::Preview, "Hit lighting"), (Tab::Preview, "Sound"), (Tab::Preview, "Volume"), (Tab::Preview, "Music offset"), (Tab::Preview, "Playback speed"), (Tab::Preview, "Cursor size"),
-    (Tab::History, "History saved versions"), (Tab::Import, "Import followpoint images"),
+    (Tab::Look, "Color keys tint"), (Tab::Look, "Add a color"), (Tab::Look, "Outline"), (Tab::Look, "Outline color"), (Tab::Look, "Drop shadow"), (Tab::Look, "Shadow blur"), (Tab::Look, "Debanding"), (Tab::Look, "Grain dither"),
+    (Tab::Preview, "Skin"), (Tab::Preview, "Hit sounds"), (Tab::Preview, "Map"), (Tab::Preview, "Random maps lazer stable library"), (Tab::Preview, "Hit lighting"), (Tab::Preview, "Sound"), (Tab::Preview, "Volume"), (Tab::Preview, "Music offset"), (Tab::Preview, "Playback speed"), (Tab::Preview, "Cursor size"),
+    (Tab::Export, "Export sizes 1x 2x"), (Tab::Export, "Export images"), (Tab::Export, "History saved versions"), (Tab::Export, "Import followpoint images"),
 ];
 
 fn search_results(ui: &mut Ui, st: &mut Studio) {
@@ -569,15 +566,15 @@ fn search_results(ui: &mut Ui, st: &mut Studio) {
     }
 }
 
-fn tab_effect(ui: &mut Ui, st: &mut Studio) {
-    th::note(ui, "Pick a ready-made animation to start from. Everything after it is yours to change, and the view shows each change as you make it.");
+fn tab_animation(ui: &mut Ui, st: &mut Studio) {
+    th::note(ui, "Pick a ready-made animation to start from. Each one brings its own timing, and everything after it is yours to change.");
     let list = presets::effect_names();
     if let Some(i) = th::dropdown_row(ui, "effect", "Start from an effect", "Choose an effect...", &list) {
         st.apply_effect(&list[i].clone());
     }
-    ui.add_space(6.0);
+    th::subsection_header(ui, "Source");
     let sources = presets::source_names();
-    let cur = st.settings["preset"].as_str().unwrap_or("Arrow").to_string();
+    let cur = st.settings["preset"].as_str().unwrap_or("Chevron (bold)").to_string();
     if let Some(i) = th::dropdown_row(ui, "source", "Source image", &cur, &sources) {
         st.set_source(&sources[i].clone());
     }
@@ -588,10 +585,6 @@ fn tab_effect(ui: &mut Ui, st: &mut Studio) {
             st.pick(PickKind::CustomImage);
         }
     }
-}
-
-fn tab_source(ui: &mut Ui, st: &mut Studio) {
-    th::subsection_header(ui, "Canvas");
     num(ui, st, "width", "Canvas width (px)");
     num(ui, st, "height", "Canvas height (px)");
     if st.is_seamless() {
@@ -604,9 +597,11 @@ fn tab_source(ui: &mut Ui, st: &mut Studio) {
 }
 
 fn tab_timing(ui: &mut Ui, st: &mut Studio) {
-    for (id, l) in [("fps", "Frame rate (fps, at most 1000)"), ("speed", "Speed (1 = as designed)"), ("shift", "Time shift (ms: + starts further in, - holds the first pose)"), ("lead", "Appear after (ms)"), ("disappear", "Disappear at (ms, 0 = never)"), ("tail", "Blank at the end (ms)"), ("fade_in", "Fade in (ms)"), ("fade_out", "Fade out (ms)"), ("copies", "Copies in a row")] {
-        num(ui, st, id, l);
-    }
+    th::subsection_header(ui, "Playback");
+    num(ui, st, "fps", "Frame rate (fps, at most 1000)");
+    num(ui, st, "speed", "Speed multiplier (1 = as designed)");
+    duration_row(ui, st);
+    num(ui, st, "shift", "Time shift (ms; - waits, + skips ahead)");
     if th::button_wide(ui, "Set speed to fit the window", Kind::Dark, true).clicked() {
         // the whole animation between "Appear after" and "Disappear at"
         let s = engine::settings::Settings::from_json(&st.settings);
@@ -619,10 +614,36 @@ fn tab_timing(ui: &mut Ui, st: &mut Studio) {
             st.bufs.remove("speed");
         }
     }
+    th::subsection_header(ui, "Window");
+    for (id, l) in [("lead", "Appear after (ms)"), ("disappear", "Disappear at (ms, 0 = never)"), ("tail", "Blank at the end (ms)"), ("fade_in", "Fade in (ms)"), ("fade_out", "Fade out (ms)")] {
+        num(ui, st, id, l);
+    }
+    choice(ui, st, "window_mode", "Appear / disappear window", &["shift", "clamp"]);
+    th::subsection_header(ui, "Repeat");
+    num(ui, st, "copies", "Copies in a row");
     toggle(ui, st, "pingpong", "Play forward and back");
     toggle(ui, st, "no_loop", "Play once (pad to a point's life)");
-    choice(ui, st, "window_mode", "Appear / disappear window", &["shift", "clamp"]);
-    choice(ui, st, "export", "Export sizes", &["1x", "2x", "both"]);
+}
+
+/// The animation's total length in ms. It is the designed length divided by the speed multiplier, so typing a length sets the
+/// speed multiplier that gives it.
+fn duration_row(ui: &mut Ui, st: &mut Studio) {
+    let s = engine::settings::Settings::from_json(&st.settings);
+    let cur = format!("{}", (s.real_length() * 10.0).round() / 10.0);
+    let buf = st.bufs.entry("total_duration".to_string()).or_insert_with(|| cur.clone());
+    let resp = th::text_row(ui, "total_duration", "Total duration (ms)", buf);
+    let text = buf.clone();
+    if resp.changed() {
+        if let Ok(v) = text.trim().parse::<f32>() {
+            if v > 0.0 {
+                let speed = format!("{:.4}", s.design_length() / v);
+                st.set_field("speed", &speed);
+                st.bufs.remove("speed");
+            }
+        }
+    } else if !resp.has_focus() && text != cur {
+        st.bufs.insert("total_duration".to_string(), cur);
+    }
 }
 
 fn tab_motion(ui: &mut Ui, st: &mut Studio) {
@@ -703,6 +724,12 @@ fn key_row(ui: &mut Ui, st: &mut Studio, pid: &str, i: usize, k: &Value) {
         st.bufs.clear();
         st.edited();
     }
+}
+
+fn tab_look(ui: &mut Ui, st: &mut Studio) {
+    th::subsection_header(ui, "Color");
+    tab_color(ui, st);
+    tab_finish(ui, st);
 }
 
 fn tab_color(ui: &mut Ui, st: &mut Studio) {
@@ -832,7 +859,6 @@ fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
     if th::button_wide(ui, "Browse for a skin...", Kind::Purple, true).clicked() {
         st.pick(PickKind::Skin);
     }
-    ui.add_space(6.0);
     th::note(ui, &format!("Hit sounds come from: {}", if st.cfg.sound_skin.is_empty() { "the skin itself (Argon Pro has none of its own)".to_string() } else { crate::studio::label(&st.cfg.sound_skin) }));
     if th::button_wide(ui, "Choose a skin for hit sounds...", Kind::Dark, true).clicked() {
         st.pick(PickKind::SoundSkin);
@@ -849,11 +875,9 @@ fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
     if th::button_wide(ui, "Pick another random map", Kind::Purple, true).clicked() {
         st.new_map();
     }
-    ui.add_space(4.0);
     if th::button_wide(ui, "Choose a .osu, .osz or .olz file...", Kind::Dark, true).clicked() {
         st.pick(PickKind::Map);
     }
-    ui.add_space(4.0);
     if th::button_wide(ui, "Choose the Songs folder...", Kind::Dark, true).clicked() {
         st.pick(PickKind::Songs);
     }
@@ -901,7 +925,6 @@ fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
                 st.bufs.remove("offset_ms");
                 out.offset = Some(st.cfg.offset_ms);
             }
-            ui.add_space(6.0);
         }
         if th::button(ui, "Reset", Kind::Dark, true).clicked() {
             st.cfg.offset_ms = 0.0;
@@ -910,7 +933,6 @@ fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
             out.offset = Some(0.0);
         }
     });
-    ui.add_space(6.0);
     let mut sp = (st.cfg.speed - 0.1) / 1.9;
     if th::slider_row(ui, "speedrow", "Playback speed", &format!("{}x", fmt_speed(st.cfg.speed)), &mut sp) {
         st.cfg.speed = (((0.1 + sp * 1.9) * 20.0).round() / 20.0).clamp(0.1, 2.0);
@@ -926,12 +948,23 @@ fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
     th::note(ui, "The music offset moves the song against the map; hit sounds stay on the objects. Space pauses, left and right seek 5 seconds, up and down change the volume. Click the view to pause.");
 }
 
+fn tab_export(ui: &mut Ui, st: &mut Studio) {
+    th::subsection_header(ui, "Export");
+    choice(ui, st, "export", "Export sizes", &["1x", "2x", "both"]);
+    if th::button_wide(ui, "Export images...", Kind::Purple, true).clicked() {
+        st.export();
+    }
+    th::subsection_header(ui, "History");
+    tab_history(ui, st);
+    th::subsection_header(ui, "Import");
+    tab_import(ui, st);
+}
+
 fn tab_history(ui: &mut Ui, st: &mut Studio) {
     th::note(ui, "Every save and export is remembered, so the settings behind a set of images are never lost.");
     if th::button_wide(ui, "Save the current settings to history", Kind::Purple, true).clicked() {
         st.add_history();
     }
-    ui.add_space(6.0);
     let items = st.history.clone();
     for h in items {
         let width = ui.available_width() - 22.0;
@@ -965,7 +998,6 @@ fn tab_import(ui: &mut Ui, st: &mut Studio) {
     if th::button_wide(ui, "Choose the folder...", Kind::Purple, true).clicked() {
         st.pick(PickKind::ImportDir);
     }
-    ui.add_space(4.0);
     let mut fps = std::mem::take(&mut st.import.fps);
     th::text_row(ui, "import_fps", "Frame rate (leave empty to work it out)", &mut fps);
     st.import.fps = fps;
@@ -973,11 +1005,9 @@ fn tab_import(ui: &mut Ui, st: &mut Studio) {
         st.run_import();
     }
     if !st.import.report.is_empty() {
-        ui.add_space(6.0);
         let r = st.import.report.clone();
         th::note(ui, &r);
     }
-    ui.add_space(6.0);
     if th::button_wide(ui, "Use these settings in the editor", Kind::Purple, st.import.result.is_some()).clicked() {
         st.use_import();
     }
