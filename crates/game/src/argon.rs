@@ -183,8 +183,13 @@ pub fn add_to_sheet(sheet: &mut Sheet, scale: f32, ss: f32) {
     put(sheet, "ar_jring_s", 9.0, 9.0, d * 2.0, &|x, y| white(ring(4.5, 4.0f32.min(4.5), x, y)));
     put(sheet, "ar_jring_l", 14.0, 14.0, d * 2.0, &|x, y| white(ring(7.0, 4.0, x, y)));
     // lazer's own texture: the edge piece of a repeat arrow (shown 110 units across)
-    // the Argon trail has no texture of its own in lazer: it draws a plain white pixel, so the trail is a hairline
-    sheet.add_image("ar_trail", 2, 2, &[255u8; 16], 2.0);
+    // lazer's `Cursor/cursortrail`: a 10 px soft white dot. Textures from its resource store are shown at half size
+    // (ScaleAdjust 2), so it is 5 units across before the trail's own 0.4 scale. Drawn here as the same soft round falloff.
+    put(sheet, "ar_trail", 5.0, 5.0, ss * 4.0, &|x, y| {
+        let r = (x * x + y * y).sqrt() * 2.0; // in texture pixels
+        let a = if r < 4.6 { 0.65 * (1.0 - (r / 4.6) * (r / 4.6)).powi(2) } else { 0.0 };
+        white(a)
+    });
     // the edge piece of a repeat arrow: a left-facing arc with a soft glow, drawn from scratch to match lazer's look
     // (a 200-unit design: radius 100, arc 19 thick from 90 to 173 degrees either side of the left, glow fading to the right)
     let es = OUTER_GRADIENT / 200.0;

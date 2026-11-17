@@ -325,7 +325,7 @@ impl Scene {
         if self.sheet.get(name).is_none() {
             return;
         }
-        let interval = interval.max(0.35);
+        let interval = interval.max(0.2);
         let mut prev = self.cursor_at(t);
         // walk back along the path the cursor took, laying a dot every `interval` units of distance (also between samples)
         let (mut acc, mut from_cursor) = (0.0f32, 0.0f32);
@@ -784,10 +784,11 @@ impl Scene {
         // cursor trail then cursor
         let cs = self.cursor_scale;
         if self.argon {
-            // ArgonCursorTrail: additive, interval x0.4, exponent 4, alpha 0.8, drawn at 0.8 scale over the default 300 ms
-            let w = self.sheet.get("ar_trail").map(|e| e.frames[0].w as f32 / e.ratio).unwrap_or(10.0);
-            // brighter and longer-lived than lazer's own settings, which read as dim on a dark background
-            self.trail(out, t, "ar_trail", true, None, 1.1 * cs, 1.0, 2.0, 380.0, w * cs / 2.5 * 0.4 * 0.8, false);
+            // ArgonCursorTrail, as in lazer's source: the soft dot texture is 5 units across (10 px, ScaleAdjust 2) and the trail
+            // drawable is scaled by 0.8 / ScaleAdjust = 0.4; additive, alpha 0.8, parts fade as (1 - age / 300 ms) ^ 4, and a part is
+            // laid every `texture width x cursor scale / 2.5 x 0.4` units (in the trail's own, unscaled space).
+            let w = self.sheet.get("ar_trail").map(|e| e.frames[0].w as f32 / e.ratio).unwrap_or(5.0);
+            self.trail(out, t, "ar_trail", true, None, 0.4 * cs, 0.8, 4.0, 300.0, w * cs / 2.5 * 0.4 * 0.4, false);
         } else if let Some(e) = self.sheet.get("cursortrail") {
             // LegacyCursorTrail: a skin with a cursormiddle gets a long continuous trail that stops short of the
             // cursor; without one the trail is short and disjoint
