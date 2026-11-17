@@ -15,7 +15,7 @@ Followpoints are only the start. The goal is a full osu! skin editor, so these a
 - Exporting a complete `.osk`, and opening an existing skin to edit it instead of starting from scratch
 - Hit sound management (previewing, replacing and trimming samples)
 - Undo and redo
-- macOS support, and more testing on real Linux desktops (the Linux build is only tested under WSL so far)
+- More testing on real Linux desktops (the Linux build is only tested under WSL so far)
 
 ## Download
 
