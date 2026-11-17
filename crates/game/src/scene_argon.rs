@@ -153,7 +153,15 @@ impl Scene {
             let (bp, dir, _) = self.slider_ball_pub(o, s, tb);
             let (fs, fa) = if t <= end {
                 let u = ease_out_quint(frac(t, o.time, o.time + 300.0));
-                (1.0 + (argon::FOLLOW_AREA - 1.0) * u, u)
+                let mut fs = 1.0 + (argon::FOLLOW_AREA - 1.0) * u;
+                // ArgonFollowCircle.OnSliderTick: once at full size, a hit tick or repeat grows it by 8% over 40 ms and back over 200 ms
+                if fs >= argon::FOLLOW_AREA * 0.98 {
+                    if let Some(dt) = self.last_pulse(o, s, t, 240.0) {
+                        let bump = if dt < 40.0 { ease_out_quint(dt / 40.0) } else { 1.0 - ease_out_quint((dt - 40.0) / 200.0) };
+                        fs = argon::FOLLOW_AREA * (1.0 + 0.08 * bump);
+                    }
+                }
+                (fs, u)
             } else {
                 (1.0 + (argon::FOLLOW_AREA - 1.0) * (1.0 - ease_out_quint(frac(t, end, end + 300.0))), 1.0 - ease_out_quint(frac(t, end, end + 150.0)))
             };

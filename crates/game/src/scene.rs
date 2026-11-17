@@ -493,6 +493,27 @@ impl Scene {
         }
     }
 
+    /// How long ago the last slider tick or repeat was hit, if that was within `within` ms (they drive the follow circle's pulse).
+    pub(crate) fn last_pulse(&self, o: &HitObject, s: &SliderData, t: f32, within: f32) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        let mut consider = |tt: f32| {
+            let dt = t - tt;
+            if dt >= 0.0 && dt < within && best.is_none_or(|b| dt < b) {
+                best = Some(dt);
+            }
+        };
+        for span in 0..s.slides {
+            let span_start = o.time + span as f32 * s.span_duration;
+            for &tick in &s.ticks {
+                consider(span_start + tick * s.span_duration);
+            }
+            if span >= 1 {
+                consider(span_start);
+            }
+        }
+        best
+    }
+
     fn approach(&self, out: &mut Frame, o: &HitObject, pos: P, t: f32, appear: f32) {
         if t >= o.time + 50.0 || t < appear || !self.has("approachcircle") {
             return;
@@ -735,7 +756,15 @@ impl Scene {
                         let sliding = t <= end;
                         if self.has("sliderfollowcircle") {
                             let (sc, al) = if sliding {
-                                (1.0 + frac(t, o.time, o.time + 180.0), frac(t, o.time, o.time + 60.0))
+                                // LegacyFollowCircle: grows 1 -> 2 over 180 ms (Easing.Out) while fading in over 60 ms, and every tick or
+                                // repeat that is hit pops it to 2.2 and back to 2 over 200 ms
+                                let mut sc = 1.0 + ease_out_quad(frac(t, o.time, o.time + 180.0));
+                                if t >= o.time + 180.0 {
+                                    if let Some(dt) = self.last_pulse(o, s, t, 200.0) {
+                                        sc = 2.2 - 0.2 * dt / 200.0;
+                                    }
+                                }
+                                (sc, frac(t, o.time, o.time + 60.0))
                             } else {
                                 let u = frac(t, end, end + 200.0);
                                 (2.0 - 0.4 * ease_out_quad(u), 1.0 - u * u)
