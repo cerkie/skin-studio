@@ -350,7 +350,7 @@ impl GameRenderer {
                         break;
                     }
                     let start = self.dyn_scratch.len() as u32;
-                    game::scene::SliderGeom::quad_verts(end.0, end.1, g.radius, &mut self.dyn_scratch);
+                    game::scene::SliderGeom::quad_verts(end.0, end.1, end.2, g.radius, &mut self.dyn_scratch);
                     game::scene::SliderGeom::cap_verts(end.1, g.radius, &mut self.dyn_scratch);
                     ranges.push(start..self.dyn_scratch.len() as u32);
                 }

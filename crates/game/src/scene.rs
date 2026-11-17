@@ -31,9 +31,9 @@ pub struct SliderDraw {
     pub to: usize,
     /// The body's growing end: the last whole path point and the exact point the body reaches (a partial segment and a round
     /// cap are drawn there, so snaking is smooth however long the segments are).
-    pub head: Option<(P, P)>,
+    pub head: Option<(P, P, P)>,
     /// The same for the shrinking end behind the ball: the first whole path point and the exact point.
-    pub tail: Option<(P, P)>,
+    pub tail: Option<(P, P, P)>,
     pub alpha: f32,
     pub border: [f32; 3],
     pub outer: [f32; 3],
@@ -92,6 +92,9 @@ pub struct SliderGeom {
     pub cum: Vec<f32>,
     /// The path points, as placed in the view.
     pub pts: Vec<P>,
+    /// Per segment: its unit normal. Every segment of a straight stretch shares one, so the strips meet edge to edge with
+    /// identical vertices (no cracks between them).
+    pub norms: Vec<P>,
     pub radius: f32,
 }
 
@@ -99,10 +102,8 @@ const CAP: usize = 48;
 
 impl SliderGeom {
     /// The strip between two points: a double-sided quad whose third coordinate is the distance from the centre line.
-    pub fn quad_verts(a: P, b: P, radius: f32, out: &mut Vec<[f32; 3]>) {
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let l = dx.hypot(dy).max(1e-6);
-        let (nx, ny) = (-dy / l * radius, dx / l * radius);
+    pub fn quad_verts(a: P, b: P, n: P, radius: f32, out: &mut Vec<[f32; 3]>) {
+        let (nx, ny) = (n[0] * radius, n[1] * radius);
         let v = |p: P, off: f32, d: f32| [p[0] + nx * off, p[1] + ny * off, d];
         let tri = [(a, 1.0, 1.0), (a, 0.0, 0.0), (b, 1.0, 1.0), (a, 0.0, 0.0), (b, 0.0, 0.0), (b, 1.0, 1.0), (a, 0.0, 0.0), (a, -1.0, 1.0), (b, 0.0, 0.0), (a, -1.0, 1.0), (b, -1.0, 1.0), (b, 0.0, 0.0)];
         for (p, off, d) in tri {
@@ -144,15 +145,19 @@ fn build_geom(pts: &[P], origin: P, radius: f32) -> SliderGeom {
         }
     }
     orig.push(*pts.last().unwrap());
-    // Long straight stretches get extra points, so trimming can follow the ball closely. They have no cap: caps spaced along a
-    // straight edge would scallop the outline. (The exact ends are drawn separately, every frame.)
     let mut keep: Vec<(P, bool)> = vec![(orig[0], true)];
+    let mut norms: Vec<P> = Vec::new();
     for w2 in orig.windows(2) {
-        let l = (w2[1][0] - w2[0][0]).hypot(w2[1][1] - w2[0][1]);
-        let n = (l / 3.5).ceil().max(1.0) as usize;
+        let (dx, dy) = (w2[1][0] - w2[0][0], w2[1][1] - w2[0][1]);
+        let l = dx.hypot(dy);
+        let normal = if l > 1e-6 { [-dy / l, dx / l] } else { [0.0, 1.0] };
+        // One strip per straight stretch, as in the game: the exact ends of a growing or shrinking body are drawn separately,
+        // so no extra points (and no seams between many small strips) are needed.
+        let n = 1usize;
         for k in 1..=n {
             let u = k as f32 / n as f32;
-            keep.push(([w2[0][0] + (w2[1][0] - w2[0][0]) * u, w2[0][1] + (w2[1][1] - w2[0][1]) * u], k == n));
+            keep.push(([w2[0][0] + dx * u, w2[0][1] + dy * u], k == n));
+            norms.push(normal);
         }
     }
     let mut cum = vec![0.0f32];
@@ -165,7 +170,7 @@ fn build_geom(pts: &[P], origin: P, radius: f32) -> SliderGeom {
     }
     let w = |p: P| [p[0] + origin[0], p[1] + origin[1]];
     let placed: Vec<P> = keep.iter().map(|(p, _)| w(*p)).collect();
-    let mut g = SliderGeom { verts: vec![], quads: vec![], caps: vec![], cum, pts: placed.clone(), radius };
+    let mut g = SliderGeom { verts: vec![], quads: vec![], caps: vec![], cum, pts: placed.clone(), norms: norms.clone(), radius };
     for (i, (_, is_orig)) in keep.iter().enumerate() {
         let s = g.verts.len() as u32;
         if *is_orig {
@@ -174,7 +179,7 @@ fn build_geom(pts: &[P], origin: P, radius: f32) -> SliderGeom {
         g.caps.push(s..g.verts.len() as u32);
         if i + 1 < keep.len() {
             let s = g.verts.len() as u32;
-            SliderGeom::quad_verts(placed[i], placed[i + 1], radius, &mut g.verts);
+            SliderGeom::quad_verts(placed[i], placed[i + 1], norms[i], radius, &mut g.verts);
             g.quads.push(s..g.verts.len() as u32);
         }
     }
@@ -604,7 +609,7 @@ impl Scene {
                         if snake_in < 1.0 {
                             let (i, exact) = g.point_at(snake_in);
                             to = i;
-                            head = Some((g.pts[i], exact));
+                            head = Some((g.pts[i], exact, g.norms[i.min(g.norms.len() - 1)]));
                         }
                         if t >= o.time {
                             to = nseg;
@@ -617,11 +622,11 @@ impl Scene {
                                 if s.slides % 2 == 1 {
                                     let (j, exact) = g.point_at(along);
                                     from = (j + 1).min(nseg);
-                                    tail = Some((g.pts[from], exact));
+                                    tail = Some((g.pts[from], exact, g.norms[j.min(g.norms.len() - 1)]));
                                 } else {
                                     let (j, exact) = g.point_at(1.0 - along);
                                     to = j;
-                                    head = Some((g.pts[j], exact));
+                                    head = Some((g.pts[j], exact, g.norms[j.min(g.norms.len() - 1)]));
                                 }
                             }
                         }

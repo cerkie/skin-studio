@@ -31,7 +31,8 @@ async fn run() {
     let skin = Skin::open(&PathBuf::from(skin_path)).expect("skin");
     println!("skin: {}", skin.name);
 
-    let ss = 2.0f32;
+    // pixels per view unit (a fractional value shows how the app looks at odd window sizes)
+    let ss = arg("--scale").and_then(|s| s.parse().ok()).unwrap_or(2.0f32);
     let scale = engine::lazer::circle_scale(map.cs);
     let mut sheet = if matches!(skin.style, skin::Style::Argon { .. }) {
         let mut s = Sheet::default();
@@ -71,7 +72,7 @@ async fn run() {
     let instance = wgpu::Instance::default();
     let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }).await.expect("gpu");
     let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() }).await.expect("device");
-    let (w, h) = (1280u32, 960u32);
+    let (w, h) = ((640.0 * ss).round() as u32, (480.0 * ss).round() as u32);
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let mut r = GameRenderer::new(device.clone(), queue.clone(), format, (w, h), &sheet.rgba, (sheet.w, sheet.h), &scene.geoms, ss);
     let target = device.create_texture(&wgpu::TextureDescriptor {
