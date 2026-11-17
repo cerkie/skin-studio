@@ -178,7 +178,7 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
         ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_width(body.width());
-                ui.spacing_mut().item_spacing = Vec2::new(0.0, 8.0);
+                ui.spacing_mut().item_spacing = Vec2::new(0.0, 0.0);
                 if !st.search.trim().is_empty() {
                     search_results(ui, st);
                     return;
@@ -552,8 +552,8 @@ fn search_results(ui: &mut Ui, st: &mut Studio) {
         hits += 1;
         let tab_name = TABS.iter().find(|(t, _)| t == tab).map(|(_, n)| *n).unwrap_or("");
         let w = ui.available_width() - 22.0;
-        let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::click());
-        let r = Rect::from_min_size(r.min + Vec2::new(12.0, 0.0), r.size());
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 46.0 + th::ROW_GAP), Sense::click());
+        let r = Rect::from_min_size(r.min + Vec2::new(12.0, 0.0), Vec2::new(r.width(), r.height() - th::ROW_GAP));
         ui.painter().rect_filled(r, CornerRadius::same(5), if resp.hovered() { DARK3 } else { CONTROL });
         ui.painter().text(r.left_center() + Vec2::new(10.0, -8.0), Align2::LEFT_CENTER, label, FontId::new(15.0, FontFamily::Proportional), CONTENT1);
         ui.painter().text(r.left_center() + Vec2::new(10.0, 10.0), Align2::LEFT_CENTER, tab_name, FontId::new(12.0, th::light()), LIGHT3);
@@ -667,8 +667,8 @@ fn tab_motion(ui: &mut Ui, st: &mut Studio) {
 fn key_row(ui: &mut Ui, st: &mut Studio, pid: &str, i: usize, k: &Value) {
     let rid = ui.id().with((pid, i));
     let width = ui.available_width() - 22.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::hover());
-    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), rect.size());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 38.0 + th::ROW_GAP), Sense::hover());
+    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - th::ROW_GAP));
     ui.painter().rect_filled(rect, CornerRadius::same(5), CONTROL);
     let cur = [state::fmt_num(&k[0]), state::fmt_num(&k[1])];
     let mut x = rect.left() + 8.0;
@@ -676,7 +676,7 @@ fn key_row(ui: &mut Ui, st: &mut Studio, pid: &str, i: usize, k: &Value) {
         let key = format!("key:{pid}:{i}:{f}");
         let buf = st.bufs.entry(key.clone()).or_insert_with(|| cur[f].clone());
         let r = Rect::from_min_size(Pos2::new(x, rect.top() + 9.0), Vec2::new(w, 20.0));
-        let resp = ui.put(r, egui::TextEdit::singleline(buf).id(rid.with(f)).frame(egui::Frame::NONE).desired_width(w).font(FontId::new(15.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO));
+        let resp = th::put_free(ui, r, egui::TextEdit::singleline(buf).id(rid.with(f)).frame(egui::Frame::NONE).desired_width(w).font(FontId::new(15.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO));
         let text = buf.clone();
         if resp.changed() {
             state::edit_key(&mut st.settings, pid, i, f as i32, &text);
@@ -763,8 +763,8 @@ fn tab_color(ui: &mut Ui, st: &mut Studio) {
 fn color_row(ui: &mut Ui, st: &mut Studio, i: usize, k: &Value) {
     let rid = ui.id().with(("col", i));
     let width = ui.available_width() - 22.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::hover());
-    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), rect.size());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 38.0 + th::ROW_GAP), Sense::hover());
+    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - th::ROW_GAP));
     ui.painter().rect_filled(rect, CornerRadius::same(5), CONTROL);
     let hex = k[1].as_str().unwrap_or("#ffffff").to_string();
     let rgb = state::hex_to_rgb(&hex).unwrap_or([255, 255, 255]);
@@ -780,7 +780,7 @@ fn color_row(ui: &mut Ui, st: &mut Studio, i: usize, k: &Value) {
         let key = format!("col:{i}:{f}");
         let buf = st.bufs.entry(key.clone()).or_insert_with(|| cur[f].clone());
         let r = Rect::from_min_size(Pos2::new(x, rect.top() + 9.0), Vec2::new(w, 20.0));
-        let resp = ui.put(r, egui::TextEdit::singleline(buf).id(rid.with(f)).frame(egui::Frame::NONE).desired_width(w).font(FontId::new(15.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO));
+        let resp = th::put_free(ui, r, egui::TextEdit::singleline(buf).id(rid.with(f)).frame(egui::Frame::NONE).desired_width(w).font(FontId::new(15.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO));
         let text = buf.clone();
         if resp.changed() {
             state::edit_color(&mut st.settings, i, f as i32, &text);
@@ -979,8 +979,8 @@ fn tab_history(ui: &mut Ui, st: &mut Studio) {
     let items = st.history.clone();
     for h in items {
         let width = ui.available_width() - 22.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 56.0), Sense::hover());
-        let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), rect.size());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 56.0 + th::ROW_GAP), Sense::hover());
+        let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - th::ROW_GAP));
         ui.painter().rect_filled(rect, CornerRadius::same(5), CONTROL);
         let name = if h.name.chars().count() > 30 { format!("{}…", h.name.chars().take(29).collect::<String>()) } else { h.name.clone() };
         ui.painter().text(rect.min + Vec2::new(9.0, 9.0), Align2::LEFT_TOP, name, FontId::new(15.0, th::semibold()), CONTENT1);

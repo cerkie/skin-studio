@@ -190,7 +190,7 @@ pub fn search_box(ui: &mut Ui, rect: Rect, text: &mut String) -> Response {
     ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(46));
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, Color32::from_white_alpha(10)));
     let edit_rect = Rect::from_min_max(rect.left_top() + Vec2::new(20.0, 14.0), rect.right_bottom() - Vec2::new(56.0, 14.0));
-    let resp = ui.put(edit_rect, egui::TextEdit::singleline(text).hint_text(RichText::new("type to search").color(LIGHT3).size(20.0)).frame(egui::Frame::NONE).desired_width(edit_rect.width()).font(FontId::new(20.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO));
+    let resp = put_free(ui, edit_rect, egui::TextEdit::singleline(text).hint_text(RichText::new("type to search").color(LIGHT3).size(20.0)).frame(egui::Frame::NONE).desired_width(edit_rect.width()).font(FontId::new(20.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO));
     let c = Pos2::new(rect.right() - 30.0, rect.center().y - 1.0);
     ui.painter().circle_stroke(c, 7.5, Stroke::new(2.4, CONTENT1));
     ui.painter().line_segment([c + Vec2::new(5.5, 5.5), c + Vec2::new(11.0, 11.0)], Stroke::new(2.6, CONTENT1));
@@ -303,16 +303,26 @@ fn bg_end(ui: &mut Ui, bg: Bg, rect: Rect, id: Id, hovered: bool, focused: bool,
 
 const PAD: f32 = 9.0;
 
+/// The empty space under every row of a settings panel.
+pub const ROW_GAP: f32 = 8.0;
+
+/// Place a widget at an exact rectangle without touching the layout cursor. (`Ui::put` pulls the cursor back to the bottom of
+/// the widget, which made every row that holds a text box shorter than the space it was given.)
+pub fn put_free(ui: &mut Ui, rect: Rect, widget: impl egui::Widget) -> Response {
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    child.add(widget)
+}
+
 /// A caption above a single-line text box.
 pub fn text_row(ui: &mut Ui, id: &str, caption_text: &str, buf: &mut String) -> Response {
     let rid = ui.id().with(id);
     let width = ui.available_width() - 22.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 54.0), Sense::hover());
-    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), rect.size());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 54.0 + ROW_GAP), Sense::hover());
+    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     let bg = bg_begin(ui);
     ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, caption_text, FontId::new(14.0, light()), CONTENT2);
     let edit_rect = Rect::from_min_size(rect.min + Vec2::new(PAD, PAD + 17.0), Vec2::new(rect.width() - 2.0 * PAD, 20.0));
-    let resp = ui.put(
+    let resp = put_free(ui, 
         edit_rect,
         egui::TextEdit::singleline(buf).id(rid).frame(egui::Frame::NONE).desired_width(edit_rect.width()).font(FontId::new(16.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO),
     );
@@ -325,8 +335,8 @@ pub fn text_row(ui: &mut Ui, id: &str, caption_text: &str, buf: &mut String) -> 
 pub fn dropdown_row(ui: &mut Ui, id: &str, caption_text: &str, current: &str, items: &[String]) -> Option<usize> {
     let rid = ui.id().with(id);
     let width = ui.available_width() - 22.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 54.0), Sense::click());
-    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), rect.size());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 54.0 + ROW_GAP), Sense::click());
+    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     let bg = bg_begin(ui);
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
     ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, caption_text, FontId::new(14.0, light()), CONTENT2);
@@ -372,8 +382,8 @@ fn elide(s: &str, max: usize) -> String {
 pub fn switch_row(ui: &mut Ui, id: &str, label: &str, on: &mut bool) -> bool {
     let rid = ui.id().with(id);
     let width = ui.available_width() - 22.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::click());
-    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), rect.size());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 38.0 + ROW_GAP), Sense::click());
+    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     let bg = bg_begin(ui);
     ui.painter().text(rect.left_center() + Vec2::new(PAD, 0.0), Align2::LEFT_CENTER, elide(label, 44), FontId::new(14.0, FontFamily::Proportional), CONTENT2);
     let mut changed = false;
@@ -396,8 +406,8 @@ pub fn switch_row(ui: &mut Ui, id: &str, label: &str, on: &mut bool) -> bool {
 pub fn slider_row(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str, v: &mut f32) -> bool {
     let rid = ui.id().with(id);
     let width = ui.available_width() - 22.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 56.0), Sense::hover());
-    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), rect.size());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 56.0 + ROW_GAP), Sense::hover());
+    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     let bg = bg_begin(ui);
     ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, caption_text, FontId::new(14.0, light()), CONTENT2);
     ui.painter().text(rect.min + Vec2::new(PAD, PAD + 17.0), Align2::LEFT_TOP, value_text, FontId::new(16.0, FontFamily::Proportional), CONTENT1);
@@ -442,8 +452,8 @@ pub enum Kind {
 /// A full-width settings button (RoundedButton: 5 px corner, lightened by 0.2 on hover).
 pub fn button_wide(ui: &mut Ui, label: &str, kind: Kind, enabled: bool) -> Response {
     let width = ui.available_width() - 22.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::click());
-    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), rect.size());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 40.0 + ROW_GAP), Sense::click());
+    let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     paint_button(ui, rect, &resp, label, kind, enabled);
     resp
 }
@@ -500,6 +510,7 @@ pub fn note(ui: &mut Ui, s: &str) {
             ui.add(egui::Label::new(text(s, 14.0, CONTENT2).family(semibold())).wrap());
         });
     });
+    ui.add_space(ROW_GAP);
 }
 
 /// One entry of the sidebar: icon-less text with the 4 px selection bar on the left.

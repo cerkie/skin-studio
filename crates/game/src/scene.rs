@@ -117,8 +117,10 @@ impl SliderGeom {
         for k in 0..CAP {
             let (a0, a1) = (k as f32 / CAP as f32 * std::f32::consts::TAU, (k + 1) as f32 / CAP as f32 * std::f32::consts::TAU);
             out.push([c[0], c[1], 0.0]);
-            out.push([c[0] + rim * (a0 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a0 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
-            out.push([c[0] + rim * (a1 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a1 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
+            // the third coordinate is the true distance from the path over the radius, so it reads 1 on the circle itself and
+            // matches the strips exactly where they overlap (no depth ties, no seams)
+            out.push([c[0] + rim * (a0 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a0 + std::f32::consts::PI / CAP as f32).sin(), rim / radius]);
+            out.push([c[0] + rim * (a1 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a1 + std::f32::consts::PI / CAP as f32).sin(), rim / radius]);
         }
     }
 

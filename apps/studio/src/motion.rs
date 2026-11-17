@@ -24,8 +24,8 @@ pub fn graph(ui: &mut Ui, st: &mut Studio, pid: &str) {
     let json_keys = engine::presets::keys_of(&st.settings["props"][pid]);
 
     let width = ui.available_width() - 22.0;
-    let (outer, bg) = ui.allocate_exact_size(Vec2::new(width, H), Sense::click());
-    let outer = Rect::from_min_size(outer.min + Vec2::new(12.0, 0.0), outer.size());
+    let (outer, bg) = ui.allocate_exact_size(Vec2::new(width, H + crate::theme::ROW_GAP), Sense::click());
+    let outer = Rect::from_min_size(outer.min + Vec2::new(12.0, 0.0), Vec2::new(outer.width(), H));
     let plot = Rect::from_min_max(outer.min + Vec2::new(40.0, 14.0), outer.max - Vec2::new(16.0, 24.0));
     let p = ui.painter().clone();
     p.rect_filled(outer, CornerRadius::same(8), BACKGROUND5);
