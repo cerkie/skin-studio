@@ -1,0 +1,10 @@
+[package]
+name = "preview"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+engine = { version = "0.1.0", path = "../engine" }
+wgpu = "30.0.2"
+game = { path = "../game" }

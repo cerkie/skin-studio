@@ -1,0 +1,12 @@
+[package]
+name = "mapview"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine = { path = "../../crates/engine" }
+game = { path = "../../crates/game" }
+png = "0.18.1"
+pollster = "1.0.1"
+preview = { path = "../../crates/preview" }
+wgpu = "30.0.2"

@@ -1,0 +1,16 @@
+[package]
+name = "preview-window"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+game = { path = "../game" }
+engine = { version = "0.1.0", path = "../engine" }
+pollster = "1.0.1"
+preview = { version = "0.1.0", path = "../preview" }
+rodio = "0.23.0"
+wgpu = "30.0.2"
+winit = "0.30.13"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Graphics_Dwm"] }

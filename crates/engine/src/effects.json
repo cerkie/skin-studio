@@ -1,0 +1,856 @@
+{
+ "order": [
+  "None (static)",
+  "Slide across",
+  "Shrink thickness (green to white, for lines)",
+  "Expand and fade (for lines)",
+  "Pulse",
+  "Color shift",
+  "Slide + color shift",
+  "Slide, hold, then fade out",
+  "Pass-by pulse (lights up as the cursor passes)",
+  "Spring snap (loads back, then fires forward)",
+  "Sonar ring (pings at the hit moment)",
+  "Heartbeat (two beats)",
+  "Glitch flicker",
+  "Accelerate (arrow speeds up toward the hit)",
+  "Tick ladder (bars rise as the cursor passes)",
+  "Heat ramp (white, yellow, red)",
+  "Pop in (overshoot)"
+ ],
+ "effects": {
+  "None (static)": {
+   "props": {}
+  },
+  "Slide across": {
+   "props": {
+    "x": [
+     0,
+     1,
+     "linear"
+    ]
+   },
+   "fade_in": 80,
+   "fade_out": 80
+  },
+  "Shrink thickness (green to white, for lines)": {
+   "props": {
+    "sy": [
+     3,
+     0.1,
+     "ease-out"
+    ],
+    "alpha": [
+     1,
+     0.05,
+     "ease-in"
+    ]
+   },
+   "color": [
+    "#00ff26",
+    "#ffffff"
+   ],
+   "set": {
+    "preset": "Seamless line (CS-matched)",
+    "width": 128,
+    "height": 32,
+    "duration": 240
+   }
+  },
+  "Expand and fade (for lines)": {
+   "props": {
+    "sy": [
+     0.1,
+     3,
+     "ease-out"
+    ],
+    "alpha": [
+     1,
+     0,
+     "ease-in"
+    ]
+   },
+   "set": {
+    "preset": "Seamless line (CS-matched)",
+    "width": 128,
+    "height": 32,
+    "duration": 220
+   }
+  },
+  "Pulse": {
+   "props": {
+    "sy": [
+     1,
+     2.5,
+     "ease-in-out"
+    ],
+    "alpha": [
+     0.4,
+     1,
+     "ease-in-out"
+    ]
+   },
+   "pingpong": true
+  },
+  "Color shift": {
+   "props": {},
+   "color": [
+    "#ff3030",
+    "#3070ff"
+   ]
+  },
+  "Slide + color shift": {
+   "props": {
+    "x": [
+     0,
+     1,
+     "linear"
+    ]
+   },
+   "color": [
+    "#ffd000",
+    "#ff0080"
+   ],
+   "fade_in": 80,
+   "fade_out": 80
+  },
+  "Slide, hold, then fade out": {
+   "props": {
+    "x": [
+     [
+      0,
+      0,
+      "ease-out"
+     ],
+     [
+      250,
+      1,
+      "linear"
+     ]
+    ],
+    "alpha": [
+     [
+      0,
+      1,
+      "linear"
+     ],
+     [
+      350,
+      1,
+      "ease-in"
+     ],
+     [
+      550,
+      0,
+      "linear"
+     ]
+    ]
+   },
+   "fade_in": 60
+  },
+  "Pass-by pulse (lights up as the cursor passes)": {
+   "set": {
+    "preset": "Chevron (bold)",
+    "width": 100,
+    "height": 50,
+    "window_mode": "clamp"
+   },
+   "props": {
+    "alpha": [
+     [
+      0,
+      0.25,
+      "linear"
+     ],
+     [
+      500,
+      0.4,
+      "ease-in"
+     ],
+     [
+      790,
+      1,
+      "ease-out"
+     ],
+     [
+      1000,
+      0.15,
+      "linear"
+     ],
+     [
+      1200,
+      0,
+      "linear"
+     ]
+    ],
+    "sx": [
+     [
+      0,
+      0.75,
+      "linear"
+     ],
+     [
+      700,
+      0.9,
+      "ease-out"
+     ],
+     [
+      800,
+      1.45,
+      "ease-out"
+     ],
+     [
+      1000,
+      1,
+      "linear"
+     ]
+    ],
+    "sy": [
+     [
+      0,
+      0.75,
+      "linear"
+     ],
+     [
+      700,
+      0.9,
+      "ease-out"
+     ],
+     [
+      800,
+      1.45,
+      "ease-out"
+     ],
+     [
+      1000,
+      1,
+      "linear"
+     ]
+    ]
+   },
+   "color_keys": [
+    [
+     0,
+     "#4d6bff",
+     "linear"
+    ],
+    [
+     700,
+     "#ffe060",
+     "linear"
+    ],
+    [
+     800,
+     "#ffffff",
+     "linear"
+    ],
+    [
+     "end",
+     "#ff3a3a",
+     "linear"
+    ]
+   ]
+  },
+  "Spring snap (loads back, then fires forward)": {
+   "set": {
+    "preset": "Arrow",
+    "width": 100,
+    "height": 50,
+    "window_mode": "clamp"
+   },
+   "props": {
+    "x": [
+     [
+      0,
+      0.5,
+      "ease-in-out"
+     ],
+     [
+      650,
+      0.2,
+      "ease-in"
+     ],
+     [
+      800,
+      0.95,
+      "ease-out"
+     ],
+     [
+      1000,
+      0.95,
+      "linear"
+     ]
+    ],
+    "sx": [
+     [
+      0,
+      1,
+      "linear"
+     ],
+     [
+      650,
+      0.8,
+      "ease-out"
+     ],
+     [
+      800,
+      1.5,
+      "ease-out"
+     ],
+     [
+      1000,
+      1,
+      "linear"
+     ]
+    ],
+    "alpha": [
+     [
+      0,
+      1,
+      "linear"
+     ],
+     [
+      900,
+      1,
+      "ease-in"
+     ],
+     [
+      1100,
+      0,
+      "linear"
+     ]
+    ]
+   }
+  },
+  "Sonar ring (pings at the hit moment)": {
+   "set": {
+    "preset": "Ring",
+    "width": 64,
+    "height": 64,
+    "window_mode": "clamp"
+   },
+   "props": {
+    "sx": [
+     [
+      0,
+      0.35,
+      "linear"
+     ],
+     [
+      780,
+      0.35,
+      "ease-out"
+     ],
+     [
+      1150,
+      2.2,
+      "linear"
+     ]
+    ],
+    "sy": [
+     [
+      0,
+      0.35,
+      "linear"
+     ],
+     [
+      780,
+      0.35,
+      "ease-out"
+     ],
+     [
+      1150,
+      2.2,
+      "linear"
+     ]
+    ],
+    "alpha": [
+     [
+      0,
+      0,
+      "linear"
+     ],
+     [
+      730,
+      0,
+      "linear"
+     ],
+     [
+      800,
+      0.9,
+      "ease-out"
+     ],
+     [
+      1150,
+      0,
+      "linear"
+     ]
+    ],
+    "blur": [
+     [
+      0,
+      0,
+      "linear"
+     ],
+     [
+      800,
+      0,
+      "linear"
+     ],
+     [
+      1150,
+      2,
+      "linear"
+     ]
+    ]
+   }
+  },
+  "Heartbeat (two beats)": {
+   "set": {
+    "preset": "Chevron (bold)",
+    "width": 100,
+    "height": 50,
+    "window_mode": "clamp"
+   },
+   "props": {
+    "sx": [
+     [
+      0,
+      1,
+      "linear"
+     ],
+     [
+      150,
+      1.35,
+      "ease-out"
+     ],
+     [
+      300,
+      1,
+      "ease-in-out"
+     ],
+     [
+      430,
+      1.25,
+      "ease-out"
+     ],
+     [
+      600,
+      1,
+      "ease-in-out"
+     ]
+    ],
+    "sy": [
+     [
+      0,
+      1,
+      "linear"
+     ],
+     [
+      150,
+      1.35,
+      "ease-out"
+     ],
+     [
+      300,
+      1,
+      "ease-in-out"
+     ],
+     [
+      430,
+      1.25,
+      "ease-out"
+     ],
+     [
+      600,
+      1,
+      "ease-in-out"
+     ]
+    ],
+    "alpha": [
+     [
+      0,
+      0.7,
+      "linear"
+     ],
+     [
+      150,
+      1,
+      "ease-out"
+     ],
+     [
+      300,
+      0.7,
+      "linear"
+     ],
+     [
+      430,
+      1,
+      "ease-out"
+     ],
+     [
+      600,
+      0.7,
+      "linear"
+     ]
+    ]
+   }
+  },
+  "Glitch flicker": {
+   "set": {
+    "preset": "Chevron (bold)",
+    "width": 100,
+    "height": 50,
+    "window_mode": "clamp"
+   },
+   "props": {
+    "y": [
+     [
+      0,
+      0,
+      "linear"
+     ],
+     [
+      120,
+      -3,
+      "linear"
+     ],
+     [
+      150,
+      4,
+      "linear"
+     ],
+     [
+      190,
+      0,
+      "linear"
+     ],
+     [
+      520,
+      0,
+      "linear"
+     ],
+     [
+      560,
+      -4,
+      "linear"
+     ],
+     [
+      600,
+      3,
+      "linear"
+     ],
+     [
+      640,
+      0,
+      "linear"
+     ]
+    ],
+    "alpha": [
+     [
+      0,
+      1,
+      "linear"
+     ],
+     [
+      110,
+      0.2,
+      "linear"
+     ],
+     [
+      140,
+      1,
+      "linear"
+     ],
+     [
+      520,
+      1,
+      "linear"
+     ],
+     [
+      550,
+      0.25,
+      "linear"
+     ],
+     [
+      580,
+      1,
+      "linear"
+     ]
+    ]
+   },
+   "color_keys": [
+    [
+     0,
+     "#00fff0",
+     "linear"
+    ],
+    [
+     300,
+     "#ff2bd6",
+     "linear"
+    ],
+    [
+     "end",
+     "#00fff0",
+     "linear"
+    ]
+   ]
+  },
+  "Accelerate (arrow speeds up toward the hit)": {
+   "set": {
+    "preset": "Arrow",
+    "width": 100,
+    "height": 50,
+    "window_mode": "clamp"
+   },
+   "props": {
+    "x": [
+     [
+      0,
+      0,
+      "ease-in"
+     ],
+     [
+      800,
+      1,
+      "linear"
+     ]
+    ],
+    "sx": [
+     [
+      0,
+      0.8,
+      "linear"
+     ],
+     [
+      800,
+      1.4,
+      "linear"
+     ]
+    ],
+    "alpha": [
+     [
+      0,
+      1,
+      "linear"
+     ],
+     [
+      800,
+      1,
+      "ease-in"
+     ],
+     [
+      1000,
+      0,
+      "linear"
+     ]
+    ]
+   },
+   "color_keys": [
+    [
+     0,
+     "#6aa0ff",
+     "linear"
+    ],
+    [
+     800,
+     "#ff5050",
+     "linear"
+    ],
+    [
+     "end",
+     "#ff5050",
+     "linear"
+    ]
+   ]
+  },
+  "Tick ladder (bars rise as the cursor passes)": {
+   "set": {
+    "preset": "Tick (bar)",
+    "width": 48,
+    "height": 48,
+    "window_mode": "clamp"
+   },
+   "props": {
+    "sy": [
+     [
+      0,
+      0.4,
+      "linear"
+     ],
+     [
+      700,
+      0.6,
+      "ease-out"
+     ],
+     [
+      800,
+      1.6,
+      "ease-out"
+     ],
+     [
+      1000,
+      0.5,
+      "linear"
+     ]
+    ],
+    "alpha": [
+     [
+      0,
+      0.5,
+      "linear"
+     ],
+     [
+      780,
+      0.9,
+      "ease-out"
+     ],
+     [
+      800,
+      1,
+      "ease-out"
+     ],
+     [
+      1100,
+      0,
+      "linear"
+     ]
+    ]
+   }
+  },
+  "Heat ramp (white, yellow, red)": {
+   "props": {},
+   "color_keys": [
+    [
+     0,
+     "#ffffff",
+     "linear"
+    ],
+    [
+     200,
+     "#ffe040",
+     "linear"
+    ],
+    [
+     "end",
+     "#ff2020",
+     "linear"
+    ]
+   ]
+  },
+  "Pop in (overshoot)": {
+   "props": {
+    "sx": [
+     0,
+     1,
+     "ease-out back"
+    ],
+    "sy": [
+     0,
+     1,
+     "ease-out back"
+    ]
+   },
+   "fade_out": 100
+  }
+ },
+ "default": {
+  "preset": "Arrow",
+  "image": "",
+  "fps": 60.0,
+  "duration": 500.0,
+  "speed": 1.0,
+  "lead": 0.0,
+  "shift": 0.0,
+  "tail": 0.0,
+  "disappear": 0.0,
+  "fade_in": 0.0,
+  "fade_out": 0.0,
+  "width": 100,
+  "height": 50,
+  "copies": 1,
+  "pingpong": false,
+  "color_on": false,
+  "color_start": "#00ff26",
+  "color_end": "#ffffff",
+  "color_strength": 1.0,
+  "color_ease": "linear",
+  "hires": false,
+  "export": "1x",
+  "no_loop": true,
+  "window_mode": "shift",
+  "deband_on": false,
+  "deband_radius": 8.0,
+  "deband_thr_rgb": 3.0,
+  "deband_thr_a": 3.0,
+  "deband_iter": 2,
+  "deband_grain": 0.0,
+  "outline_on": false,
+  "outline_w": 2.0,
+  "outline_color": "#000000",
+  "outline_opacity": 1.0,
+  "shadow_on": false,
+  "shadow_dx": 2.0,
+  "shadow_dy": 2.0,
+  "shadow_blur": 3.0,
+  "shadow_color": "#000000",
+  "shadow_opacity": 0.6,
+  "sl_cs": 4.0,
+  "sl_ar": 9.0,
+  "sl_soft": 160.0,
+  "sl_tight": 0.0,
+  "sl_thick": 2.0,
+  "sl_alpha": 0.9,
+  "sl_overlap": 1.0,
+  "props": {
+   "x": [
+    0.5,
+    0.5,
+    "linear"
+   ],
+   "y": [
+    0.0,
+    0.0,
+    "linear"
+   ],
+   "sx": [
+    1.0,
+    1.0,
+    "linear"
+   ],
+   "sy": [
+    1.0,
+    1.0,
+    "linear"
+   ],
+   "rot": [
+    0.0,
+    0.0,
+    "linear"
+   ],
+   "alpha": [
+    1.0,
+    1.0,
+    "linear"
+   ],
+   "blur": [
+    0.0,
+    0.0,
+    "linear"
+   ]
+  }
+ },
+ "easings": [
+  "linear",
+  "ease-in",
+  "ease-out",
+  "ease-in-out",
+  "ease-in cubic",
+  "ease-out cubic",
+  "smoother",
+  "sine in-out",
+  "ease-out back",
+  "bounce"
+ ]
+}

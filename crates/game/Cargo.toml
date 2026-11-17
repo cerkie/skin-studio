@@ -1,0 +1,10 @@
+[package]
+name = "game"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+png = "0.18"
+fontdue = "0.9"
+zip = { version = "2", default-features = false, features = ["deflate"] }

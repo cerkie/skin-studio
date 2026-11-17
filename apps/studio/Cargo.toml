@@ -1,0 +1,26 @@
+[package]
+name = "studio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine = { version = "0.1.0", path = "../../crates/engine" }
+game = { path = "../../crates/game" }
+preview-window = { path = "../../crates/preview-window" }
+preview = { path = "../../crates/preview" }
+png = "0.18"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+pollster = "1.0.1"
+serde_json = "1"
+wgpu = "30.0.2"
+winit = "0.30.13"
+egui = "0.37"
+egui-winit = "0.37"
+egui-wgpu = "0.37"
+
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15", default-features = false }
+windows-sys = { version = "0.61.2", features = ["Win32_Graphics_Dwm"] }
+
+[target.'cfg(not(windows))'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }

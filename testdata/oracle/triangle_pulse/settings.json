@@ -1,0 +1,85 @@
+{
+ "preset": "Triangle",
+ "image": "",
+ "fps": 120.0,
+ "duration": 500.0,
+ "speed": 1.0,
+ "lead": 0.0,
+ "tail": 0.0,
+ "disappear": 0.0,
+ "fade_in": 0,
+ "fade_out": 0,
+ "width": 100,
+ "height": 50,
+ "copies": 1,
+ "pingpong": true,
+ "color_on": false,
+ "color_start": "#00ff26",
+ "color_end": "#ffffff",
+ "color_strength": 1.0,
+ "color_ease": "linear",
+ "hires": false,
+ "export": "1x",
+ "no_loop": true,
+ "window_mode": "shift",
+ "deband_on": false,
+ "deband_radius": 8.0,
+ "deband_thr_rgb": 3.0,
+ "deband_thr_a": 3.0,
+ "deband_iter": 2,
+ "deband_grain": 0.0,
+ "outline_on": false,
+ "outline_w": 2.0,
+ "outline_color": "#000000",
+ "outline_opacity": 1.0,
+ "shadow_on": false,
+ "shadow_dx": 2.0,
+ "shadow_dy": 2.0,
+ "shadow_blur": 3.0,
+ "shadow_color": "#000000",
+ "shadow_opacity": 0.6,
+ "sl_cs": 4.0,
+ "sl_ar": 9.0,
+ "sl_soft": 160.0,
+ "sl_tight": 0.0,
+ "sl_thick": 2.0,
+ "sl_alpha": 0.9,
+ "sl_overlap": 1.0,
+ "props": {
+  "x": [
+   0.5,
+   0.5,
+   "linear"
+  ],
+  "y": [
+   0.0,
+   0.0,
+   "linear"
+  ],
+  "sx": [
+   1.0,
+   1.0,
+   "linear"
+  ],
+  "sy": [
+   1,
+   2.5,
+   "ease-in-out"
+  ],
+  "rot": [
+   0.0,
+   0.0,
+   "linear"
+  ],
+  "alpha": [
+   0.4,
+   1,
+   "ease-in-out"
+  ],
+  "blur": [
+   0.0,
+   0.0,
+   "linear"
+  ]
+ }
+}
