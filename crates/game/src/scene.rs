@@ -625,10 +625,10 @@ impl Scene {
                                 }
                             }
                         }
-                        // after the end the body fades: quickly when it has been snaking out (lazer: 40 ms), over 240 ms otherwise
+                        // After the end: a body that has been snaking out is already gone (drawing it again would flash the whole
+                        // thing), otherwise the full body fades over 240 ms.
                         if t > end {
-                            let base = frac(t, appear, appear + self.fade_in);
-                            a = base * (1.0 - frac(t, end, end + if self.snake_out { 40.0 } else { 240.0 }));
+                            a = if self.snake_out { 0.0 } else { frac(t, appear, appear + self.fade_in) * (1.0 - frac(t, end, end + 240.0)) };
                         }
                         let track = map.slider_track.or_else(|| self.skin.ini.color("slidertrackoverride")).map(|c| [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]);
                         let col = track.unwrap_or(self.colors[o.color_index % self.colors.len()]);
