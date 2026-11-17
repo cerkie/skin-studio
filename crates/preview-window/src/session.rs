@@ -317,6 +317,8 @@ pub struct SessionConfig {
     pub offset_ms: f32,
     pub cursor_scale: f32,
     pub hit_lighting: bool,
+    pub snake_in: bool,
+    pub snake_out: bool,
     /// Playback speed, 1.0 = as played.
     pub speed: f32,
     /// Carry on from this map time (and play or pause state) instead of the start, as after a skin change.
@@ -397,6 +399,8 @@ impl Session {
         let mut scene = Scene::new(map.clone(), skin.clone(), sheet.clone(), follow);
         scene.cursor_scale = cfg.cursor_scale;
         scene.hit_lighting = cfg.hit_lighting;
+        scene.snake_in = cfg.snake_in;
+        scene.snake_out = cfg.snake_out;
         let renderer = GameRenderer::new(device, queue, format, size, &sheet.rgba, (sheet.w, sheet.h), &scene.geoms, ss);
         let first = map.objects.first().map(|o| o.time).unwrap_or(0.0);
         let last = map.objects.last().map(|o| o.end_time).unwrap_or(first + 1000.0);
@@ -531,6 +535,11 @@ impl Session {
             a.speed = self.speed;
         }
         self.seek_audio();
+    }
+
+    pub fn set_snaking(&mut self, snake_in: bool, snake_out: bool) {
+        self.scene.snake_in = snake_in;
+        self.scene.snake_out = snake_out;
     }
 
     pub fn set_hit_lighting(&mut self, on: bool) {

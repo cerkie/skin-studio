@@ -29,6 +29,11 @@ pub struct SliderDraw {
     /// Segment range of the body to draw (snaking).
     pub from: usize,
     pub to: usize,
+    /// The body's growing end: the last whole path point and the exact point the body reaches (a partial segment and a round
+    /// cap are drawn there, so snaking is smooth however long the segments are).
+    pub head: Option<(P, P)>,
+    /// The same for the shrinking end behind the ball: the first whole path point and the exact point.
+    pub tail: Option<(P, P)>,
     pub alpha: f32,
     pub border: [f32; 3],
     pub outer: [f32; 3],
@@ -81,34 +86,51 @@ pub struct SliderGeom {
     pub verts: Vec<[f32; 3]>,
     /// Per segment: vertex range of the quad.
     pub quads: Vec<Range<u32>>,
-    /// Per path point: vertex range of its round cap.
+    /// Per path point: vertex range of its round cap (empty for the extra points on straight stretches).
     pub caps: Vec<Range<u32>>,
-    /// Per path point: a cap kept apart from the strip, drawn only when the body is trimmed exactly there.
-    pub extra: Vec<Option<Range<u32>>>,
     /// Per path point: how far along the path it is (0 to 1, by length), so trimming follows the ball exactly.
     pub cum: Vec<f32>,
+    /// The path points, as placed in the view.
+    pub pts: Vec<P>,
+    pub radius: f32,
 }
 
+const CAP: usize = 48;
+
 impl SliderGeom {
-    /// Whether the body can end, rounded, at path point `i`.
-    fn can_end_at(&self, i: usize) -> bool {
-        self.caps[i].start != self.caps[i].end || self.extra[i].is_some()
+    /// The strip between two points: a double-sided quad whose third coordinate is the distance from the centre line.
+    pub fn quad_verts(a: P, b: P, radius: f32, out: &mut Vec<[f32; 3]>) {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let l = dx.hypot(dy).max(1e-6);
+        let (nx, ny) = (-dy / l * radius, dx / l * radius);
+        let v = |p: P, off: f32, d: f32| [p[0] + nx * off, p[1] + ny * off, d];
+        let tri = [(a, 1.0, 1.0), (a, 0.0, 0.0), (b, 1.0, 1.0), (a, 0.0, 0.0), (b, 0.0, 0.0), (b, 1.0, 1.0), (a, 0.0, 0.0), (a, -1.0, 1.0), (b, 0.0, 0.0), (a, -1.0, 1.0), (b, -1.0, 1.0), (b, 0.0, 0.0)];
+        for (p, off, d) in tri {
+            out.push(v(p, off, d));
+        }
     }
 
-    /// The first point at or after `i` that can end the body.
-    fn end_from(&self, mut i: usize) -> usize {
-        while i + 1 < self.caps.len() && !self.can_end_at(i) {
-            i += 1;
+    /// A round cap: a circumscribed polygon, so its flat sides sit exactly on the circle and meet the strips without notches.
+    pub fn cap_verts(c: P, radius: f32, out: &mut Vec<[f32; 3]>) {
+        let rim = radius / (std::f32::consts::PI / CAP as f32).cos();
+        for k in 0..CAP {
+            let (a0, a1) = (k as f32 / CAP as f32 * std::f32::consts::TAU, (k + 1) as f32 / CAP as f32 * std::f32::consts::TAU);
+            out.push([c[0], c[1], 0.0]);
+            out.push([c[0] + rim * (a0 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a0 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
+            out.push([c[0] + rim * (a1 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a1 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
         }
-        i
     }
 
-    /// The last point at or before `i` that can end the body.
-    fn end_before(&self, mut i: usize) -> usize {
-        while i > 0 && !self.can_end_at(i) {
-            i -= 1;
+    /// The last path point at or before `f` (0 to 1 along the path) and the exact point at `f`.
+    pub fn point_at(&self, f: f32) -> (usize, P) {
+        let n = self.pts.len();
+        let i = self.cum.partition_point(|&c| c <= f).saturating_sub(1).min(n.saturating_sub(1));
+        if i + 1 >= n {
+            return (i, self.pts[n - 1]);
         }
-        i
+        let (c0, c1) = (self.cum[i], self.cum[i + 1]);
+        let u = if c1 > c0 { ((f - c0) / (c1 - c0)).clamp(0.0, 1.0) } else { 0.0 };
+        (i, [self.pts[i][0] + (self.pts[i + 1][0] - self.pts[i][0]) * u, self.pts[i][1] + (self.pts[i + 1][1] - self.pts[i][1]) * u])
     }
 }
 
@@ -122,73 +144,38 @@ fn build_geom(pts: &[P], origin: P, radius: f32) -> SliderGeom {
         }
     }
     orig.push(*pts.last().unwrap());
-    // Long straight stretches get extra points so the body can be trimmed close to the ball. Those points carry no cap in the
-    // main strip (caps spaced along a straight edge would scallop the outline); every fourth one has a spare cap that is
-    // drawn on its own when the body is trimmed exactly there.
-    struct Pt {
-        p: P,
-        orig: bool,
-        spare_cap: bool,
-    }
-    let mut keep: Vec<Pt> = vec![Pt { p: orig[0], orig: true, spare_cap: false }];
+    // Long straight stretches get extra points, so trimming can follow the ball closely. They have no cap: caps spaced along a
+    // straight edge would scallop the outline. (The exact ends are drawn separately, every frame.)
+    let mut keep: Vec<(P, bool)> = vec![(orig[0], true)];
     for w2 in orig.windows(2) {
         let l = (w2[1][0] - w2[0][0]).hypot(w2[1][1] - w2[0][1]);
         let n = (l / 3.5).ceil().max(1.0) as usize;
         for k in 1..=n {
             let u = k as f32 / n as f32;
-            keep.push(Pt { p: [w2[0][0] + (w2[1][0] - w2[0][0]) * u, w2[0][1] + (w2[1][1] - w2[0][1]) * u], orig: k == n, spare_cap: k < n && k % 4 == 0 });
+            keep.push(([w2[0][0] + (w2[1][0] - w2[0][0]) * u, w2[0][1] + (w2[1][1] - w2[0][1]) * u], k == n));
         }
     }
     let mut cum = vec![0.0f32];
     for w2 in keep.windows(2) {
-        cum.push(cum.last().unwrap() + (w2[1].p[0] - w2[0].p[0]).hypot(w2[1].p[1] - w2[0].p[1]));
+        cum.push(cum.last().unwrap() + (w2[1].0[0] - w2[0].0[0]).hypot(w2[1].0[1] - w2[0].0[1]));
     }
     let total = cum.last().copied().unwrap_or(1.0).max(1e-6);
     for c in cum.iter_mut() {
         *c /= total;
     }
     let w = |p: P| [p[0] + origin[0], p[1] + origin[1]];
-    let mut g = SliderGeom { verts: vec![], quads: vec![], caps: vec![], extra: vec![], cum };
-    // a circumscribed polygon: the flat sides sit exactly on the circle, so caps meet the strips without notches
-    const CAP: usize = 48;
-    let rim = radius / (std::f32::consts::PI / CAP as f32).cos();
-    let cap_verts = |c: P, out: &mut Vec<[f32; 3]>| {
-        for k in 0..CAP {
-            let (a0, a1) = (k as f32 / CAP as f32 * std::f32::consts::TAU, (k + 1) as f32 / CAP as f32 * std::f32::consts::TAU);
-            out.push([c[0], c[1], 0.0]);
-            out.push([c[0] + rim * (a0 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a0 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
-            out.push([c[0] + rim * (a1 + std::f32::consts::PI / CAP as f32).cos(), c[1] + rim * (a1 + std::f32::consts::PI / CAP as f32).sin(), 1.0]);
-        }
-    };
-    for (i, pt) in keep.iter().enumerate() {
-        let c = w(pt.p);
+    let placed: Vec<P> = keep.iter().map(|(p, _)| w(*p)).collect();
+    let mut g = SliderGeom { verts: vec![], quads: vec![], caps: vec![], cum, pts: placed.clone(), radius };
+    for (i, (_, is_orig)) in keep.iter().enumerate() {
         let s = g.verts.len() as u32;
-        if pt.orig {
-            cap_verts(c, &mut g.verts);
+        if *is_orig {
+            SliderGeom::cap_verts(placed[i], radius, &mut g.verts);
         }
         g.caps.push(s..g.verts.len() as u32);
         if i + 1 < keep.len() {
-            let (a, b) = (w(pt.p), w(keep[i + 1].p));
-            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-            let l = dx.hypot(dy).max(1e-6);
-            let (nx, ny) = (-dy / l * radius, dx / l * radius);
             let s = g.verts.len() as u32;
-            let v = |p: P, off: f32, d: f32| [p[0] + nx * off, p[1] + ny * off, d];
-            let tri = [(a, 1.0, 1.0), (a, 0.0, 0.0), (b, 1.0, 1.0), (a, 0.0, 0.0), (b, 0.0, 0.0), (b, 1.0, 1.0), (a, 0.0, 0.0), (a, -1.0, 1.0), (b, 0.0, 0.0), (a, -1.0, 1.0), (b, -1.0, 1.0), (b, 0.0, 0.0)];
-            for (p, off, d) in tri {
-                g.verts.push(v(p, off, d));
-            }
+            SliderGeom::quad_verts(placed[i], placed[i + 1], radius, &mut g.verts);
             g.quads.push(s..g.verts.len() as u32);
-        }
-    }
-    // the spare caps, after everything else
-    for pt in &keep {
-        if pt.spare_cap {
-            let s = g.verts.len() as u32;
-            cap_verts(w(pt.p), &mut g.verts);
-            g.extra.push(Some(s..g.verts.len() as u32));
-        } else {
-            g.extra.push(None);
         }
     }
     g
@@ -225,6 +212,9 @@ pub struct Scene {
     pub cursor_scale: f32,
     /// The glow that flashes around a hit circle (off unless asked for).
     pub hit_lighting: bool,
+    /// lazer's "snaking in" and "snaking out" slider settings (both on by default).
+    pub snake_in: bool,
+    pub snake_out: bool,
     pub map: Arc<Beatmap>,
     pub skin: Arc<Skin>,
     pub sheet: Arc<Sheet>,
@@ -282,6 +272,8 @@ impl Scene {
             argon,
             cursor_scale: 1.0,
             hit_lighting: false,
+            snake_in: true,
+            snake_out: true,
             map,
             skin,
             sheet,
@@ -604,20 +596,39 @@ impl Scene {
                     // body, snaking in then out on the final span
                     if let Some(g) = &self.geoms[i] {
                         let nseg = g.quads.len();
-                        let snake_in = frac(t, appear, appear + self.preempt / 3.0);
+                        let snake_in = if self.snake_in { frac(t, appear, appear + self.preempt / 3.0) } else { 1.0 };
                         let mut from = 0usize;
-                        let mut to = g.end_from(g.cum.partition_point(|&c| c < snake_in).min(nseg));
+                        let mut to = nseg;
+                        let mut head = None;
+                        let mut tail = None;
+                        if snake_in < 1.0 {
+                            let (i, exact) = g.point_at(snake_in);
+                            to = i;
+                            head = Some((g.pts[i], exact));
+                        }
                         if t >= o.time {
                             to = nseg;
                             let total = s.span_duration * s.slides as f32;
                             let prog = ((t - o.time) / total).clamp(0.0, 1.0) * s.slides as f32;
-                            if s.slides % 2 == 1 && prog >= (s.slides - 1) as f32 && t <= end {
-                                let at = prog - (s.slides - 1) as f32;
-                                from = g.end_before(g.cum.partition_point(|&c| c <= at).saturating_sub(1).min(nseg.saturating_sub(1)));
+                            if self.snake_out && prog >= (s.slides - 1) as f32 && t <= end {
+                                // the last span: the body shrinks away behind the ball (from the start when it runs forwards,
+                                // from the far end when it runs back)
+                                let along = (prog - (s.slides - 1) as f32).clamp(0.0, 1.0);
+                                if s.slides % 2 == 1 {
+                                    let (j, exact) = g.point_at(along);
+                                    from = (j + 1).min(nseg);
+                                    tail = Some((g.pts[from], exact));
+                                } else {
+                                    let (j, exact) = g.point_at(1.0 - along);
+                                    to = j;
+                                    head = Some((g.pts[j], exact));
+                                }
                             }
                         }
+                        // after the end the body fades: quickly when it has been snaking out (lazer: 40 ms), over 240 ms otherwise
                         if t > end {
-                            a = 0.0;
+                            let base = frac(t, appear, appear + self.fade_in);
+                            a = base * (1.0 - frac(t, end, end + if self.snake_out { 40.0 } else { 240.0 }));
                         }
                         let track = map.slider_track.or_else(|| self.skin.ini.color("slidertrackoverride")).map(|c| [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]);
                         let col = track.unwrap_or(self.colors[o.color_index % self.colors.len()]);
@@ -635,6 +646,8 @@ impl Scene {
                             geom: i,
                             from,
                             to: to.max(from),
+                            head,
+                            tail,
                             alpha: a,
                             border,
                             outer,

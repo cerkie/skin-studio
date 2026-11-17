@@ -155,6 +155,8 @@ pub struct Config {
     pub offset_ms: f32,
     pub cursor_scale: f32,
     pub hit_lighting: bool,
+    pub snake_in: bool,
+    pub snake_out: bool,
     pub speed: f32,
     /// Where random maps come from: "auto", "lazer" or "stable".
     pub library: String,
@@ -173,6 +175,8 @@ impl Default for Config {
             offset_ms: 0.0,
             cursor_scale: 1.0,
             hit_lighting: false,
+            snake_in: true,
+            snake_out: true,
             speed: 1.0,
             library: "auto".into(),
         }
@@ -210,6 +214,12 @@ impl Config {
         if let Some(b) = v.get("hit_lighting").and_then(|x| x.as_bool()) {
             c.hit_lighting = b;
         }
+        if let Some(b) = v.get("snake_in").and_then(|x| x.as_bool()) {
+            c.snake_in = b;
+        }
+        if let Some(b) = v.get("snake_out").and_then(|x| x.as_bool()) {
+            c.snake_out = b;
+        }
         if let Some(x) = v.get("speed").and_then(|x| x.as_f64()) {
             c.speed = (x as f32).clamp(0.1, 2.0);
         }
@@ -221,7 +231,7 @@ impl Config {
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let v = serde_json::json!({ "settings": self.settings, "skin": self.skin, "sound_skin": self.sound_skin, "map": self.map, "songs": self.songs, "volume": self.volume, "muted": self.muted, "offset_ms": self.offset_ms, "cursor_scale": self.cursor_scale, "hit_lighting": self.hit_lighting, "speed": self.speed, "library": self.library });
+        let v = serde_json::json!({ "settings": self.settings, "skin": self.skin, "sound_skin": self.sound_skin, "map": self.map, "songs": self.songs, "volume": self.volume, "muted": self.muted, "offset_ms": self.offset_ms, "cursor_scale": self.cursor_scale, "hit_lighting": self.hit_lighting, "snake_in": self.snake_in, "snake_out": self.snake_out, "speed": self.speed, "library": self.library });
         let _ = std::fs::write(f, serde_json::to_string_pretty(&v).unwrap_or_default());
     }
 }

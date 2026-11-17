@@ -195,6 +195,9 @@ impl App {
             if let Some(v) = out.hit_lighting {
                 s.set_hit_lighting(v);
             }
+            if let Some((a, b)) = out.snaking {
+                s.set_snaking(a, b);
+            }
         }
         let size_px = (l.config.width as f32, l.config.height as f32);
         let vp_px = out.viewport.map(|r| [r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp]).unwrap_or([0.0, 0.0, size_px.0, size_px.1]);

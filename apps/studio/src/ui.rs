@@ -34,6 +34,7 @@ pub struct UiOut {
     pub offset: Option<f32>,
     pub cursor: Option<f32>,
     pub hit_lighting: Option<bool>,
+    pub snaking: Option<(bool, bool)>,
     pub speed: Option<f32>,
 }
 
@@ -536,7 +537,7 @@ const SEARCHABLE: &[(Tab, &str)] = &[
     (Tab::Timing, "Fade in"), (Tab::Timing, "Fade out"), (Tab::Timing, "Copies in a row"), (Tab::Timing, "Play forward and back"), (Tab::Timing, "Play once"),
     (Tab::Motion, "Position keyframes"), (Tab::Motion, "Scale keyframes"), (Tab::Motion, "Rotation keyframes"), (Tab::Motion, "Opacity keyframes"), (Tab::Motion, "Blur keyframes"), (Tab::Motion, "Easing"),
     (Tab::Look, "Color keys tint"), (Tab::Look, "Add a color"), (Tab::Look, "Outline"), (Tab::Look, "Outline color"), (Tab::Look, "Drop shadow"), (Tab::Look, "Shadow blur"), (Tab::Look, "Debanding"), (Tab::Look, "Grain dither"),
-    (Tab::Preview, "Skin"), (Tab::Preview, "Hit sounds"), (Tab::Preview, "Map"), (Tab::Preview, "Random maps lazer stable library"), (Tab::Preview, "Hit lighting"), (Tab::Preview, "Sound"), (Tab::Preview, "Volume"), (Tab::Preview, "Music offset"), (Tab::Preview, "Playback speed"), (Tab::Preview, "Cursor size"),
+    (Tab::Preview, "Skin"), (Tab::Preview, "Hit sounds"), (Tab::Preview, "Map"), (Tab::Preview, "Random maps lazer stable library"), (Tab::Preview, "Snaking sliders in out"), (Tab::Preview, "Hit lighting"), (Tab::Preview, "Sound"), (Tab::Preview, "Volume"), (Tab::Preview, "Music offset"), (Tab::Preview, "Playback speed"), (Tab::Preview, "Cursor size"),
     (Tab::Export, "Export sizes 1x 2x"), (Tab::Export, "Export images"), (Tab::Export, "History saved versions"), (Tab::Export, "Import followpoint images"),
 ];
 
@@ -880,6 +881,16 @@ fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
     }
     if th::button_wide(ui, "Choose the Songs folder...", Kind::Dark, true).clicked() {
         st.pick(PickKind::Songs);
+    }
+    th::subsection_header(ui, "Sliders");
+    let (mut si, mut so) = (st.cfg.snake_in, st.cfg.snake_out);
+    let c1 = th::switch_row(ui, "snake_in", "Snaking in sliders", &mut si);
+    let c2 = th::switch_row(ui, "snake_out", "Snaking out sliders", &mut so);
+    if c1 || c2 {
+        st.cfg.snake_in = si;
+        st.cfg.snake_out = so;
+        st.cfg.save();
+        out.snaking = Some((si, so));
     }
     th::subsection_header(ui, "Effects");
     let mut hl = st.cfg.hit_lighting;

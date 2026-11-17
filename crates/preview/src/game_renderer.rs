@@ -39,6 +39,12 @@ pub struct GameRenderer {
     slider_insts: wgpu::Buffer,
     slider_cap: usize,
     verts: wgpu::Buffer,
+    /// The exact growing and shrinking ends of the slider bodies, rebuilt every frame.
+    dyn_verts: wgpu::Buffer,
+    dyn_cap: usize,
+    dyn_scratch: Vec<[f32; 3]>,
+    /// Per slider of the frame: the ranges of `dyn_scratch` to draw.
+    dyn_ranges: Vec<Vec<std::ops::Range<u32>>>,
     /// First vertex of each slider's geometry in `verts`.
     base: Vec<u32>,
     depth: wgpu::TextureView,
@@ -234,13 +240,15 @@ impl GameRenderer {
         if !all.is_empty() {
             queue.write_buffer(&verts, 0, bytemuck::cast_slice(&all));
         }
+        let dyn_cap = 1 << 16;
+        let dyn_verts = device.create_buffer(&wgpu::BufferDescriptor { label: Some("slider ends"), size: (dyn_cap * 12) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let inst_cap = 8192;
         let slider_cap = 256;
         let instances = device.create_buffer(&wgpu::BufferDescriptor { label: Some("instances"), size: (inst_cap * std::mem::size_of::<Instance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let slider_insts = device.create_buffer(&wgpu::BufferDescriptor { label: Some("slider instances"), size: (slider_cap * std::mem::size_of::<SliderInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let depth = depth_tex(&device, size);
         let msaa = msaa_tex(&device, size, format);
-        GameRenderer { device, queue, sprite_pipe, add_pipe, prepass_pipe, body_pipe, bind_group, globals, instances, inst_cap, slider_insts, slider_cap, verts, base, depth, msaa, format, scratch: Vec::new(), sinst: Vec::new(), sheet_size, bgl, sampler, size, scale, origin: [0.0, 0.0] }
+        GameRenderer { device, queue, sprite_pipe, add_pipe, prepass_pipe, body_pipe, bind_group, globals, instances, inst_cap, slider_insts, slider_cap, verts, dyn_verts, dyn_cap, dyn_scratch: Vec::new(), dyn_ranges: Vec::new(), base, depth, msaa, format, scratch: Vec::new(), sinst: Vec::new(), sheet_size, bgl, sampler, size, scale, origin: [0.0, 0.0] }
     }
 
     /// Replace the skin sheet (a new follow-point animation was appended to it).
@@ -331,6 +339,27 @@ impl GameRenderer {
         if ns > 0 {
             self.queue.write_buffer(&self.slider_insts, 0, bytemuck::cast_slice(&self.sinst[..ns]));
         }
+        // the exact ends of the bodies that are snaking in or being trimmed behind the ball
+        self.dyn_scratch.clear();
+        self.dyn_ranges.clear();
+        for s in frame.sliders.iter() {
+            let mut ranges = Vec::new();
+            if let Some(g) = geoms.get(s.geom).and_then(|g| g.as_ref()) {
+                for end in [s.head, s.tail].into_iter().flatten() {
+                    if self.dyn_scratch.len() + 160 > self.dyn_cap {
+                        break;
+                    }
+                    let start = self.dyn_scratch.len() as u32;
+                    game::scene::SliderGeom::quad_verts(end.0, end.1, g.radius, &mut self.dyn_scratch);
+                    game::scene::SliderGeom::cap_verts(end.1, g.radius, &mut self.dyn_scratch);
+                    ranges.push(start..self.dyn_scratch.len() as u32);
+                }
+            }
+            self.dyn_ranges.push(ranges);
+        }
+        if !self.dyn_scratch.is_empty() {
+            self.queue.write_buffer(&self.dyn_verts, 0, bytemuck::cast_slice(&self.dyn_scratch));
+        }
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -376,17 +405,17 @@ impl GameRenderer {
                         let v1 = self.base[s.geom] + g.caps[last].end;
                         pass.set_vertex_buffer(0, self.verts.slice(..));
                         pass.set_vertex_buffer(1, self.slider_insts.slice(..));
-                        // the strip, then the spare caps where the body is trimmed to a point that has none in the strip
-                        let mut ranges = vec![v0..v1];
-                        for i in [first, last] {
-                            if let Some(Some(x)) = g.extra.get(i) {
-                                ranges.push(self.base[s.geom] + x.start..self.base[s.geom] + x.end);
-                            }
-                        }
                         for pipe in [&self.prepass_pipe, &self.body_pipe] {
                             pass.set_pipeline(pipe);
-                            for r in &ranges {
-                                pass.draw(r.clone(), *si as u32..*si as u32 + 1);
+                            pass.set_vertex_buffer(0, self.verts.slice(..));
+                            pass.draw(v0..v1, *si as u32..*si as u32 + 1);
+                            if let Some(ranges) = self.dyn_ranges.get(*si) {
+                                if !ranges.is_empty() {
+                                    pass.set_vertex_buffer(0, self.dyn_verts.slice(..));
+                                    for r in ranges {
+                                        pass.draw(r.clone(), *si as u32..*si as u32 + 1);
+                                    }
+                                }
                             }
                         }
                     }

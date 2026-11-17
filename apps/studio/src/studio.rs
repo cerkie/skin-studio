@@ -211,6 +211,8 @@ impl Studio {
             offset_ms: self.cfg.offset_ms,
             cursor_scale: self.cfg.cursor_scale,
             hit_lighting: self.cfg.hit_lighting,
+            snake_in: self.cfg.snake_in,
+            snake_out: self.cfg.snake_out,
             speed: self.cfg.speed,
             resume: None,
         }
