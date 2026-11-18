@@ -56,6 +56,10 @@ pub enum Msg {
     Status(String),
     ImportDone(Result<engine::analyze::Analysis, String>),
     HistoryChanged,
+    /// A map for the lazer preview (resolved, with its audio next to it).
+    LazerMap(Result<PathBuf, String>),
+    /// A skin built for the lazer preview.
+    LazerSkin(Result<PathBuf, String>),
 }
 
 #[derive(Default)]
@@ -109,6 +113,12 @@ pub struct Studio {
     /// The .osu file the current session is playing.
     pub resolved_map: Option<PathBuf>,
     pub loading: bool,
+    /// The osu!lazer preview process, when it is the one drawing the preview.
+    pub lazer: Option<crate::lazer::Link>,
+    pub lazer_skin_dirty: bool,
+    lazer_skin_building: bool,
+    lazer_skin_sent: u32,
+    lazer_resume: Option<f32>,
     pub session_error: String,
     pub tx: Sender<Msg>,
     pub rx: Receiver<Msg>,
@@ -150,6 +160,11 @@ impl Studio {
             anim_idx: usize::MAX,
             anim_gen: 0,
             load_session: true,
+            lazer: None,
+            lazer_skin_dirty: false,
+            lazer_skin_building: false,
+            lazer_skin_sent: 0,
+            lazer_resume: None,
             resume: None,
             reroll_map: true,
             resolved_map: None,
@@ -215,6 +230,105 @@ impl Studio {
             snake_out: self.cfg.snake_out,
             speed: self.cfg.speed,
             resume: None,
+        }
+    }
+
+    /// Whether the osu!lazer preview is the one drawing the preview.
+    pub fn lazer_active(&self) -> bool {
+        self.lazer.is_some()
+    }
+
+    /// Hand the preview to osu!lazer's own renderer (a separate window), or take it back.
+    pub fn set_renderer(&mut self, lazer: bool) {
+        if lazer == self.lazer.is_some() {
+            return;
+        }
+        if lazer {
+            let Some(exe) = crate::lazer::find_host() else {
+                self.status = "The lazer preview component was not found. See the README for where to put it.".into();
+                self.cfg.renderer = "builtin".into();
+                return;
+            };
+            match crate::lazer::Link::spawn(&exe) {
+                Ok(mut l) => {
+                    l.send(serde_json::json!({ "cmd": "volume", "value": self.effective_volume() }));
+                    l.send(serde_json::json!({ "cmd": "speed", "value": self.cfg.speed }));
+                    l.send(serde_json::json!({ "cmd": "config", "hitLighting": self.cfg.hit_lighting, "snakingIn": self.cfg.snake_in, "snakingOut": self.cfg.snake_out, "cursorSize": self.cfg.cursor_scale }));
+                    self.lazer = Some(l);
+                    self.cfg.renderer = "lazer".into();
+                    self.reroll_map = false;
+                    self.lazer_request_map();
+                }
+                Err(e) => {
+                    self.status = format!("The lazer preview could not be started: {e}");
+                    self.cfg.renderer = "builtin".into();
+                }
+            }
+        } else {
+            self.lazer = None; // closes it
+            self.cfg.renderer = "builtin".into();
+            self.load_session = true;
+        }
+        self.cfg.save();
+    }
+
+    /// Resolve the map for the lazer preview (a new one when asked for, else the one already playing) and send it.
+    pub fn lazer_request_map(&mut self) {
+        self.load_session = false;
+        self.session_error.clear();
+        self.lazer_skin_dirty = true;
+        let keep = (!self.reroll_map).then(|| self.resolved_map.clone()).flatten();
+        if keep.is_some() && self.lazer.as_ref().is_some_and(|l| l.time.is_some()) {
+            // a skin change: the map carries on
+            return;
+        }
+        self.reroll_map = false;
+        self.loading = true;
+        let spec = keep.map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| self.cfg.map.clone());
+        let songs = self.cfg.songs.clone();
+        let library = self.cfg.library.clone();
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let r = paths::resolve_map(&spec, if songs.is_empty() { None } else { Some(&songs) }, &library);
+            let _ = tx.send(Msg::LazerMap(r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Called every frame while the lazer preview runs: take in what it says, and send it the animation when that changed.
+    pub fn lazer_tick(&mut self) {
+        let Some(l) = &mut self.lazer else { return };
+        if !l.alive() {
+            // its window was closed: back to the built-in preview
+            self.lazer = None;
+            self.cfg.renderer = "builtin".into();
+            self.cfg.save();
+            self.load_session = true;
+            return;
+        }
+        l.poll();
+        if let Some(e) = l.error.take() {
+            self.status = format!("lazer preview: {e}");
+        }
+        let acked = l.skin_ack >= self.lazer_skin_sent;
+        if self.lazer_skin_dirty && !self.lazer_skin_building && acked && l.ready && !self.frames.is_empty() {
+            self.lazer_skin_dirty = false;
+            self.lazer_skin_building = true;
+            let frames = self.frames.clone();
+            let fps = self.fps;
+            let base = self.cfg.skin.clone();
+            let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+            std::thread::spawn(move || {
+                let out = std::env::temp_dir().join("skinstudio").join(format!("lazer-skin-{}.osk", std::process::id() as u64 * 1_000_000 + std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_micros() as u64).unwrap_or(0)));
+                let _ = std::fs::create_dir_all(out.parent().unwrap());
+                let r = if base.is_empty() || base == "argon" {
+                    Err("the lazer preview needs a legacy skin to show a custom animation (Argon Pro draws its own follow points)".to_string())
+                } else {
+                    crate::lazer::build_skin(std::path::Path::new(&base), &frames, fps, &out).map(|_| out)
+                };
+                let _ = tx.send(Msg::LazerSkin(r));
+                ctx.request_repaint();
+            });
         }
     }
 
@@ -290,6 +404,7 @@ impl Studio {
                     self.fps = fps;
                     self.atlas = Some(atlas);
                     self.atlas_gen += 1;
+                    self.lazer_skin_dirty = true;
                 }
                 Msg::Prepared(Ok(p)) => {
                     self.resolved_map = Some(p.map_path().to_path_buf());
@@ -298,6 +413,29 @@ impl Studio {
                 Msg::Prepared(Err(e)) => {
                     self.loading = false;
                     self.session_error = e;
+                }
+                Msg::LazerMap(Ok(p)) => {
+                    self.loading = false;
+                    self.resolved_map = Some(p.clone());
+                    let resume = self.lazer_resume.take();
+                    if let Some(l) = &mut self.lazer {
+                        l.map(&p, resume);
+                    }
+                    self.lazer_skin_dirty = true;
+                }
+                Msg::LazerMap(Err(e)) => {
+                    self.loading = false;
+                    self.session_error = e;
+                }
+                Msg::LazerSkin(Ok(p)) => {
+                    self.lazer_skin_building = false;
+                    if let Some(l) = &mut self.lazer {
+                        self.lazer_skin_sent = l.skin(&p);
+                    }
+                }
+                Msg::LazerSkin(Err(e)) => {
+                    self.lazer_skin_building = false;
+                    self.status = format!("The skin for the lazer preview could not be built: {e}");
                 }
                 Msg::Sheet(..) => {}
                 Msg::Status(s) => self.status = s,

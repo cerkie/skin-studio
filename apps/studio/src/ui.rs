@@ -210,7 +210,10 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
         if clicked && !over_transport && sv.loaded {
             out.toggle_play = true;
         }
-        if st.loading {
+        if st.lazer_active() {
+            let msg = if st.loading { "Loading the map...".to_string() } else if sv.loaded { format!("Playing in the osu!lazer window\n{}", sv.info) } else { "Starting the osu!lazer preview...".to_string() };
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, msg, FontId::new(20.0, th::light()), CONTENT2);
+        } else if st.loading {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Loading the map...", FontId::new(22.0, th::light()), CONTENT2);
         } else if !st.session_error.is_empty() {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, &st.session_error, FontId::new(18.0, th::light()), CONTENT2);
@@ -849,6 +852,17 @@ fn tab_finish(ui: &mut Ui, st: &mut Studio) {
 }
 
 fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
+    th::subsection_header(ui, "Renderer");
+    let renderers = ["Built-in".to_string(), "osu!lazer (a separate window)".to_string()];
+    let cur = if st.lazer_active() { 1 } else { 0 };
+    if let Some(i) = th::dropdown_row(ui, "renderer", "Draw the preview with", &renderers[cur], &renderers) {
+        st.set_renderer(i == 1);
+    }
+    if st.lazer_active() {
+        th::note(ui, "lazer draws the map with its own code and assets, so it looks exactly as in the game. It needs a skin that is not Argon Pro to show your animation. The window can be placed next to this one.");
+    } else if crate::lazer::find_host().is_none() {
+        th::note(ui, "The osu!lazer renderer is an optional download (lazer-preview, from the releases page). Unzip it into a folder called lazer-preview next to this program.");
+    }
     th::subsection_header(ui, "Skin");
     let names: Vec<String> = std::iter::once("Argon Pro".to_string()).chain(st.skins.iter().map(|(l, _)| l.clone())).collect();
     let cur = st.skin_label();

@@ -21,6 +21,17 @@ Followpoints are only the start. The goal is a full osu! skin editor, so these a
 
 Windows and Linux builds are on the [releases page](../../releases).
 
+## The osu!lazer preview (optional)
+
+The built-in preview is our own drawing of the map. For the exact look of the game there is an optional component that plays the map
+with osu!lazer's own renderer, in a window of its own: **Preview > Renderer > osu!lazer**. Your animation is put into a copy of your
+skin and shown by lazer itself; with it on, play, seek, speed and volume in Skin Studio control that window. It needs a skin that is
+not Argon Pro to show your animation.
+
+Download `lazer-preview-windows-x64.zip` from the releases page, unzip it into a folder called `lazer-preview` next to
+`studio.exe`, and install the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (desktop). To build it from
+source: `dotnet publish apps/lazer-preview -c Release`. The component includes lazer's own assets (see `NOTICE.md`).
+
 ## Build
 
     cargo build --release -p studio

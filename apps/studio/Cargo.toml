@@ -9,6 +9,7 @@ game = { path = "../../crates/game" }
 preview-window = { path = "../../crates/preview-window" }
 preview = { path = "../../crates/preview" }
 png = "0.18"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 pollster = "1.0.1"
 serde_json = "1"
