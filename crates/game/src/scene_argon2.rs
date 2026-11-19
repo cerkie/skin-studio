@@ -38,7 +38,7 @@ impl Scene {
         let tp = sp.start - p;
         let mut a = frac(t, tp, tp + self.fade_in * 0.5);
         if t > sp.end {
-            a *= 1.0 - frac(t, sp.end, sp.end + 160.0);
+            a *= 1.0 - frac(t, sp.end, sp.end + 240.0);
         }
         if a <= 0.0 {
             return;
@@ -120,33 +120,4 @@ impl Scene {
         }
     }
 
-    /// "GREAT" with a burst of rings, as ArgonJudgementPiece. Argon Pro shows nothing for a Great.
-    pub(crate) fn argon_judgement(&self, out: &mut Frame, pos: P, t: f32, at: f32, seed: u32) {
-        if matches!(self.skin.style, crate::skin::Style::Argon { pro: true }) {
-            return;
-        }
-        let dt = t - at;
-        if !(0.0..=1000.0).contains(&dt) {
-            return;
-        }
-        let blue = [0.6, 0.933, 1.0]; // BlueLight, the color of a Great
-        let k = self.scale;
-        let fade = 1.0 - frac(dt, 0.0, 800.0);
-        let text_a = ease_out_quint(frac(dt, 0.0, 300.0));
-        let text_k = 1.0 + 0.2 * ease_out_quint(frac(dt, 0.0, 1800.0));
-        self.sprite_add(out, "ar_great", pos, k * text_k, 0.0, text_a * fade, Some(blue));
-        // eight rings fly outwards: four small, four large
-        let ring_fade = 1.0 - ease_out_quint(frac(dt, 0.0, 1000.0));
-        for i in 0..8u32 {
-            let mut h = (seed.wrapping_mul(2654435761)).wrapping_add(i.wrapping_mul(40503)).wrapping_mul(2246822519);
-            h ^= h >> 15;
-            let dir = (h & 0xffff) as f32 / 65535.0 * std::f32::consts::TAU;
-            h = h.wrapping_mul(3266489917);
-            let dist = 26.0 + (h & 0xffff) as f32 / 65535.0 * 26.0;
-            let travel = ease_out_quint(frac(dt, 0.0, 600.0));
-            let r = dist * (0.3 + 0.7 * travel);
-            let name = if i < 4 { "ar_jring_s" } else { "ar_jring_l" };
-            self.sprite_add(out, name, [pos[0] + dir.cos() * r * k, pos[1] + dir.sin() * r * k], k, 0.0, ring_fade, Some(blue));
-        }
-    }
 }

@@ -69,6 +69,8 @@ struct Audio {
     /// After a seek the music position is not trusted for a moment.
     ignore_until: std::time::Instant,
     count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Where the music comes from, to start it again when it has played to its end.
+    path: std::path::PathBuf,
     /// Samples per second of the music (rate x channels).
     per_sec: f64,
     sink: rodio::MixerDeviceSink,
@@ -193,6 +195,12 @@ impl Audio {
     /// Put the music at `ms` right away; its reported position is ignored until the player has really moved.
     fn seek_music(&mut self, ms: f32) {
         let ms = ms.max(0.0);
+        // a song that has played to its end has nothing left in the player to seek in: queue it again
+        if self.player.empty() {
+            if let Some(dec) = std::fs::File::open(&self.path).ok().and_then(|f| rodio::Decoder::try_from(f).ok()) {
+                self.player.append(CountSrc { inner: dec, n: self.count.clone() });
+            }
+        }
         self.count.store((ms as f64 / 1000.0 * self.per_sec) as u64, std::sync::atomic::Ordering::Relaxed);
         self.ignore_until = std::time::Instant::now() + Duration::from_millis(250);
         let _ = self.player.try_seek(Duration::from_secs_f32(ms / 1000.0 / self.speed.max(0.05)));
@@ -251,7 +259,7 @@ fn open_audio(map: &Beatmap, samples: std::collections::HashMap<String, Sample>,
             eprintln!("audio: seek failed ({e:?})");
         }
     }
-    let mut a = Audio { speed: 1.0, born: std::time::Instant::now(), gain: 0.0, ignore_until: std::time::Instant::now(), count, per_sec, sink, player, samples, volume, events, next_event: 0, loops, active: None };
+    let mut a = Audio { path: path.clone(), speed: 1.0, born: std::time::Instant::now(), gain: 0.0, ignore_until: std::time::Instant::now(), count, per_sec, sink, player, samples, volume, events, next_event: 0, loops, active: None };
     a.set_volume(volume);
     a.seek_events(start_ms);
     a.player.play();
@@ -259,18 +267,7 @@ fn open_audio(map: &Beatmap, samples: std::collections::HashMap<String, Sample>,
 }
 
 fn base_sheet(skin: &Skin, map: &Beatmap, ss: f32) -> Sheet {
-    let scale = engine::lazer::circle_scale(map.cs);
-    if matches!(skin.style, skin::Style::Argon { .. }) {
-        let mut s = Sheet::default();
-        game::argon::add_to_sheet(&mut s, scale, ss);
-        s
-    } else {
-        let mut sheet = Sheet::pack(&skin::gameplay_entries(skin, scale, ss));
-        if sheet.get("approachcircle").is_none() {
-            skin::add_default_approach(&mut sheet, scale, ss);
-        }
-        sheet
-    }
+    skin::base_sheet(skin, map.cs, ss)
 }
 
 /// The skin sheet with the follow-point animation appended below it.
@@ -383,6 +380,8 @@ pub struct Session {
     pub clock_ms: f32,
     pub start_ms: f32,
     pub end_ms: f32,
+    /// The map has played to its end; whoever owns the session decides what comes next (see `restart`).
+    pub ended: bool,
     pub playing: bool,
     offset_ms: f32,
     speed: f32,
@@ -424,7 +423,7 @@ impl Session {
             load_ms,
             if audio.is_some() { format!("on, {n_samples} sounds, {n_events} hit events, {n_loops} loops") } else { "off".into() }
         );
-        let mut s = Session { map, skin, scene, base, renderer, frame: Frame::default(), audio, follow: cfg.follow.clone(), built_ss: ss, clock_ms: clock0, start_ms, end_ms, playing: cfg.resume.map(|(_, p)| p).unwrap_or(true), offset_ms: cfg.offset_ms, speed: cfg.speed.clamp(0.05, 4.0), info, sprites: 0, sliders: 0 };
+        let s = Session { map, skin, scene, base, renderer, frame: Frame::default(), audio, follow: cfg.follow.clone(), built_ss: ss, clock_ms: clock0, start_ms, end_ms, ended: false, playing: cfg.resume.map(|(_, p)| p).unwrap_or(true), offset_ms: cfg.offset_ms, speed: cfg.speed.clamp(0.05, 4.0), info, sprites: 0, sliders: 0 };
         if !s.playing {
             if let Some(a) = &s.audio {
                 a.player.pause();
@@ -487,7 +486,19 @@ impl Session {
 
     pub fn seek_to(&mut self, ms: f32) {
         self.clock_ms = ms.clamp(self.start_ms, self.end_ms);
+        self.ended = false;
         self.seek_audio();
+        if self.playing {
+            if let Some(a) = &self.audio {
+                a.player.play();
+            }
+        }
+    }
+
+    /// Play the same map again from the start.
+    pub fn restart(&mut self) {
+        self.seek_to(self.start_ms);
+        self.set_playing(true);
     }
 
     pub fn seek_by(&mut self, ms: f32) {
@@ -552,7 +563,7 @@ impl Session {
 
     /// Advance the clock by `dt` ms, following the music, and play the hit sounds that came due.
     pub fn advance(&mut self, dt: f32) {
-        if !self.playing {
+        if !self.playing || self.ended {
             return;
         }
         if let Some(a) = &mut self.audio {
@@ -560,8 +571,9 @@ impl Session {
         }
         let prev = self.clock_ms;
         self.clock_ms += dt.min(50.0) * self.speed;
-        if let Some(a) = &self.audio {
-            // the audio device is the master clock; follow it gently so frames stay smooth
+        // the audio device is the master clock while there is music left to play; once it has ended the clock runs on its own
+        if let Some(a) = self.audio.as_ref().filter(|a| !a.player.empty()) {
+            // follow it gently so frames stay smooth
             let ap = a.pos_ms() + self.offset_ms;
             let err = ap - self.clock_ms;
             if std::time::Instant::now() < a.ignore_until {
@@ -573,8 +585,8 @@ impl Session {
             }
         }
         if self.clock_ms >= self.end_ms {
-            self.clock_ms = self.start_ms;
-            self.seek_audio();
+            self.clock_ms = self.end_ms;
+            self.ended = true;
         } else if let Some(a) = &mut self.audio {
             a.update_loops(self.clock_ms, true);
             // a hit sound belongs to the moment it is hit, so a jump must not replay old ones

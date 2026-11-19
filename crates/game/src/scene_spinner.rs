@@ -12,9 +12,6 @@ const TOP: f32 = 45.0 - 16.0; // SPINNER_TOP_OFFSET
 fn ease_out_quad(t: f32) -> f32 {
     1.0 - (1.0 - t) * (1.0 - t)
 }
-fn ease_out_quint(t: f32) -> f32 {
-    1.0 - (1.0 - t).powi(5)
-}
 fn frac(t: f32, a: f32, b: f32) -> f32 {
     ((t - a) / (b - a).max(1e-6)).clamp(0.0, 1.0)
 }
@@ -62,10 +59,10 @@ impl Scene {
             return;
         }
         let has = |n: &str| self.sheet.get(n).is_some();
-        // whole spinner fades in over its fade-in time, out for 160 ms after it ends
+        // whole spinner fades in over its fade-in time, out for 240 ms after it ends (DrawableSpinner fade_out_duration)
         let mut a = frac(t, o.time - self.fade_in, o.time);
         if t > o.end_time {
-            a *= 1.0 - frac(t, o.end_time, o.end_time + 160.0);
+            a *= 1.0 - frac(t, o.end_time, o.end_time + 240.0);
         }
         if a <= 0.0 {
             return;
@@ -87,14 +84,16 @@ impl Scene {
                     bars += 1.0;
                 }
                 let f = (bars / 10.0).clamp(0.0, 1.0);
-                if f > 0.0 {
-                    let r = e.frames[0];
-                    let (full_w, full_h) = (r.w as f32 / e.ratio * K, r.h as f32 / e.ratio * K);
-                    let vis_h = full_h * f;
+                let r = e.frames[0];
+                let (full_w, full_h) = (r.w as f32 / e.ratio * K, r.h as f32 / e.ratio * K);
+                // the metre is masked to a window that rises from the 692-unit mark: the sprite shows from `final_h * (1 - f)` down
+                let vis_top = 692.0 * K * (1.0 - f);
+                if f > 0.0 && vis_top < full_h {
+                    let vis_h = full_h - vis_top;
                     let top_left = self.win(0.0, TOP);
-                    let rect = [r.x as f32, r.y as f32 + r.h as f32 * (1.0 - f), (r.x + r.w) as f32, (r.y + r.h) as f32];
+                    let rect = [r.x as f32, r.y as f32 + r.h as f32 * (vis_top / full_h), (r.x + r.w) as f32, (r.y + r.h) as f32];
                     out.sprites.push(crate::scene::SpriteDraw {
-                        pos: [top_left[0] + full_w * 0.5 + crate::scene::OFF_X, top_left[1] + full_h - vis_h * 0.5 + crate::scene::OFF_Y],
+                        pos: [top_left[0] + full_w * 0.5 + crate::scene::OFF_X, top_left[1] + vis_top + vis_h * 0.5 + crate::scene::OFF_Y],
                         half: [full_w * 0.5, vis_h * 0.5],
                         rot: 0.0,
                         alpha: a,
@@ -110,9 +109,15 @@ impl Scene {
         } else if has("spinner-top") {
             // new style
             let kk = K * (0.8 + ease_out_quad(progress) * 0.2);
-            let glow_a = progress * if t > o.end_time { 1.0 - frac(t, o.end_time, o.end_time + 300.0) } else { 1.0 };
+            // (lazer sets the glow's alpha to the progress every frame, which wins over the 300 ms fade-out queued at the end)
+            let glow_a = progress;
             if has("spinner-glow") {
-                self.sprite_add(out, "spinner-glow", center, kk, 0.0, glow_a * a, Some([3.0 / 255.0, 151.0 / 255.0, 1.0]));
+                // every bonus tick flashes the glow white, fading back to its blue over 200 ms
+                let last_bonus = (0..sp.total_ticks()).filter(|&i| sp.is_bonus(i) && sp.tick_time(i) <= t).map(|i| sp.tick_time(i)).fold(f32::MIN, f32::max);
+                let fl = 1.0 - frac(t - last_bonus, 0.0, 200.0);
+                let blue = [3.0 / 255.0, 151.0 / 255.0, 1.0];
+                let tint = [blue[0] + (1.0 - blue[0]) * fl, blue[1] + (1.0 - blue[1]) * fl, 1.0];
+                self.sprite_add(out, "spinner-glow", center, kk, 0.0, glow_a * a, Some(tint));
             }
             let (top_rot, mid_rot) = if has("spinner-middle2") { (rot * 0.5, rot) } else { (rot, rot) };
             self.sprite(out, "spinner-bottom", 0, center, kk, top_rot / 3.0, a, None);
@@ -154,7 +159,9 @@ impl Scene {
             let tl = self.win(320.0 - 87.0, 445.0 + slide);
             self.sprite(out, "spinner-rpm", 0, [tl[0] + w * 0.5, tl[1] + h * 0.5], K, 0.0, a, None);
             let rpm = format!("{}", sp.rpm(t) as i32);
-            let rp = self.win(320.0 + 80.0, 448.0 + slide + 10.0);
+            // the counter hangs from its top-right corner, so its centre is half a digit's height below that
+            let digit_h = self.sheet.get("sc0").map(|d| d.frames[0].h as f32 / d.ratio * K * 0.9).unwrap_or(0.0);
+            let rp = self.win(320.0 + 80.0, 448.0 + slide + digit_h * 0.5);
             self.score_text(out, &rpm, rp, K * 0.9, a, 1);
         }
         // bonus counter
@@ -162,9 +169,9 @@ impl Scene {
         if n > 0 {
             let tb = (0..sp.total_ticks()).filter(|&i| sp.is_bonus(i) && sp.tick_time(i) <= t).map(|i| sp.tick_time(i)).fold(f32::MIN, f32::max);
             let dt = t - tb;
-            let (s, al) = if max { (K * (1.4 + 0.4 * ease_out_quad(frac(dt, 0.0, 1000.0))), 1.0 - ease_out_quad(frac(dt, 0.0, 500.0))) } else { (K * (2.0 - 0.72 * ease_out_quad(frac(dt, 0.0, 800.0))), 1.0 - ease_out_quad(frac(dt, 0.0, 800.0))) };
+            let (s, al) = if max { (1.4 + 0.4 * ease_out_quad(frac(dt, 0.0, 1000.0)), 1.0 - ease_out_quad(frac(dt, 0.0, 500.0))) } else { (K * (2.0 - 0.72 * ease_out_quad(frac(dt, 0.0, 800.0))), 1.0 - ease_out_quad(frac(dt, 0.0, 800.0))) };
             if al > 0.0 {
-                self.score_text(out, &score.to_string(), self.win(320.0, TOP + 299.0), s, al, 0);
+                self.score_text(out, &score.to_string(), self.win(320.0, TOP + 299.0), s, al * a, 0);
             }
         }
     }

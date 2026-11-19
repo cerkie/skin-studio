@@ -12,7 +12,7 @@ namespace LazerPreview
         public static void Main(string[] args)
         {
             // standard output carries the protocol only; the framework's own logging goes to its log files
-            using GameHost host = Host.GetSuitableDesktopHost("skin-studio-lazer-preview");
+            using GameHost host = Host.GetSuitableDesktopHost("skin-studio-lazer-preview" + (System.Environment.GetEnvironmentVariable("SKIN_STUDIO_HOST_DATA") ?? ""));
             using var game = new PreviewGame();
             host.Run(game);
         }

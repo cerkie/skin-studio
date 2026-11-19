@@ -121,6 +121,21 @@ impl Realm {
         Ok(Table { root: tt[2] as usize, cols, idx })
     }
 
+    /// The values of a list column: one array, or, for a long list, the leaves of a B+tree of arrays (an inner node holds a
+    /// tagged size or an offsets array first, the children, and a tagged total last).
+    fn flat_list(&self, r: usize) -> R<Vec<i64>> {
+        let h = self.hdr(r)?;
+        let a = self.arr(r)?;
+        if !h.inner {
+            return Ok(a);
+        }
+        let mut out = Vec::new();
+        for c in a.iter().skip(1).take(a.len().saturating_sub(2)) {
+            out.extend(self.flat_list(*c as usize)?);
+        }
+        Ok(out)
+    }
+
     /// Every leaf of a cluster tree with the first object key it holds.
     fn leaves(&self, r: usize, base: i64, out: &mut Vec<(usize, i64)>) -> R<()> {
         let h = self.hdr(r)?;
@@ -227,7 +242,7 @@ pub fn read_sets(dir: &Path) -> R<Vec<LazerSet>> {
             if pending.get(i).copied().unwrap_or(0) != 0 || lists[i] == 0 {
                 continue;
             }
-            let files = rl.arr(lists[i] as usize)?.into_iter().filter_map(|k| {
+            let files = rl.flat_list(lists[i] as usize)?.into_iter().filter_map(|k| {
                 let (name, f) = usage.get(&k)?;
                 Some((name.clone(), hashes.get(f)?.clone()))
             }).collect();
@@ -235,6 +250,103 @@ pub fn read_sets(dir: &Path) -> R<Vec<LazerSet>> {
         }
     }
     Ok(sets)
+}
+
+/// One skin of the lazer database: its name and files as (name, SHA-256).
+pub struct LazerSkin {
+    pub name: String,
+    pub files: Vec<(String, String)>,
+}
+
+/// Every skin of the lazer database that has files of its own (the skins that come with the game have none).
+pub fn read_skins(dir: &Path) -> R<Vec<LazerSkin>> {
+    let path = dir.join("client.realm");
+    let d = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if d.get(16..20) != Some(b"T-DB") {
+        return Err("client.realm is not a Realm file".into());
+    }
+    let rl = Realm { d };
+    let leaf_rows = |t: &Table| -> R<Vec<(Vec<i64>, Vec<i64>)>> {
+        let mut ls = Vec::new();
+        rl.leaves(t.root, 0, &mut ls)?;
+        ls.into_iter().map(|(l, base)| {
+            let a = rl.arr(l)?;
+            let keys = rl.keys(&a, base)?;
+            Ok((a, keys))
+        }).collect()
+    };
+    let file_t = rl.table("File")?;
+    let mut hashes: HashMap<i64, String> = HashMap::new();
+    for (a, keys) in leaf_rows(&file_t)? {
+        let h = rl.strings(file_t.col(&a, "Hash")?)?;
+        for (k, s) in keys.into_iter().zip(h) {
+            hashes.insert(k, s);
+        }
+    }
+    let nfu_t = rl.table("RealmNamedFileUsage")?;
+    let mut usage: HashMap<i64, (String, i64)> = HashMap::new();
+    for (a, keys) in leaf_rows(&nfu_t)? {
+        let names = rl.strings(nfu_t.col(&a, "Filename")?)?;
+        let links = rl.arr(nfu_t.col(&a, "File")?)?;
+        for ((k, n), l) in keys.into_iter().zip(names).zip(links) {
+            usage.insert(k, (n, l - 1));
+        }
+    }
+    let skin_t = rl.table("Skin")?;
+    let mut skins = Vec::new();
+    for (a, keys) in leaf_rows(&skin_t)? {
+        let names = rl.strings(skin_t.col(&a, "Name")?)?;
+        let lists = rl.arr(skin_t.col(&a, "Files")?)?;
+        let pending = rl.arr(skin_t.col(&a, "DeletePending")?)?;
+        for i in 0..keys.len() {
+            if pending.get(i).copied().unwrap_or(0) != 0 || lists[i] == 0 {
+                continue;
+            }
+            let files: Vec<(String, String)> = rl.flat_list(lists[i] as usize)?.into_iter().filter_map(|k| {
+                let (name, f) = usage.get(&k)?;
+                Some((name.trim_end_matches(' ').to_string(), hashes.get(f)?.trim_end_matches(' ').to_string()))
+            }).collect();
+            if std::env::var_os("SKIN_STUDIO_REALM_DEBUG").is_some() {
+                let raw = rl.flat_list(lists[i] as usize)?;
+                eprintln!("{}: list {} resolved {} raw {:?}", names.get(i).cloned().unwrap_or_default(), raw.len(), files.len(), &raw[..raw.len().min(8)]);
+            }
+            if !files.is_empty() {
+                skins.push(LazerSkin { name: names.get(i).cloned().unwrap_or_default(), files });
+            }
+        }
+    }
+    Ok(skins)
+}
+
+/// Copy the files of a skin into `dest` under their own names.
+pub fn materialize_skin(dir: &Path, skin: &LazerSkin, dest: &Path) -> R<()> {
+    for (name, hash) in &skin.files {
+        if name.contains("..") || Path::new(name).is_absolute() || hash.len() < 2 {
+            continue;
+        }
+        let to = dest.join(name);
+        let src = file_path(dir, hash);
+        if to.is_file() && std::fs::metadata(&to).ok().map(|m| m.len()) == std::fs::metadata(&src).ok().map(|m| m.len()) {
+            continue;
+        }
+        if let Some(p) = to.parent() {
+            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+        }
+        std::fs::copy(&src, &to).map_err(|e| format!("{}: {e}", src.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod skin_tests {
+    #[test]
+    #[ignore]
+    fn lists_lazer_skins() {
+        let dir = super::lazer_dir().expect("lazer dir");
+        for s in super::read_skins(&dir).expect("skins") {
+            println!("{} ({} files) {}", s.name, s.files.len(), if s.name.to_lowercase().contains("cerkie") { s.files.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>().join(", ") } else { String::new() });
+        }
+    }
 }
 
 /// Where lazer stores a file.

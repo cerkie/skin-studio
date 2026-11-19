@@ -242,7 +242,7 @@ impl GameRenderer {
         }
         let dyn_cap = 1 << 16;
         let dyn_verts = device.create_buffer(&wgpu::BufferDescriptor { label: Some("slider ends"), size: (dyn_cap * 12) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let inst_cap = 8192;
+        let inst_cap = 65536;
         let slider_cap = 256;
         let instances = device.create_buffer(&wgpu::BufferDescriptor { label: Some("instances"), size: (inst_cap * std::mem::size_of::<Instance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let slider_insts = device.create_buffer(&wgpu::BufferDescriptor { label: Some("slider instances"), size: (slider_cap * std::mem::size_of::<SliderInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });

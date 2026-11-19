@@ -104,7 +104,7 @@ pub fn add_to_sheet(sheet: &mut Sheet, scale: f32, ss: f32) {
     let d = scale * ss * 2.0; // pixels per object unit: twice what the screen shows, for headroom when pieces grow
     let white = |a: f32| [1.0, 1.0, 1.0, a];
     let gray = |b: f32, a: f32| [b, b, b, a];
-    let mut put = |sheet: &mut Sheet, key: &str, w: f32, h: f32, density: f32, f: &dyn Fn(f32, f32) -> [f32; 4]| {
+    let put = |sheet: &mut Sheet, key: &str, w: f32, h: f32, density: f32, f: &dyn Fn(f32, f32) -> [f32; 4]| {
         let (pw, ph, px) = raster(w, h, density, f);
         sheet.add_image(key, pw as u32, ph as u32, &px, density);
     };

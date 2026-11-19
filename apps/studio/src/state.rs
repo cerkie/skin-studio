@@ -211,7 +211,6 @@ pub struct HistoryEntry {
     pub id: String,
     pub name: String,
     pub when: String,
-    pub summary: String,
     pub settings: Value,
 }
 
@@ -234,7 +233,6 @@ pub fn history_list(config_dir: &Path) -> Vec<HistoryEntry> {
             id: p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
             name: v["name"].as_str().unwrap_or("settings").to_string(),
             when: v["saved"].as_str().unwrap_or("").to_string(),
-            summary: presets::summary(&settings),
             settings,
         });
     }

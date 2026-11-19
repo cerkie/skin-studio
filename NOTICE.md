@@ -12,6 +12,4 @@
   behavior, hit sounds and the interface's colors and sizes. The full license text is in `LICENSE-osu-MIT.txt` and has to stay
   with copies of this project. This project is not affiliated with or endorsed by ppy.
 - Torus, lazer's own typeface, is a commercial font and is not included.
-- The optional `lazer-preview` component (`apps/lazer-preview`) is built on the osu!lazer packages (`ppy.osu.Game`, MIT) and ships with
-  `ppy.osu.Game.Resources` (osu-resources: textures, audio and fonts, CC BY-NC 4.0, copyright ppy Pty Ltd). That download is therefore
-  for non-commercial use, with credit; the rest of this project is not affected.
+- `dev/lazer-reference` (not part of the release) is built on the osu!lazer packages (`ppy.osu.Game`, MIT) and is used to check Skin Studio's renderer against the game's.

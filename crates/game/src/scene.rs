@@ -1,5 +1,5 @@
 //! The gameplay scene: what an autoplayed osu!standard map looks like at map time `t`, with lazer's timings for
-//! fade-in, hit animations, slider body snaking, ticks, ball, follow circle, repeat arrows and judgements.
+//! fade-in, hit animations, slider body snaking, ticks, ball, follow circle, repeat arrows.
 //! Output is a flat draw list (sprites and slider bodies, in z order) that any renderer can consume.
 use std::ops::Range;
 use std::sync::Arc;
@@ -227,6 +227,10 @@ pub struct Scene {
     pub sheet: Arc<Sheet>,
     pub geoms: Vec<Option<SliderGeom>>,
     pub colors: Vec<[f32; 3]>,
+    /// How the cursor grows while the autoplay holds a key (see `press_timeline`), as (start, from, to) of a 100 ms ease-out.
+    pub presses: Vec<(f32, f32, f32)>,
+    /// Whether the colours are the map's own (picked with the combo offsets) rather than the skin's.
+    pub map_colours: bool,
     pub follow: Option<FollowFrames>,
     pub(crate) scale: f32,
     pub(crate) preempt: f32,
@@ -259,6 +263,8 @@ impl Scene {
         if colors.is_empty() {
             colors = if argon { crate::argon::COMBO.to_vec() } else { vec![[255.0, 192.0, 0.0], [0.0, 202.0, 0.0], [18.0, 124.0, 255.0], [242.0, 24.0, 57.0]] };
         }
+        let map_colours = !map.combo_colors.is_empty();
+        let presses = press_timeline(&map);
         let colors = colors.iter().map(|c| [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]).collect();
         let radius = if argon { crate::argon::OUTER_GRADIENT * 0.5 * scale } else { 64.0 * scale };
         let geoms = map
@@ -286,6 +292,8 @@ impl Scene {
             sheet,
             geoms,
             colors,
+            presses,
+            map_colours,
             follow,
             scale,
             preempt,
@@ -316,18 +324,16 @@ impl Scene {
         k
     }
 
-    pub(crate) fn cursor_pos(&self, t: f32) -> P {
-        self.cursor_at(t)
-    }
 
     /// lazer's CursorTrail: dots laid along the path the cursor took, one every `interval` units of distance, each fading
     /// for `life` ms as (1 - age / life)^exponent. With `avoid_near` nothing is drawn within one interval of the cursor.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn trail(&self, out: &mut Frame, t: f32, name: &str, additive: bool, tint: Option<[f32; 3]>, scale: f32, alpha: f32, exponent: f32, life: f32, interval: f32, avoid_near: bool) {
+    pub(crate) fn trail(&self, out: &mut Frame, t: f32, name: &str, additive: bool, tint: Option<[f32; 3]>, scale: f32, alpha: f32, exponent: f32, life: f32, interval: f32, avoid_near: bool, legacy: bool) {
         if self.sheet.get(name).is_none() {
             return;
         }
         let interval = interval.max(0.2);
+        let rot_now = if legacy { self.cursor_rotation(t) } else { 0.0 };
         let mut prev = self.cursor_at(t);
         // walk back along the path the cursor took, laying a dot every `interval` units of distance (also between samples)
         let (mut acc, mut from_cursor) = (0.0f32, 0.0f32);
@@ -338,7 +344,9 @@ impl Scene {
             let step = ((p[0] - prev[0]).powi(2) + (p[1] - prev[1]).powi(2)).sqrt();
             let mut need = interval - acc;
             let mut walked = 0.0;
+            let mut placed = false;
             while step - walked >= need && emitted < 6000 {
+                placed = true;
                 walked += need;
                 need = interval;
                 let u = if step > 0.0 { walked / step } else { 1.0 };
@@ -346,14 +354,17 @@ impl Scene {
                 if !avoid_near || from_cursor + walked >= interval {
                     emitted += 1;
                     let a = alpha * (1.0 - (age - 1.0 + u) / life).max(0.0).powf(exponent);
+                    // a part is made at the size the cursor has then (NewPartScale), and all of them turn with the cursor now (PartRotation)
+                    let (sc, rot) = if legacy { (scale * self.cursor_expand(t - age), rot_now) } else { (scale, 0.0) };
                     if additive {
-                        self.sprite_add(out, name, q, scale, 0.0, a, tint);
+                        self.sprite_add(out, name, q, sc, rot, a, tint);
                     } else {
-                        self.sprite(out, name, 0, q, scale, 0.0, a, tint);
+                        self.sprite(out, name, 0, q, sc, rot, a, tint);
                     }
                 }
             }
-            acc = step - walked;
+            // the distance since the last part: what is left of this step after the last one, or, when none fell in it, all of it so far
+            acc = if placed { step - walked } else { acc + step };
             from_cursor += step;
             prev = p;
             age += 1.0;
@@ -430,6 +441,28 @@ impl Scene {
         out.sprites.push(SpriteDraw { pos: [pos[0] + OFF[0], pos[1] + OFF[1]], half: [hw, hh], rot, alpha, rect: [r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32], tint, additive: false });
     }
 
+    /// The colour of an object's combo, as osu!lazer picks it: the colours of the map itself go by `ComboIndexWithOffsets` (the map's
+    /// beatmap skin), those of the skin by `ComboIndex`, which counts the first combo as 1 (so the first combo is the skin's second colour).
+    pub(crate) fn combo_colour(&self, o: &HitObject) -> [f32; 3] {
+        let i = if self.map_colours { o.combo_index_offsets } else { o.combo_index };
+        self.colors[i % self.colors.len()]
+    }
+
+    /// The expansion of the legacy cursor at `t`.
+    pub(crate) fn cursor_expand(&self, t: f32) -> f32 {
+        expand_at(&self.presses, t)
+    }
+
+    /// The rotation of the legacy cursor at `t`, in radians: it turns once every 10 s (LegacyCursor.REVOLUTION_DURATION) unless
+    /// the skin says CursorRotate: 0.
+    pub(crate) fn cursor_rotation(&self, t: f32) -> f32 {
+        if self.skin.flag("cursorrotate", "cursorrotate", true) {
+            (t / 10000.0).rem_euclid(1.0) * std::f32::consts::TAU
+        } else {
+            0.0
+        }
+    }
+
     pub(crate) fn has(&self, name: &str) -> bool {
         self.sheet.get(name).is_some()
     }
@@ -457,7 +490,7 @@ impl Scene {
     /// A circle (head of a circle or slider): body, number, overlay.
     #[allow(clippy::too_many_arguments)]
     fn circle(&self, out: &mut Frame, o: &HitObject, base: &str, pos: P, t: f32, appear: f32, hit_at: Option<f32>, show_number: bool) {
-        let col = self.colors[o.color_index % self.colors.len()];
+        let col = self.combo_colour(o);
         let name = if self.has(base) { base } else { "hitcircle" };
         let overlay = format!("{name}overlay");
         let overlay = if self.has(&overlay) { overlay } else if name == base { "hitcircleoverlay".to_string() } else { overlay };
@@ -518,7 +551,7 @@ impl Scene {
         if t >= o.time + 50.0 || t < appear || !self.has("approachcircle") {
             return;
         }
-        let col = self.colors[o.color_index % self.colors.len()];
+        let col = self.combo_colour(o);
         let mut a = 0.9 * frac(t, appear, appear + (self.fade_in * 2.0).min(self.preempt));
         if t > o.time {
             a *= 1.0 - frac(t, o.time, o.time + 50.0);
@@ -527,18 +560,6 @@ impl Scene {
         self.sprite(out, "approachcircle", 0, pos, self.scale * k, 0.0, a, Some(col));
     }
 
-    fn judgement(&self, out: &mut Frame, pos: P, t: f32, at: f32) {
-        let dt = t - at;
-        if dt < 0.0 || dt > 1000.0 || !self.has("hit300") {
-            return;
-        }
-        let fade_in = frac(dt, 0.0, 120.0);
-        let fade_out = 1.0 - frac(dt, 500.0, 900.0);
-        let sc = if dt < 120.0 { 0.6 + 0.5 * ease_out_quad(dt / 120.0) } else { 1.1 - 0.1 * frac(dt, 120.0, 400.0) };
-        let frames = self.sheet.get("hit300").map(|e| e.frames.len()).unwrap_or(1);
-        let fi = if frames > 1 { ((dt / (1000.0 / self.anim_fps())) as usize).min(frames - 1) } else { 0 };
-        self.sprite(out, "hit300", fi, pos, self.scale * sc, 0.0, fade_in * fade_out, None);
-    }
 
     fn anim_fps(&self) -> f32 {
         self.skin.ini.get("general", "animationframerate").and_then(|s| s.parse().ok()).unwrap_or(60.0)
@@ -591,7 +612,6 @@ impl Scene {
 
         let slot_step = 1.0 / (visible.len() as f32 + 2.0);
         let mut approaches: Vec<usize> = Vec::new();
-        let mut judgements: Vec<(P, f32)> = Vec::new();
         // earlier objects end up on top: draw later ones first
         for (rank, &i) in visible.iter().enumerate().rev() {
             let o = &map.objects[i];
@@ -610,7 +630,6 @@ impl Scene {
                     }
                     out.flush(start, false);
                     approaches.push(i);
-                    judgements.push((p, o.time));
                 }
                 Kind::Slider(s) => {
                     let end = o.end_time;
@@ -638,7 +657,7 @@ impl Scene {
                             to = nseg;
                             let total = s.span_duration * s.slides as f32;
                             let prog = ((t - o.time) / total).clamp(0.0, 1.0) * s.slides as f32;
-                            if self.snake_out && prog >= (s.slides - 1) as f32 && t <= end {
+                            if self.snake_out && prog >= (s.slides - 1) as f32 {
                                 // the last span: the body shrinks away behind the ball (from the start when it runs forwards,
                                 // from the far end when it runs back)
                                 let along = (prog - (s.slides - 1) as f32).clamp(0.0, 1.0);
@@ -653,17 +672,18 @@ impl Scene {
                                 }
                             }
                         }
-                        // After the end: a body that has been snaking out is already gone (drawing it again would flash the whole
-                        // thing), otherwise the full body fades over 240 ms.
+                        // After the end: a body that has been snaking out fades over 40 ms (lazer: Body.FadeOut(40), measured linear)
+                        // on top of the slider's own 240 ms fade; otherwise the full body fades over 240 ms.
                         if t > end {
-                            a = if self.snake_out { 0.0 } else { frac(t, appear, appear + self.fade_in) * (1.0 - frac(t, end, end + 240.0)) };
+                            let whole = frac(t, appear, appear + self.fade_in) * (1.0 - frac(t, end, end + 240.0));
+                            a = if self.snake_out { whole * (1.0 - frac(t, end, end + 40.0)) } else { whole };
                         }
                         let track = map.slider_track.or_else(|| self.skin.ini.color("slidertrackoverride")).map(|c| [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]);
-                        let col = track.unwrap_or(self.colors[o.color_index % self.colors.len()]);
+                        let col = track.unwrap_or(self.combo_colour(o));
                         let border = map.slider_border.or_else(|| self.skin.ini.color("sliderborder")).map(|c| [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]).unwrap_or([1.0; 3]);
                         // Argon: accent border, accent/5 body at 0.98 (0.92 for Pro) alpha, no shadow, border 0.2 of the radius
                         let (border, outer, inner, body_alpha, border_portion, shadow_portion) = if self.argon {
-                            let ac = self.colors[o.color_index % self.colors.len()];
+                            let ac = self.combo_colour(o);
                             let pro = matches!(self.skin.style, crate::skin::Style::Argon { pro: true });
                             let body = crate::argon::darken(ac, 4.0);
                             (ac, body, body, if pro { 0.92 } else { 0.98 }, crate::argon::GRADIENT / (crate::argon::OUTER_GRADIENT * 0.5), 0.0)
@@ -701,28 +721,49 @@ impl Scene {
                     // tail circle (only skins that have one) and repeat arrows on a circle each
                     let end_pos = to_view(s.path.at(s.length).0);
                     let start_pos = to_view(s.path.at(0.0).0);
-                    let ba = frac(t, appear, appear + self.fade_in) * alpha_whole;
-                    let ccol = self.colors[o.color_index % self.colors.len()];
+                    let ccol = self.combo_colour(o);
+                    // DrawableOsuHitObject.ApplyRepeatFadeIn: the first end circle fades in with the slider (after a third of the pre-empt
+                    // when the body snakes in); later ones appear two spans before they are due and fade in over at most a span.
+                    let fade = |t: f32, from: f32, dur: f32| if dur <= 0.0 { (t >= from) as u8 as f32 } else { frac(t, from, from + dur) };
+                    let delay = if self.snake_in { self.preempt / 3.0 } else { 0.0 };
+                    let circle_name = if self.has("sliderendcircle") { ("sliderendcircle", "sliderendcircleoverlay") } else { ("hitcircle", "hitcircleoverlay") };
                     if self.has("sliderendcircle") {
-                        self.sprite(out, "sliderendcircle", 0, end_pos, self.scale, 0.0, ba, Some(ccol));
-                        self.sprite(out, "sliderendcircleoverlay", 0, end_pos, self.scale, 0.0, ba, None);
+                        // the tail (SliderTailCircle, repeat index slides - 1); hit tails stay until the slider is gone
+                        let r = s.slides - 1;
+                        let (from, dur) = if r == 0 { (appear + delay, self.fade_in) } else { (o.time + s.slides as f32 * s.span_duration - 2.0 * s.span_duration, 0.0) };
+                        let ta = fade(t, from, dur) * alpha_whole;
+                        self.sprite(out, "sliderendcircle", 0, end_pos, self.scale, 0.0, ta, Some(ccol));
+                        self.sprite(out, "sliderendcircleoverlay", 0, end_pos, self.scale, 0.0, ta, None);
                     }
                     for k in 1..s.slides {
                         let pass = o.time + k as f32 * s.span_duration;
-                        let ka = ba * (1.0 - frac(t, pass, pass + s.span_duration.min(300.0)));
-                        if ka <= 0.0 {
+                        let r = k - 1;
+                        let (from, cdur, adur) = if r == 0 { (appear + delay, self.fade_in, 150.0) } else { (pass - 2.0 * s.span_duration, 0.0, s.span_duration.min(150.0)) };
+                        let anim = s.span_duration.min(300.0);
+                        let hit_u = frac(t, pass, pass + anim);
+                        // the whole repeat fades out (Easing.Out) once it is hit
+                        let whole = alpha_whole * (1.0 - ease_out_quad(hit_u));
+                        if whole <= 0.0 {
                             continue;
                         }
                         let (pos, toward) = if k % 2 == 1 { (end_pos, s.path.at((s.length - 8.0).max(0.0)).0) } else { (start_pos, s.path.at(8.0f32.min(s.length)).0) };
                         let toward = to_view(toward);
-                        let (cn, co) = if self.has("sliderendcircle") { ("sliderendcircle", "sliderendcircleoverlay") } else { ("hitcircle", "hitcircleoverlay") };
-                        self.sprite(out, cn, 0, pos, self.scale, 0.0, ka, Some(ccol));
-                        self.sprite(out, co, 0, pos, self.scale, 0.0, ka, None);
-                        let rot = (toward[1] - pos[1]).atan2(toward[0] - pos[0]);
-                        let period = map.timing_at(o.time).0.max(100.0);
-                        let ph = (t - o.time).rem_euclid(period) / period;
-                        let sc = if self.skin.version() <= 1.0 { 1.0 } else { 1.3 - 0.3 * ease_out_quad(ph) };
-                        self.sprite(out, "reversearrow", 0, pos, self.scale * sc, rot, ka * frac(t, appear, appear + 150.0), None);
+                        let ca = fade(t, from, cdur) * whole;
+                        self.sprite(out, circle_name.0, 0, pos, self.scale, 0.0, ca, Some(ccol));
+                        self.sprite(out, circle_name.1, 0, pos, self.scale, 0.0, ca, None);
+                        let aim = (toward[1] - pos[1]).atan2(toward[0] - pos[0]);
+                        // LegacyReverseArrow: a 300 ms loop from the repeat's animation start, or a 1 -> 1.4 pop once hit
+                        let (rot, sc) = if t >= pass {
+                            (aim, 1.0 + 0.4 * ease_out_quad(hit_u))
+                        } else {
+                            let u = (t - from).rem_euclid(300.0) / 300.0;
+                            if self.skin.version() <= 1.0 {
+                                (aim + (5.625 - 11.25 * u).to_radians(), 1.3 - 0.3 * u)
+                            } else {
+                                (aim, 1.3 - 0.3 * ease_out_quad(u))
+                            }
+                        };
+                        self.sprite(out, "reversearrow", 0, pos, self.scale * sc, rot, fade(t, from, adur) * whole, None);
                     }
                     // ticks
                     if self.has("sliderscorepoint") {
@@ -731,7 +772,8 @@ impl Scene {
                                 let f = if span % 2 == 1 { 1.0 - tick } else { tick };
                                 let span_start = o.time + span as f32 * s.span_duration;
                                 let tt = span_start + tick * s.span_duration;
-                                let ap = (span_start + (tt - span_start) * 0.5 - self.preempt).max(appear);
+                                // SliderTick: pre-empt = half the time since the span began + 200 ms (66% of the slider's pre-empt in the first span)
+                                let ap = (span_start + (tt - span_start) * 0.5 - if span > 0 { 200.0 } else { self.preempt * 0.66 }).max(appear);
                                 if t < ap || t > tt + 150.0 {
                                     continue;
                                 }
@@ -752,7 +794,7 @@ impl Scene {
                     if t >= o.time && t <= end + 200.0 {
                         let tb = t.min(end);
                         let (bp, dir, _) = self.slider_ball(o, s, tb);
-                        let col = self.colors[o.color_index % self.colors.len()];
+                        let col = self.combo_colour(o);
                         let sliding = t <= end;
                         if self.has("sliderfollowcircle") {
                             let (sc, al) = if sliding {
@@ -771,23 +813,27 @@ impl Scene {
                             };
                             let frames = self.sheet.get("sliderfollowcircle").map(|e| e.frames.len()).unwrap_or(1);
                             let fi = ((t / (1000.0 / self.anim_fps())) as usize) % frames;
-                            self.sprite(out, "sliderfollowcircle", fi, bp, self.scale * sc * 0.5, 0.0, al, None);
+                            self.sprite(out, "sliderfollowcircle", fi, bp, self.scale * sc * 0.5, 0.0, al * alpha_whole, None);
                         }
                         if sliding {
-                            let tint = if self.ball_tint { Some(col) } else { None };
+                            // LegacySliderBall: the combo colour when the skin allows it, else the skin's SliderBall colour (white by default);
+                            // the "-nd" layer is always near black, and the "-spec" glint is added on top, neither of them turning with the ball
+                            let tint = if self.ball_tint { Some(col) } else { self.skin.ini.color("sliderball").map(|c| [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]) };
                             if self.has("sliderb-nd") {
-                                self.sprite(out, "sliderb-nd", 0, bp, self.scale, 0.0, 1.0, tint);
+                                self.sprite(out, "sliderb-nd", 0, bp, self.scale, 0.0, 1.0, Some([5.0 / 255.0; 3]));
                             }
                             if let Some(e) = self.sheet.get("sliderb") {
                                 let delay = (0.15 / s.velocity * 16.667).max(16.667);
                                 let fi = ((t - o.time) / delay) as usize % e.frames.len();
                                 self.sprite(out, "sliderb", fi, bp, self.scale, dir[1].atan2(dir[0]), 1.0, tint);
                             }
+                            if self.has("sliderb-spec") {
+                                self.sprite_add(out, "sliderb-spec", bp, self.scale, 0.0, 1.0, None);
+                            }
                         }
                     }
                     out.flush(start, false);
                     approaches.push(i);
-                    judgements.push((to_view(s.path.at(if s.slides % 2 == 1 { s.length } else { 0.0 }).0), end));
                 }
                 Kind::Spinner => {
                     if t > o.end_time + 400.0 {
@@ -796,7 +842,6 @@ impl Scene {
                     let start = out.sprites.len();
                     self.spinner(out, o, t);
                     out.flush(start, false);
-                    judgements.push(([256.0, 192.0], o.end_time));
                 }
             }
         }
@@ -810,8 +855,7 @@ impl Scene {
                 self.approach(out, o, map.stacked(o), t, o.time - self.preempt);
             }
         }
-        // the hit popups (300, GREAT with its rings) are left out of the preview
-        let _ = &judgements;
+        // the hit popups (300, GREAT with its rings) are left out of the preview, which is about the follow points
         // cursor trail then cursor
         let cs = self.cursor_scale;
         if self.argon {
@@ -819,21 +863,134 @@ impl Scene {
             // drawable is scaled by 0.8 / ScaleAdjust = 0.4; additive, alpha 0.8, parts fade as (1 - age / 300 ms) ^ 4, and a part is
             // laid every `texture width x cursor scale / 2.5 x 0.4` units (in the trail's own, unscaled space).
             let w = self.sheet.get("ar_trail").map(|e| e.frames[0].w as f32 / e.ratio).unwrap_or(5.0);
-            self.trail(out, t, "ar_trail", true, None, 0.4 * cs, 0.8, 4.0, 300.0, w * cs / 2.5 * 0.4 * 0.4, false);
+            self.trail(out, t, "ar_trail", true, None, 0.4 * cs, 0.8, 4.0, 300.0, w * cs / 2.5 * 0.4 * 0.4, false, false);
         } else if let Some(e) = self.sheet.get("cursortrail") {
             // LegacyCursorTrail: a skin with a cursormiddle gets a long continuous trail that stops short of the
             // cursor; without one the trail is short and disjoint
             let disjoint = !self.has("cursormiddle");
-            let w = e.frames[0].w as f32 / e.ratio;
-            self.trail(out, t, "cursortrail", true, None, cs, 1.0, 0.7, if disjoint { 200.0 } else { 550.0 }, w * cs / 2.5 / cs.max(1.0), !disjoint);
+            // LegacyCursorTrail multiplies the texture's ScaleAdjust by STABLE_MAGIC_SCALE_FACTOR (1.6): the parts are that much smaller
+            const MAGIC: f32 = 1.6;
+            let w = e.frames[0].w as f32 / e.ratio / MAGIC;
+            if disjoint {
+                // lazer's LegacyCursorTrail without a cursormiddle: a part at the cursor every 1/60 s, nothing laid between them,
+                // plain blending, fading linearly over 150 ms
+                let mut age = 1000.0 / 60.0;
+                let rot_now = self.cursor_rotation(t);
+                while age < 150.0 {
+                    let a = 1.0 - age / 150.0;
+                    self.sprite(out, "cursortrail", 0, self.cursor_at(t - age), cs / MAGIC * self.cursor_expand(t - age), rot_now, a, None);
+                    age += 1000.0 / 60.0;
+                }
+            } else {
+                // with a cursormiddle: additive, interpolated along the path, linear fade over 500 ms, nothing drawn near the cursor
+                self.trail(out, t, "cursortrail", true, None, cs / MAGIC, 1.0, 1.0, 500.0, w * cs / 2.5 / cs.max(1.0), true, true);
+            }
         }
         let cp = self.cursor_at(t);
         if self.argon {
             self.sprite(out, "ar_cursor", 0, cp, cs, 0.0, 1.0, None);
         } else {
-            self.sprite(out, "cursor", 0, cp, cs, 0.0, 1.0, None);
+            // only the cursor image grows and turns; the cursormiddle stays as it is (LegacyCursor's ExpandTarget)
+            self.sprite(out, "cursor", 0, cp, cs * self.cursor_expand(t), self.cursor_rotation(t), 1.0, None);
             self.sprite(out, "cursormiddle", 0, cp, cs, 0.0, 1.0, None);
         }
         out.flush(start, false);
+    }
+}
+
+/// When the autoplay holds a key down, as osu!lazer's OsuAutoGenerator plays it: a key goes down at the start of every object and up
+/// KEY_UP_DELAY (50 ms) after its end. The legacy cursor grows to 1.3 over 100 ms (out-quad) from 1 on every press and eases back to 1
+/// over 100 ms when the last key is released (OsuCursorContainer + LegacyCursor). Returned as segments (start, from, to).
+fn press_timeline(map: &Beatmap) -> Vec<(f32, f32, f32)> {
+    const KEY_UP_DELAY: f32 = 50.0;
+    // (time, is_press); a press at the same time as a release comes first
+    let mut ev: Vec<(f32, bool)> = Vec::with_capacity(map.objects.len() * 2);
+    for o in &map.objects {
+        ev.push((o.time, true));
+        ev.push((o.end_time + KEY_UP_DELAY + if matches!(o.kind, Kind::Spinner) { 1.0 } else { 0.0 }, false));
+    }
+    ev.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(b.1.cmp(&a.1)));
+    let mut segs: Vec<(f32, f32, f32)> = Vec::new();
+    let mut down = 0i32;
+    for (time, press) in ev {
+        if press {
+            down += 1;
+            segs.push((time, 1.0, 1.3));
+        } else {
+            down = (down - 1).max(0);
+            if down == 0 {
+                let from = expand_at(&segs, time);
+                segs.push((time, from, 1.0));
+            }
+        }
+    }
+    segs
+}
+
+fn expand_at(segs: &[(f32, f32, f32)], t: f32) -> f32 {
+    let i = segs.partition_point(|s| s.0 <= t);
+    if i == 0 {
+        return 1.0;
+    }
+    let (start, from, to) = segs[i - 1];
+    let x = ((t - start) / 100.0).clamp(0.0, 1.0);
+    from + (to - from) * (1.0 - (1.0 - x) * (1.0 - x))
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::expand_at;
+
+    #[test]
+    fn the_cursor_grows_on_a_press_and_eases_back() {
+        // a press at 1000 ms, released at 1200: 1 -> 1.3 over 100 ms (out-quad), then back to 1 over 100 ms
+        let segs = vec![(1000.0, 1.0, 1.3), (1200.0, 1.3, 1.0)];
+        assert_eq!(expand_at(&segs, 900.0), 1.0);
+        assert!((expand_at(&segs, 1000.0) - 1.0).abs() < 1e-6);
+        assert!((expand_at(&segs, 1050.0) - 1.225).abs() < 1e-3); // out-quad at half: 0.75 of the way
+        assert!((expand_at(&segs, 1150.0) - 1.3).abs() < 1e-6);
+        assert!((expand_at(&segs, 1250.0) - 1.075).abs() < 1e-3);
+        assert!((expand_at(&segs, 1400.0) - 1.0).abs() < 1e-6);
+    }
+}
+
+/// A development check against osu!lazer: what the scene draws for the slider that starts at `SS_SLIDER` ms around its end, to be set
+/// beside the alphas the lazer reference reports (dev/lazer-reference, the "slider" command).
+/// SS_MAP and SS_SKIN name the map and the skin; run with `cargo test -p game dump_slider_end -- --ignored --nocapture`.
+#[cfg(test)]
+mod slider_end_probe {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn dump_slider_end() {
+        let map = Arc::new(Beatmap::parse_file(std::path::Path::new(&std::env::var("SS_MAP").unwrap())).unwrap());
+        let skin = Arc::new(Skin::open(std::path::Path::new(&std::env::var("SS_SKIN").unwrap_or_else(|_| "argon".into()))).unwrap());
+        let start: f32 = std::env::var("SS_SLIDER").unwrap().parse().unwrap();
+        let sheet = Arc::new(crate::skin::base_sheet(&skin, map.cs, 2.0));
+        let scene = Scene::new(map.clone(), skin, sheet.clone(), None);
+        let o = map.objects.iter().find(|o| (o.time - start).abs() < 1.0).unwrap();
+        println!("slider {}..{}", o.time, o.end_time);
+        for dt in [-30.0f32, 0.0, 22.0, 47.0, 72.0, 97.0, 122.0, 172.0, 222.0] {
+            let t = o.end_time + dt;
+            let mut f = Frame::default();
+            scene.build(t, &mut f);
+            let name_of = |r: [f32; 4]| sheet.elems.iter().find(|(_, e)| e.frames.iter().any(|fr| (fr.x as f32, fr.y as f32) == (r[0], r[1]))).map(|(n, _)| n.clone()).unwrap_or_default();
+            let head = map.stacked(o);
+            let head = [head[0] + OFF[0], head[1] + OFF[1]];
+            let (tail_pos, _, _) = match &o.kind { Kind::Slider(s) => scene.slider_ball(o, s, o.end_time), _ => unreachable!() };
+            let tail = [tail_pos[0] + OFF[0], tail_pos[1] + OFF[1]];
+            print!("end{dt:+}:");
+            for s in &f.sprites {
+                let n = name_of(s.rect);
+                let d = |p: [f32; 2]| ((s.pos[0] - p[0]).powi(2) + (s.pos[1] - p[1]).powi(2)).sqrt();
+                let where_ = if d(head) < 2.0 { "head" } else if d(tail) < 2.0 { "tail" } else { continue };
+                print!(" {where_}:{n}={:.2}@{:.1}", s.alpha, s.half[0]);
+            }
+            for s in f.sliders.iter().filter(|s| s.geom == map.objects.iter().position(|q| (q.time - o.time).abs() < 1.0).unwrap()) {
+                print!(" body={:.2}", s.alpha);
+            }
+            println!();
+        }
     }
 }

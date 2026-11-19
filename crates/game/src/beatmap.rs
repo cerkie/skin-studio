@@ -61,8 +61,11 @@ pub struct HitObject {
     pub end_time: f32,
     pub kind: Kind,
     pub new_combo: bool,
-    /// Index into the combo color list.
-    pub color_index: usize,
+    /// osu!lazer's `ComboIndex`: the number of combos so far, counting the first (so the first combo is 1). The skin's colour
+    /// for the combo is `colors[combo_index % count]`.
+    pub combo_index: usize,
+    /// `ComboIndexWithOffsets`: the same with the combo offsets of the map added, which is what the colours of the map itself use.
+    pub combo_index_offsets: usize,
     /// Number shown on the circle (1-based).
     pub number: u32,
     pub stack: i32,
@@ -102,6 +105,8 @@ pub struct Beatmap {
     pub sample_set: u8,
     pub timing: Vec<Timing>,
     pub combo_colors: Vec<[f32; 3]>,
+    /// Breaks of the map as (start, end) in ms; the first object after one starts a new combo.
+    pub breaks: Vec<(f32, f32)>,
     pub slider_border: Option<[f32; 3]>,
     pub slider_track: Option<[f32; 3]>,
     pub objects: Vec<HitObject>,
@@ -192,6 +197,11 @@ impl Beatmap {
                 }
                 "Events" => {
                     let parts: Vec<&str> = line.split(',').collect();
+                    if parts.len() >= 3 && (parts[0] == "2" || parts[0] == "Break") {
+                        if let (Ok(s), Ok(e)) = (parts[1].trim().parse::<f32>(), parts[2].trim().parse::<f32>()) {
+                            bm.breaks.push((s, e));
+                        }
+                    }
                     if parts.len() >= 3 && parts[0] == "0" && parts[1] == "0" && bm.background.is_none() {
                         bm.background = Some(parts[2].trim_matches('"').to_string());
                     }
@@ -224,10 +234,11 @@ impl Beatmap {
     }
 
     fn build_objects(&mut self, raw: &[String]) {
-        let mut combo_index = 0usize;
-        let mut number = 0u32;
-        let mut first = true;
-        let colors = self.combo_colors.len().max(1);
+        // osu!lazer: Beatmap decoding and OsuBeatmapProcessor force a new combo on the first object, on the first object after a
+        // spinner and on the first object after a break; IHasComboInformation.UpdateComboInformation then counts the combos
+        let (mut combo_index, mut combo_index_offsets, mut in_combo) = (0usize, 0usize, 0u32);
+        let mut last: Option<bool> = None; // whether the previous object was a spinner
+        let mut break_i = 0usize;
         let mut out = Vec::with_capacity(raw.len());
         for line in raw {
             let v: Vec<&str> = line.split(',').collect();
@@ -237,19 +248,29 @@ impl Beatmap {
             let f = |i: usize| v.get(i).and_then(|s| s.trim().parse::<f32>().ok()).unwrap_or(0.0);
             let (x, y, time, ty, hs) = (f(0), f(1), f(2), f(3) as u32, f(4) as u8);
             let is_spinner = ty & 8 != 0;
-            let nc = ty & 4 != 0;
-            if first || nc {
-                if !first {
-                    combo_index = (combo_index + 1 + ((ty >> 4) & 7) as usize) % colors;
-                }
-                number = 0;
+            let mut nc = ty & 4 != 0;
+            if !is_spinner && matches!(last, None | Some(true)) {
+                nc = true;
             }
-            first = false;
-            number += 1;
+            let mut after_break = false;
+            while break_i < self.breaks.len() && self.breaks[break_i].1 < time {
+                after_break = true;
+                break_i += 1;
+            }
+            nc |= after_break;
+            if nc || last.is_none() {
+                in_combo = 0;
+                combo_index += 1;
+                combo_index_offsets += ((ty >> 4) & 7) as usize + 1;
+            } else {
+                in_combo += 1;
+            }
+            last = Some(is_spinner);
+            let shown_number = in_combo + 1;
             let (beat, sv, tp) = self.timing_at(time);
             let (set, volume) = tp.map(|t| (t.sample_set, t.volume)).unwrap_or((0, 100.0));
             let sample_set = if set == 0 { self.sample_set } else { set };
-            let mut obj = HitObject { pos: [x, y], time, end_time: time, kind: Kind::Circle, new_combo: nc, color_index: combo_index, number, stack: 0, hit_sound: hs, sample_set, volume, sample: SampleSpec::default() };
+            let mut obj = HitObject { pos: [x, y], time, end_time: time, kind: Kind::Circle, new_combo: nc, combo_index, combo_index_offsets, number: shown_number, stack: 0, hit_sound: hs, sample_set, volume, sample: SampleSpec::default() };
             if is_spinner {
                 obj.kind = Kind::Spinner;
                 obj.end_time = f(5);
@@ -372,11 +393,37 @@ mod tests {
         assert_eq!(b.objects[0].number, 1);
         assert_eq!(b.objects[1].number, 2);
         assert_eq!(b.objects[2].number, 1);
-        assert_eq!(b.objects[2].color_index, 1);
+        assert_eq!(b.objects[2].combo_index, 2);
         let Kind::Slider(s) = &b.objects[2].kind else { panic!() };
         // 140 px at 1.4 * 100 / 500 = 0.28 px/ms
         assert!((s.span_duration - 500.0).abs() < 1.0);
         assert!((b.objects[2].end_time - 2500.0).abs() < 1.0);
         assert!((b.objects[2].end_pos()[0] - 240.0).abs() < 0.5);
+    }
+}
+
+#[cfg(test)]
+mod combo_tests {
+    use super::*;
+
+    fn map(objects: &str, events: &str) -> Beatmap {
+        Beatmap::parse(&format!("osu file format v14\n[General]\nAudioFilename: a.mp3\n[Difficulty]\nCircleSize:4\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n[Events]\n{events}\n[HitObjects]\n{objects}\n"))
+    }
+
+    #[test]
+    fn combo_indices_follow_lazer() {
+        // the first object starts combo 1; a new combo with offset 2 (bits 4-6 of the type) skips two colours
+        let b = map("100,100,1000,1,0\n100,100,1500,1,0\n100,100,2000,5,0\n100,100,2500,37,0", "");
+        assert_eq!(b.objects.iter().map(|o| o.combo_index).collect::<Vec<_>>(), vec![1, 1, 2, 3]);
+        assert_eq!(b.objects.iter().map(|o| o.combo_index_offsets).collect::<Vec<_>>(), vec![1, 1, 2, 5]);
+        assert_eq!(b.objects.iter().map(|o| o.number).collect::<Vec<_>>(), vec![1, 2, 1, 1]);
+    }
+
+    #[test]
+    fn a_break_or_a_spinner_starts_a_new_combo() {
+        let b = map("100,100,1000,1,0\n100,100,5000,1,0\n256,192,6000,8,0,7000\n100,100,8000,1,0", "2,2000,4000");
+        // the object after the break (5000) and the one after the spinner (8000) start combos
+        assert_eq!(b.objects.iter().map(|o| o.number).collect::<Vec<_>>(), vec![1, 1, 2, 1]);
+        assert_eq!(b.objects.iter().map(|o| o.combo_index).collect::<Vec<_>>(), vec![1, 2, 2, 3]);
     }
 }

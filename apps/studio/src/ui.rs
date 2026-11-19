@@ -4,6 +4,7 @@ use egui::{Align2, Color32, CornerRadius, FontFamily, FontId, Pos2, Rect, Sense,
 use engine::presets;
 use serde_json::Value;
 
+use crate::paths;
 use crate::state::{self, PROPS};
 use crate::studio::{PickKind, Studio, Tab, TABS};
 use crate::theme::{self as th, pal::*, Kind};
@@ -20,7 +21,6 @@ pub struct SessionView {
     pub end: f32,
     pub playing: bool,
     pub info: String,
-    pub volume: f32,
 }
 
 /// What the interface asks the app to do to the session.
@@ -56,7 +56,7 @@ fn fmt_speed(v: f32) -> String {
 
 /// A slim slider with a nub and a value bubble while it is dragged. Returns true when `f` (0..1) changed.
 fn mini_slider(ui: &mut Ui, id: &str, area: Rect, f: &mut f32, tip: impl Fn(f32) -> String) -> bool {
-    let resp = ui.interact(area, ui.id().with(id), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = ui.interact(area, ui.scope_id().with(id), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
     let mut changed = false;
     if resp.dragged() || resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
@@ -94,7 +94,7 @@ fn toast(ui: &mut Ui, st: &mut Studio, view: Rect) {
     ui.painter().rect_filled(rect, CornerRadius::same(10), Color32::from_rgba_unmultiplied(0x1c, 0x1a, 0x22, (240.0 * a) as u8));
     ui.painter().rect_stroke(rect, CornerRadius::same(10), Stroke::new(1.0, Color32::from_white_alpha((30.0 * a) as u8)), egui::StrokeKind::Inside);
     ui.painter().galley(rect.min + Vec2::new(16.0, 12.0), galley, CONTENT1);
-    if ui.interact(rect, ui.id().with("toast"), Sense::click()).clicked() {
+    if ui.interact(rect, ui.scope_id().with("toast"), Sense::click()).clicked() {
         st.status_at = std::time::Instant::now() - std::time::Duration::from_secs(12);
     }
 }
@@ -197,47 +197,65 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
         });
     });
 
+    // the transport lives in a bar under the view
+    egui::Panel::bottom("transport_bar").exact_size(66.0).frame(egui::Frame::new().fill(BACKGROUND6).inner_margin(egui::Margin::ZERO)).show(root, |ui| {
+        let bar = ui.max_rect();
+        ui.painter().line_segment([bar.left_top(), bar.right_top()], Stroke::new(1.0, Color32::from_white_alpha(10)));
+        let tr = Rect::from_min_size(Pos2::new(bar.left() + 16.0, bar.top() + 6.0), Vec2::new(bar.width() - 32.0, 54.0));
+        transport(ui, tr, st, sv, out);
+    });
+
     // ---- the gameplay view fills the rest
     egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::TRANSPARENT)).show(root, |ui| {
         let rect = ui.max_rect();
         out.viewport = Some(rect);
         toast(ui, st, rect);
-        let clicked = ui.interact(rect, ui.id().with("view"), Sense::click()).clicked();
-        let transport_h = 54.0;
-        let tw = (rect.width() - 40.0).clamp(200.0, 760.0);
-        let tr = Rect::from_center_size(Pos2::new(rect.center().x, rect.bottom() - transport_h / 2.0 - 16.0), Vec2::new(tw, transport_h));
-        let over_transport = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| tr.contains(p));
+        let clicked = ui.interact(rect, ui.scope_id().with("view"), Sense::click()).clicked();
+        let over_transport = false;
         if clicked && !over_transport && sv.loaded {
             out.toggle_play = true;
         }
-        if st.lazer_active() {
-            let msg = if st.loading { "Loading the map...".to_string() } else if sv.loaded { format!("Playing in the osu!lazer window\n{}", sv.info) } else { "Starting the osu!lazer preview...".to_string() };
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, msg, FontId::new(20.0, th::light()), CONTENT2);
-        } else if st.loading {
+        if st.loading {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Loading the map...", FontId::new(22.0, th::light()), CONTENT2);
         } else if !st.session_error.is_empty() {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, &st.session_error, FontId::new(18.0, th::light()), CONTENT2);
         }
-        transport(ui, tr, st, sv, out);
-        anim_card(&ctx, ui, st, rect);
         if sv.loaded && !sv.info.is_empty() {
-            // keep clear of the animation card in the corner
             let max_chars = ((rect.width() * 0.6) / 6.2) as usize;
             let info: String = if sv.info.chars().count() > max_chars { format!("{}…", sv.info.chars().take(max_chars.saturating_sub(1)).collect::<String>()) } else { sv.info.clone() };
             ui.painter().text(Pos2::new(rect.left() + 16.0, rect.top() + 12.0), Align2::LEFT_TOP, info, FontId::new(12.0, th::light()), Color32::from_white_alpha(130));
         }
     });
+
+    if let Some(v) = out.viewport {
+        anim_window(&ctx, st, v);
+    }
+}
+
+/// The animation, in a window that can be moved, resized and folded (the osu!lazer window has the same in its own picture).
+fn anim_window(ctx: &egui::Context, st: &mut Studio, view: Rect) {
+    if st.frames.is_empty() {
+        return;
+    }
+    egui::Window::new("animation_card")
+        .title_bar(false)
+        .frame(egui::Frame::NONE)
+        .resizable(false)
+        .collapsible(false)
+        .default_pos(Pos2::new(view.right() - st.anim_width - 16.0, view.top() + 14.0))
+        .show(ctx, |ui| {
+            let size = anim_card_size(ctx, st);
+            let (area, _) = ui.allocate_exact_size(size, Sense::hover());
+            anim_card(ctx, ui, st, area.min);
+        });
 }
 
 fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
     if !sv.loaded {
         return;
     }
-    th::shadow(ui.painter(), r, 12, 120);
-    ui.painter().rect_filled(r, CornerRadius::same(14), Color32::from_rgba_unmultiplied(0x1c, 0x1a, 0x22, 238));
-    ui.painter().rect_stroke(r, CornerRadius::same(14), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
     let btn = Rect::from_center_size(Pos2::new(r.left() + 36.0, r.center().y), Vec2::new(44.0, 34.0));
-    let bresp = ui.interact(btn, ui.id().with("play"), Sense::click());
+    let bresp = ui.interact(btn, ui.scope_id().with("play"), Sense::click());
     ui.painter().rect_filled(btn, CornerRadius::same(5), if bresp.hovered() { th::lighten(COLOR3, 0.2) } else { COLOR3 });
     if sv.playing {
         for dx in [-5.0, 5.0] {
@@ -252,7 +270,7 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
     }
     // a new random map, next to play (the die)
     let nm = Rect::from_center_size(Pos2::new(btn.right() + 24.0, r.center().y), Vec2::new(36.0, 34.0));
-    let nresp = ui.interact(nm, ui.id().with("newmap"), Sense::click());
+    let nresp = ui.interact(nm, ui.scope_id().with("newmap"), Sense::click());
     ui.painter().rect_filled(nm, CornerRadius::same(5), if nresp.hovered() { DARK3 } else { DARK2 });
     {
         let c = nm.center();
@@ -268,7 +286,7 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
     }
     // playback speed: a chip that opens a slider
     let sp = Rect::from_center_size(Pos2::new(nm.right() + 34.0, r.center().y), Vec2::new(52.0, 34.0));
-    let spresp = ui.interact(sp, ui.id().with("speed"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Playback speed");
+    let spresp = ui.interact(sp, ui.scope_id().with("speed"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Playback speed");
     ui.painter().rect_filled(sp, CornerRadius::same(5), if spresp.hovered() { DARK3 } else { DARK2 });
     ui.painter().text(sp.center(), Align2::CENTER_CENTER, format!("{}x", fmt_speed(st.cfg.speed)), FontId::new(14.0, FontFamily::Proportional), if (st.cfg.speed - 1.0).abs() < 0.001 { CONTENT2 } else { HIGHLIGHT1 });
     egui::Popup::menu(&spresp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).gap(8.0).show(|ui| {
@@ -298,7 +316,7 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
     ui.painter().text(Pos2::new(r.right() - 14.0, r.center().y), Align2::RIGHT_CENTER, time, FontId::new(14.0, FontFamily::Proportional), CONTENT2);
     let vol = Rect::from_min_max(Pos2::new(r.right() - 14.0 - 96.0 - 96.0, r.center().y - 12.0), Pos2::new(r.right() - 14.0 - 96.0 - 8.0, r.center().y + 12.0));
     let mute = Rect::from_center_size(Pos2::new(vol.left() - 22.0, r.center().y), Vec2::new(32.0, 32.0));
-    let mresp = ui.interact(mute, ui.id().with("mute"), Sense::click());
+    let mresp = ui.interact(mute, ui.scope_id().with("mute"), Sense::click());
     let col = if mresp.hovered() { CONTENT1 } else { LIGHT1 };
     let c = mute.center();
     ui.painter().add(egui::Shape::convex_polygon(vec![c + Vec2::new(-9.0, -3.5), c + Vec2::new(-4.0, -3.5), c + Vec2::new(1.0, -8.0), c + Vec2::new(1.0, 8.0), c + Vec2::new(-4.0, 3.5), c + Vec2::new(-9.0, 3.5)], col, Stroke::NONE));
@@ -321,7 +339,7 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
         st.cfg.save();
         out.volume = Some(st.effective_volume());
     }
-    let vresp = ui.interact(vol, ui.id().with("vol"), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let vresp = ui.interact(vol, ui.scope_id().with("vol"), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
     if vresp.dragged() || vresp.clicked() {
         if let Some(p) = vresp.interact_pointer_pos() {
             let v = ((p.x - vol.left() - 5.0) / (vol.width() - 10.0)).clamp(0.0, 1.0);
@@ -341,7 +359,7 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
         bubble(ui, Pos2::new(vx, vol.top() - 6.0), &format!("{:.0}%", shown * 100.0));
     }
     let bar = Rect::from_min_max(Pos2::new(nm.right() + 80.0, r.center().y - 14.0), Pos2::new(mute.left() - 22.0, r.center().y + 14.0));
-    let resp = ui.interact(bar, ui.id().with("seek"), Sense::click_and_drag());
+    let resp = ui.interact(bar, ui.scope_id().with("seek"), Sense::click_and_drag());
     let f = if sv.end > sv.start { ((sv.clock - sv.start) / (sv.end - sv.start)).clamp(0.0, 1.0) } else { 0.0 };
     let line = Rect::from_center_size(bar.center(), Vec2::new(bar.width(), 6.0));
     ui.painter().rect_filled(line, CornerRadius::same(3), BACKGROUND5);
@@ -355,8 +373,19 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
     }
 }
 
-/// The animation on its own, in the corner of the view.
-fn anim_card(ctx: &egui::Context, ui: &mut Ui, st: &mut Studio, view: Rect) {
+const CARD_HEADER: f32 = 44.0;
+
+/// The size of the animation card: as wide as `anim_width` allows with whole-pixel scaling of the frames, folded to its title when asked.
+fn anim_card_size(ctx: &egui::Context, st: &Studio) -> Vec2 {
+    let (mw, mh) = st.frames.iter().flatten().fold((1usize, 1usize), |a, f| (a.0.max(f.w), a.1.max(f.h)));
+    let ppp = ctx.pixels_per_point();
+    let k = (((st.anim_width - 16.0) * ppp / mw as f32).floor()).clamp(1.0, 12.0);
+    let (iw, ih) = (mw as f32 * k / ppp, mh as f32 * k / ppp);
+    Vec2::new(iw + 16.0, if st.anim_collapsed { CARD_HEADER } else { CARD_HEADER + ih + 74.0 })
+}
+
+/// The animation playing in a card: a title with its size and fold buttons, the frames, a scrub bar, and play, frame count and speed.
+fn anim_card(ctx: &egui::Context, ui: &mut Ui, st: &mut Studio, origin: Pos2) {
     let n = st.frames.len();
     let (mw, mh) = st.frames.iter().flatten().fold((1usize, 1usize), |a, f| (a.0.max(f.w), a.1.max(f.h)));
     let now = std::time::Instant::now();
@@ -407,23 +436,54 @@ fn anim_card(ctx: &egui::Context, ui: &mut Ui, st: &mut Studio, view: Rect) {
     let Some(tex) = st.anim_tex.clone() else { return };
     // draw each source pixel as a whole number of screen pixels so edges stay sharp
     let ppp = ctx.pixels_per_point();
-    let max_w = (view.width() * 0.26).clamp(150.0, 300.0) * ppp;
+    let max_w = (st.anim_width - 16.0) * ppp;
     let k = ((max_w / mw as f32).floor()).clamp(1.0, 12.0);
     let (iw, ih) = (mw as f32 * k / ppp, mh as f32 * k / ppp);
     let w = iw + 16.0;
-    let h = ih;
-    let card = Rect::from_min_size(Pos2::new(view.right() - w - 16.0, view.top() + 14.0), Vec2::new(w, h + 74.0));
+    let card = Rect::from_min_size(origin, anim_card_size(ctx, st));
     th::shadow(ui.painter(), card, 10, 120);
     ui.painter().rect_filled(card, CornerRadius::same(12), Color32::from_rgba_unmultiplied(0x1c, 0x1a, 0x22, 238));
     ui.painter().rect_stroke(card, CornerRadius::same(12), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
-    let fit = Rect::from_min_size(card.min + Vec2::new(8.0, 8.0), Vec2::new(iw, ih));
+    // the title, how many frames and at what rate, the size buttons and the fold button
+    ui.painter().text(card.min + Vec2::new(14.0, CARD_HEADER * 0.5), Align2::LEFT_CENTER, "Animation", FontId::new(18.0, th::bold()), CONTENT1);
+    let btn = |ui: &mut Ui, id: &str, right: f32, draw: &dyn Fn(&egui::Painter, Pos2, Color32), tip: &str| -> bool {
+        let r = Rect::from_center_size(Pos2::new(card.right() - right, card.top() + CARD_HEADER * 0.5), Vec2::new(30.0, 28.0));
+        let resp = ui.interact(r, ui.scope_id().with(id), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
+        if resp.hovered() {
+            ui.painter().rect_filled(r, CornerRadius::same(6), DARK2);
+        }
+        draw(ui.painter(), r.center(), if resp.hovered() { CONTENT1 } else { LIGHT1 });
+        resp.clicked()
+    };
+    let collapsed = st.anim_collapsed;
+    if btn(ui, "animfold", 22.0, &|p, c, col| {
+        let d = if collapsed { 1.0 } else { -1.0 };
+        p.add(egui::Shape::line(vec![c + Vec2::new(-5.0, -2.5 * d), c + Vec2::new(0.0, 2.5 * d), c + Vec2::new(5.0, -2.5 * d)], Stroke::new(2.0, col)));
+    }, if collapsed { "Unfold" } else { "Fold away" }) {
+        st.anim_collapsed = !st.anim_collapsed;
+    }
+    if btn(ui, "animbigger", 54.0, &|p, c, col| {
+        p.line_segment([c + Vec2::new(-5.0, 0.0), c + Vec2::new(5.0, 0.0)], Stroke::new(2.0, col));
+        p.line_segment([c + Vec2::new(0.0, -5.0), c + Vec2::new(0.0, 5.0)], Stroke::new(2.0, col));
+    }, "Make the card larger") {
+        st.anim_width = (st.anim_width + 60.0).clamp(260.0, 900.0);
+    }
+    if btn(ui, "animsmaller", 86.0, &|p, c, col| {
+        p.line_segment([c + Vec2::new(-5.0, 0.0), c + Vec2::new(5.0, 0.0)], Stroke::new(2.0, col));
+    }, "Make the card smaller") {
+        st.anim_width = (st.anim_width - 60.0).clamp(260.0, 900.0);
+    }
+    if st.anim_collapsed {
+        return;
+    }
+    let fit = Rect::from_min_size(card.min + Vec2::new(8.0, CARD_HEADER), Vec2::new(iw, ih));
     // snap to the pixel grid
     let snap = |v: f32| (v * ppp).round() / ppp;
     let fit = Rect::from_min_size(Pos2::new(snap(fit.min.x), snap(fit.min.y)), fit.size());
     ui.painter().image(tex.id(), fit, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
     // a scrub bar over the frames of the animation
     let bar = Rect::from_min_size(Pos2::new(card.left() + 12.0, card.bottom() - 64.0), Vec2::new(w - 24.0, 24.0));
-    let sresp = ui.interact(bar, ui.id().with("animseek"), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let sresp = ui.interact(bar, ui.scope_id().with("animseek"), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
     st.anim_scrub = sresp.dragged();
     if sresp.dragged() || sresp.clicked() {
         if let Some(p) = sresp.interact_pointer_pos() {
@@ -439,7 +499,7 @@ fn anim_card(ctx: &egui::Context, ui: &mut Ui, st: &mut Studio, view: Rect) {
     // play / pause, the frame count, and the speed
     let ctrl = Rect::from_min_size(Pos2::new(card.left() + 12.0, card.bottom() - 34.0), Vec2::new(w - 24.0, 26.0));
     let play = Rect::from_min_size(ctrl.min, Vec2::new(ctrl.width() - 52.0, ctrl.height()));
-    let resp = ui.interact(play, ui.id().with("animplay"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = ui.interact(play, ui.scope_id().with("animplay"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
     let col = if resp.hovered() { CONTENT1 } else { LIGHT1 };
     let c = play.left_center() + Vec2::new(7.0, 0.0);
     if st.anim_playing {
@@ -455,7 +515,7 @@ fn anim_card(ctx: &egui::Context, ui: &mut Ui, st: &mut Studio, view: Rect) {
         st.anim_playing = !st.anim_playing;
     }
     let chip = Rect::from_min_size(Pos2::new(ctrl.right() - 46.0, ctrl.top()), Vec2::new(46.0, ctrl.height()));
-    let cresp = ui.interact(chip, ui.id().with("animspeed"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Animation playback speed");
+    let cresp = ui.interact(chip, ui.scope_id().with("animspeed"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Animation playback speed");
     ui.painter().rect_filled(chip, CornerRadius::same(6), if cresp.hovered() { DARK3 } else { DARK2 });
     ui.painter().text(chip.center(), Align2::CENTER_CENTER, format!("{}x", fmt_speed(st.anim_speed)), FontId::new(13.0, FontFamily::Proportional), if (st.anim_speed - 1.0).abs() < 0.001 { CONTENT2 } else { HIGHLIGHT1 });
     egui::Popup::menu(&cresp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).gap(8.0).show(|ui| {
@@ -502,7 +562,7 @@ fn num(ui: &mut Ui, st: &mut Studio, id: &str, label: &str) {
 
 /// A color swatch that opens a color picker; returns the new color when it changes.
 fn swatch_picker(ui: &mut Ui, id: &str, rect: Rect, rgb: [u8; 3]) -> Option<[u8; 3]> {
-    let resp = ui.interact(rect, ui.id().with(("swatch", id)), Sense::click());
+    let resp = ui.interact(rect, ui.scope_id().with(("swatch", id)), Sense::click());
     ui.painter().rect_filled(rect, CornerRadius::same(4), Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
     ui.painter().rect_stroke(rect, CornerRadius::same(4), Stroke::new(if resp.hovered() { 2.0 } else { 1.0 }, if resp.hovered() { LIGHT4 } else { DARK3 }), egui::StrokeKind::Inside);
     let mut out = None;
@@ -668,7 +728,7 @@ fn tab_motion(ui: &mut Ui, st: &mut Studio) {
 }
 
 fn key_row(ui: &mut Ui, st: &mut Studio, pid: &str, i: usize, k: &Value) {
-    let rid = ui.id().with((pid, i));
+    let rid = ui.scope_id().with((pid, i));
     let width = ui.available_width() - 22.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 38.0 + th::ROW_GAP), Sense::hover());
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - th::ROW_GAP));
@@ -764,7 +824,7 @@ fn tab_color(ui: &mut Ui, st: &mut Studio) {
 }
 
 fn color_row(ui: &mut Ui, st: &mut Studio, i: usize, k: &Value) {
-    let rid = ui.id().with(("col", i));
+    let rid = ui.scope_id().with(("col", i));
     let width = ui.available_width() - 22.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 38.0 + th::ROW_GAP), Sense::hover());
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - th::ROW_GAP));
@@ -852,22 +912,16 @@ fn tab_finish(ui: &mut Ui, st: &mut Studio) {
 }
 
 fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
-    th::subsection_header(ui, "Renderer");
-    let renderers = ["Built-in".to_string(), "osu!lazer (a separate window)".to_string()];
-    let cur = if st.lazer_active() { 1 } else { 0 };
-    if let Some(i) = th::dropdown_row(ui, "renderer", "Draw the preview with", &renderers[cur], &renderers) {
-        st.set_renderer(i == 1);
-    }
-    if st.lazer_active() {
-        th::note(ui, "lazer draws the map with its own code and assets, so it looks exactly as in the game. It needs a skin that is not Argon Pro to show your animation. The window can be placed next to this one.");
-    } else if crate::lazer::find_host().is_none() {
-        th::note(ui, "The osu!lazer renderer is an optional download (lazer-preview, from the releases page). Unzip it into a folder called lazer-preview next to this program.");
-    }
     th::subsection_header(ui, "Skin");
     let names: Vec<String> = std::iter::once("Argon Pro".to_string()).chain(st.skins.iter().map(|(l, _)| l.clone())).collect();
     let cur = st.skin_label();
     if let Some(i) = th::dropdown_row(ui, "skin", "Skin", &cur, &names) {
         st.cfg.skin = if i == 0 { "argon".into() } else { st.skins[i - 1].1.clone() };
+        if i > 0 {
+            if let Err(e) = paths::ensure_skin(std::path::Path::new(&st.cfg.skin)) {
+                st.status = format!("The skin could not be copied out of osu!lazer: {e}");
+            }
+        }
         st.cfg.save();
         st.load_session = true;
     }
@@ -1002,7 +1056,7 @@ fn tab_history(ui: &mut Ui, st: &mut Studio) {
         let load = Rect::from_center_size(Pos2::new(rect.right() - 92.0, rect.center().y), Vec2::new(64.0, 30.0));
         let del = Rect::from_center_size(Pos2::new(rect.right() - 30.0, rect.center().y), Vec2::new(54.0, 30.0));
         for (r, label, kind, which) in [(load, "Load", Kind::Purple, 0), (del, "Delete", Kind::Dark, 1)] {
-            let resp = ui.interact(r, ui.id().with((&h.id, which)), Sense::click());
+            let resp = ui.interact(r, ui.scope_id().with((&h.id, which)), Sense::click());
             let base = if kind == Kind::Purple { COLOR3 } else { DARK2 };
             ui.painter().rect_filled(r, CornerRadius::same(5), if resp.hovered() { th::lighten(base, 0.2) } else { base });
             ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::new(13.0, th::semibold()), CONTENT1);

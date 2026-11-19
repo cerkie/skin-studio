@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use game::beatmap::Beatmap;
 use game::scene::{Frame, FollowFrames, Scene};
-use game::skin::{self, Sheet, Skin};
+use game::skin::{self, Skin};
 use preview::game_renderer::GameRenderer;
 
 fn arg(name: &str) -> Option<String> {
@@ -33,14 +33,7 @@ async fn run() {
 
     // pixels per view unit (a fractional value shows how the app looks at odd window sizes)
     let ss = arg("--scale").and_then(|s| s.parse().ok()).unwrap_or(2.0f32);
-    let scale = engine::lazer::circle_scale(map.cs);
-    let mut sheet = if matches!(skin.style, skin::Style::Argon { .. }) {
-        let mut s = Sheet::default();
-        game::argon::add_to_sheet(&mut s, scale, ss);
-        s
-    } else {
-        Sheet::pack(&skin::gameplay_entries(&skin, scale, ss))
-    };
+    let mut sheet = skin::base_sheet(&skin, map.cs, ss);
 
     // optional follow-point animation, generated in memory and appended below the skin elements
     let mut follow = None;

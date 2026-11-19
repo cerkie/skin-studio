@@ -7,9 +7,6 @@ use egui::{emath::easing, Align2, Color32, CornerRadius, FontFamily, FontId, Id,
 /// OverlayColourProvider(hue 255). Values computed from its `getColor(saturation, lightness)` table.
 pub mod pal {
     use egui::Color32;
-    pub const COLOR0: Color32 = Color32::from_rgb(0xb3, 0x99, 0xff);
-    pub const COLOR1: Color32 = Color32::from_rgb(0x8c, 0x66, 0xff);
-    pub const COLOR2: Color32 = Color32::from_rgb(0x70, 0x47, 0xeb);
     pub const COLOR3: Color32 = Color32::from_rgb(0x59, 0x33, 0xcc);
     pub const HIGHLIGHT1: Color32 = Color32::from_rgb(0x8c, 0x66, 0xff);
     pub const CONTENT1: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
@@ -29,8 +26,6 @@ pub mod pal {
     pub const CONTROL: Color32 = Color32::from_rgb(0x2c, 0x2a, 0x33);
     /// OsuColor.Pink3, the pink of a settings button; PinkDark for hover.
     pub const PINK3: Color32 = Color32::from_rgb(0xcc, 0x33, 0x78);
-    pub const PINK1: Color32 = Color32::from_rgb(0xff, 0x66, 0xab);
-    pub const TOOLBAR: Color32 = Color32::from_rgb(0x18, 0x18, 0x18);
     pub const RED: Color32 = Color32::from_rgb(0xed, 0x11, 0x21);
 }
 
@@ -252,10 +247,6 @@ pub fn text(s: impl Into<String>, size: f32, color: Color32) -> RichText {
     RichText::new(s).size(size).color(color)
 }
 
-pub fn caption(ui: &mut Ui, s: &str) {
-    ui.label(text(s, 14.0, CONTENT2).family(light()));
-}
-
 /// Section title: lazer sets these in Torus Alternate at 30, above a 2 px Background6 rule.
 pub fn section_header(ui: &mut Ui, s: &str) {
     ui.add_space(8.0);
@@ -315,7 +306,7 @@ pub fn put_free(ui: &mut Ui, rect: Rect, widget: impl egui::Widget) -> Response 
 
 /// A caption above a single-line text box.
 pub fn text_row(ui: &mut Ui, id: &str, caption_text: &str, buf: &mut String) -> Response {
-    let rid = ui.id().with(id);
+    let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 54.0 + ROW_GAP), Sense::hover());
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
@@ -333,7 +324,7 @@ pub fn text_row(ui: &mut Ui, id: &str, caption_text: &str, buf: &mut String) -> 
 
 /// A caption and the current choice, a chevron, and a list that opens below. Returns the index picked.
 pub fn dropdown_row(ui: &mut Ui, id: &str, caption_text: &str, current: &str, items: &[String]) -> Option<usize> {
-    let rid = ui.id().with(id);
+    let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 54.0 + ROW_GAP), Sense::click());
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
@@ -380,7 +371,7 @@ fn elide(s: &str, max: usize) -> String {
 
 /// An outlined pill that fills with the highlight color when on (SwitchButton, 56 x 16).
 pub fn switch_row(ui: &mut Ui, id: &str, label: &str, on: &mut bool) -> bool {
-    let rid = ui.id().with(id);
+    let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 38.0 + ROW_GAP), Sense::click());
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
@@ -404,7 +395,7 @@ pub fn switch_row(ui: &mut Ui, id: &str, label: &str, on: &mut bool) -> bool {
 
 /// Caption and value on the left, a 40 px slider bar on the right (FormSliderBar). `v` is 0..1.
 pub fn slider_row(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str, v: &mut f32) -> bool {
-    let rid = ui.id().with(id);
+    let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 56.0 + ROW_GAP), Sense::hover());
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));

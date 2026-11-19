@@ -75,6 +75,39 @@ fn config_file() -> Option<PathBuf> {
     Some(config_dir()?.join("config.json"))
 }
 
+/// The skins of osu!lazer's own database, by the folder they are copied into when one is picked (it does not exist before).
+static LAZER_SKINS: std::sync::Mutex<Vec<(PathBuf, PathBuf, game::realm::LazerSkin)>> = std::sync::Mutex::new(Vec::new());
+
+fn lazer_skins() -> Vec<(String, PathBuf)> {
+    use std::hash::{Hash, Hasher};
+    let Some(dir) = game::realm::lazer_dir() else { return Vec::new() };
+    let Ok(mut skins) = game::realm::read_skins(&dir) else { return Vec::new() };
+    skins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let mut reg = LAZER_SKINS.lock().unwrap();
+    reg.clear();
+    let mut out = Vec::new();
+    for s in skins {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut files = s.files.clone();
+        files.sort();
+        files.hash(&mut h);
+        let safe: String = s.name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).take(40).collect();
+        let folder = std::env::temp_dir().join("skinstudio").join("lazer-skins").join(format!("{}-{:08x}", safe.trim(), h.finish() as u32));
+        out.push((format!("{} (osu!lazer)", s.name), folder.clone()));
+        reg.push((folder, dir.clone(), s));
+    }
+    out
+}
+
+/// Make sure the folder of a skin picked from osu!lazer's database exists (copying its files there the first time).
+pub fn ensure_skin(path: &std::path::Path) -> Result<(), String> {
+    let reg = LAZER_SKINS.lock().unwrap();
+    match reg.iter().find(|(f, _, _)| f == path) {
+        Some((f, dir, s)) => game::realm::materialize_skin(dir, s, f),
+        None => Ok(()),
+    }
+}
+
 /// Every skin we can find: lazer exports and stable Skins folders, newest first.
 pub fn detect_skins() -> Vec<(String, PathBuf)> {
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -106,7 +139,10 @@ pub fn detect_skins() -> Vec<(String, PathBuf)> {
         }
     }
     found.sort_by(|a, b| b.0.cmp(&a.0));
-    found.into_iter().map(|(_, l, p)| (l, p)).collect()
+    // the skins of the game itself first: they are the ones in use
+    let mut all = lazer_skins();
+    all.extend(found.into_iter().map(|(_, l, p)| (l, p)));
+    all
 }
 
 /// `random` / `random:SEED` picks a map from the Songs folder, anything else is a path to an .osu file.
@@ -160,8 +196,6 @@ pub struct Config {
     pub speed: f32,
     /// Where random maps come from: "auto", "lazer" or "stable".
     pub library: String,
-    /// "builtin" or "lazer": who draws the gameplay preview.
-    pub renderer: String,
 }
 
 impl Default for Config {
@@ -181,7 +215,6 @@ impl Default for Config {
             snake_out: true,
             speed: 1.0,
             library: "auto".into(),
-            renderer: "builtin".into(),
         }
     }
 }
@@ -202,7 +235,6 @@ impl Config {
         s("map", &mut c.map);
         s("songs", &mut c.songs);
         s("library", &mut c.library);
-        s("renderer", &mut c.renderer);
         if let Some(x) = v.get("volume").and_then(|x| x.as_f64()) {
             c.volume = (x as f32).clamp(0.0, 1.0);
         }
@@ -235,7 +267,20 @@ impl Config {
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let v = serde_json::json!({ "settings": self.settings, "skin": self.skin, "sound_skin": self.sound_skin, "map": self.map, "songs": self.songs, "volume": self.volume, "muted": self.muted, "offset_ms": self.offset_ms, "cursor_scale": self.cursor_scale, "hit_lighting": self.hit_lighting, "snake_in": self.snake_in, "snake_out": self.snake_out, "speed": self.speed, "library": self.library, "renderer": self.renderer });
+        let v = serde_json::json!({ "settings": self.settings, "skin": self.skin, "sound_skin": self.sound_skin, "map": self.map, "songs": self.songs, "volume": self.volume, "muted": self.muted, "offset_ms": self.offset_ms, "cursor_scale": self.cursor_scale, "hit_lighting": self.hit_lighting, "snake_in": self.snake_in, "snake_out": self.snake_out, "speed": self.speed, "library": self.library });
         let _ = std::fs::write(f, serde_json::to_string_pretty(&v).unwrap_or_default());
+    }
+}
+
+#[cfg(test)]
+mod lazer_skin_tests {
+    #[test]
+    #[ignore]
+    fn lists_and_copies_the_cerkie_skin() {
+        let skins = super::detect_skins();
+        let (label, path) = skins.iter().find(|(l, _)| l.starts_with("Cerkie lazer (may 2026) (osu!lazer)")).expect("skin in the list").clone();
+        println!("{label} -> {}", path.display());
+        super::ensure_skin(&path).expect("copied");
+        println!("copied: {} files, cursor1@2x: {}", std::fs::read_dir(&path).unwrap().count(), path.join("cursor1@2x.png").is_file());
     }
 }

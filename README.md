@@ -3,7 +3,8 @@
 An editor for osu! followpoint animations with a live gameplay preview. Pick a skin and a map, edit on the left, and the changes show up in the preview right away.
 
 - Effect presets, drawn sources or your own PNG, timing, keyframe motion and color, outline, shadow and debanding
-- Preview with Argon Pro or any skin, on a random map from your osu!lazer library (or stable's Songs folder, or a `.osu`/`.osz`/`.olz` you choose)
+- A gameplay preview drawn the way osu!lazer draws it (the logic is ported from its source), with Argon Pro or any skin, including the skins stored in osu!lazer itself, on a random map from your osu!lazer library (or stable's Songs folder, or a `.osu`/`.osz`/`.olz` you choose); when a map ends the next random one starts
+- The animation plays in a card over the preview that you can move, resize and fold away
 - Export as `followpoint-N.png` (and `@2x`), import an existing set, and keep a history of your saves
 
 ## Planned
@@ -21,16 +22,12 @@ Followpoints are only the start. The goal is a full osu! skin editor, so these a
 
 Windows and Linux builds are on the [releases page](../../releases).
 
-## The osu!lazer preview (optional)
+## Checking the renderer against osu!lazer
 
-The built-in preview is our own drawing of the map. For the exact look of the game there is an optional component that plays the map
-with osu!lazer's own renderer, in a window of its own: **Preview > Renderer > osu!lazer**. Your animation is put into a copy of your
-skin and shown by lazer itself; with it on, play, seek, speed and volume in Skin Studio control that window. It needs a skin that is
-not Argon Pro to show your animation.
-
-Download `lazer-preview-windows-x64.zip` from the releases page, unzip it into a folder called `lazer-preview` next to
-`studio.exe`, and install the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (desktop). To build it from
-source: `dotnet publish apps/lazer-preview -c Release`. The component includes lazer's own assets (see `NOTICE.md`).
+The preview is Skin Studio's own renderer, written from osu!lazer's source so that it looks and moves like the game. To check it,
+`dev/lazer-reference` is a small program built on the osu!lazer packages that plays a map with lazer's own renderer, and
+`dev/compare.py` renders the same map, skin and times with both and puts the frames side by side (Windows only, development only;
+it is not part of the release). `dotnet publish dev/lazer-reference -c Release` builds it.
 
 ## Build
 

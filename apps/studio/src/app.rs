@@ -83,10 +83,7 @@ impl ApplicationHandler for App {
         surface.configure(&device, &config);
 
         let ctx = egui::Context::default();
-        let mut studio = Studio::new(ctx.clone());
-        if studio.cfg.renderer == "lazer" {
-            studio.set_renderer(true);
-        }
+        let studio = Studio::new(ctx.clone());
         theme::install(&ctx);
         let egui_state = egui_winit::State::new(ctx.clone(), ViewportId::ROOT, &*window, Some(window.scale_factor() as f32), window.theme(), Some(device.limits().max_texture_dimension_2d as usize));
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
@@ -166,47 +163,15 @@ impl App {
         let ppp = ui_scale(&l.window);
         l.ctx.set_pixels_per_point(ppp);
         let raw = l.egui_state.take_egui_input(&l.window);
-        let sv = match (&l.session, &l.studio.lazer) {
-            (Some(s), _) => SessionView { loaded: true, clock: s.clock_ms, start: s.start_ms, end: s.end_ms, playing: s.playing, info: s.info.clone(), volume: s.volume() },
-            (None, Some(lz)) => match lz.time {
-                Some(t) => SessionView { loaded: true, clock: t.ms, start: t.start, end: t.end, playing: t.playing, info: lz.title.clone(), volume: l.studio.cfg.volume },
-                None => SessionView::default(),
-            },
-            _ => SessionView::default(),
+        let sv = match &l.session {
+            Some(s) => SessionView { loaded: true, clock: s.clock_ms, start: s.start_ms, end: s.end_ms, playing: s.playing, info: s.info.clone() },
+            None => SessionView::default(),
         };
         let mut out = UiOut::default();
         let studio = &mut l.studio;
         let full = l.ctx.run_ui(raw, |ui| ui::draw(ui, studio, &sv, &mut out));
         l.egui_state.handle_platform_output(&l.window, full.platform_output);
 
-        // what the interface asked of the osu!lazer preview, when that is the one drawing
-        if l.studio.lazer_active() {
-            l.session = None;
-            l.studio.lazer_tick();
-            if l.studio.load_session {
-                l.studio.lazer_request_map();
-            }
-            let vol = l.studio.effective_volume();
-            let (hl, si, so, cur) = (l.studio.cfg.hit_lighting, l.studio.cfg.snake_in, l.studio.cfg.snake_out, l.studio.cfg.cursor_scale);
-            if let Some(lz) = &mut l.studio.lazer {
-                if out.toggle_play {
-                    let playing = lz.time.map(|t| t.playing).unwrap_or(true);
-                    lz.send(serde_json::json!({ "cmd": if playing { "pause" } else { "play" } }));
-                }
-                if let (Some(f), Some(t)) = (out.seek, lz.time) {
-                    lz.send(serde_json::json!({ "cmd": "seek", "ms": t.start + (t.end - t.start) * f }));
-                }
-                if out.volume.is_some() {
-                    lz.send(serde_json::json!({ "cmd": "volume", "value": vol }));
-                }
-                if let Some(v) = out.speed {
-                    lz.send(serde_json::json!({ "cmd": "speed", "value": v }));
-                }
-                if out.hit_lighting.is_some() || out.snaking.is_some() || out.cursor.is_some() {
-                    lz.send(serde_json::json!({ "cmd": "config", "hitLighting": hl, "snakingIn": si, "snakingOut": so, "cursorSize": cur }));
-                }
-            }
-        }
         // what the interface asked of the session
         if let Some(s) = &mut l.session {
             if out.toggle_play {
@@ -241,7 +206,7 @@ impl App {
         let from_layout = (vp_px[2] / 640.0).min(vp_px[3] / 480.0);
         let want_ss = (if from_layout.is_finite() && from_layout > 0.2 && from_layout < 8.0 { from_layout } else { from_window }).clamp(0.4, 4.0);
 
-        if l.studio.load_session && l.rescale.is_none() && !l.studio.lazer_active() {
+        if l.studio.load_session && l.rescale.is_none() {
             // a skin change carries on from the moment being played
             l.studio.resume = l.session.as_ref().map(|s| (s.clock_ms, s.playing));
             l.studio.start_session_load(want_ss);
@@ -285,6 +250,16 @@ impl App {
         let view = frame.texture.create_view(&Default::default());
         if let Some(s) = &mut l.session {
             s.advance(dt);
+            if s.ended {
+                // the map has played out: a random one goes on to the next, a chosen one plays again
+                if l.studio.cfg.map == "random" {
+                    if !l.studio.load_session && !l.studio.loading {
+                        l.studio.new_map();
+                    }
+                } else {
+                    s.restart();
+                }
+            }
             s.set_viewport(vp_px[0], vp_px[1], vp_px[2], vp_px[3]);
             s.render(&view);
         } else {

@@ -23,7 +23,7 @@ fn frac(t: f32, a: f32, b: f32) -> f32 {
 
 impl Scene {
     pub(crate) fn accent(&self, o: &HitObject) -> [f32; 3] {
-        self.colors[o.color_index % self.colors.len()]
+        self.combo_colour(o)
     }
 
     /// One Argon hit circle (a full circle, or a slider head without the outer fill).
@@ -101,7 +101,6 @@ impl Scene {
         let base = map.stacked(o);
         let p0 = s.path.pts[0];
         let to_view = |q: P| [base[0] + q[0] - p0[0], base[1] + q[1] - p0[1]];
-        let ba = frac(t, appear, appear + self.fade_in) * alpha_whole;
         let k = self.scale;
         let (end_pos, start_pos) = (to_view(s.path.at(s.length).0), to_view(s.path.at(0.0).0));
 
@@ -109,7 +108,10 @@ impl Scene {
         for r in 1..s.slides {
             let pass = o.time + r as f32 * s.span_duration;
             let anim = s.span_duration.min(300.0);
-            let ka = ba * (1.0 - frac(t, pass, pass + anim));
+            // ApplyRepeatFadeIn: the first repeat fades in with the slider (after a third of the pre-empt when the body snakes in),
+            // later ones appear two spans early and fade in over at most a span; once hit the whole repeat fades out (Easing.Out)
+            let (from, adur) = if r == 1 { (appear + if self.snake_in { self.preempt / 3.0 } else { 0.0 }, 150.0) } else { (pass - 2.0 * s.span_duration, s.span_duration.min(150.0)) };
+            let ka = alpha_whole * frac(t, from, from + adur) * (1.0 - ease_out_quad(frac(t, pass, pass + anim)));
             if ka <= 0.0 {
                 continue;
             }
@@ -117,7 +119,7 @@ impl Scene {
             let toward = to_view(toward);
             let rot = (toward[1] - pos[1]).atan2(toward[0] - pos[0]);
             let grow = if t >= pass { 1.0 + 0.5 * ease_out_quad(frac(t, pass, pass + anim)) } else { 1.0 };
-            let lt = (t - appear).rem_euclid(300.0);
+            let lt = (t - from).rem_euclid(300.0);
             let pulse = if t >= pass { 1.0 } else if lt < 35.0 { 1.0 + 0.3 * ease_out_quad(lt / 35.0) } else { 1.3 - 0.3 * ease_out_quad((lt - 35.0) / 250.0) };
             self.sprite(out, "ar_rev_pill", 0, pos, k * grow * pulse, rot, ka, None);
             self.sprite(out, "ar_rev_icon", 0, pos, k * grow * pulse, rot, ka, Some(argon::darken(ac, 4.0)));
@@ -131,7 +133,8 @@ impl Scene {
                 let f = if span % 2 == 1 { 1.0 - tick } else { tick };
                 let span_start = o.time + span as f32 * s.span_duration;
                 let tt = span_start + tick * s.span_duration;
-                let ap = (span_start + (tt - span_start) * 0.5 - self.preempt).max(appear);
+                // SliderTick: pre-empt = half the time since the span began + 200 ms (66% of the slider's pre-empt in the first span)
+                let ap = (span_start + (tt - span_start) * 0.5 - if span > 0 { 200.0 } else { self.preempt * 0.66 }).max(appear);
                 if t < ap || t > tt + 150.0 {
                     continue;
                 }
@@ -165,6 +168,8 @@ impl Scene {
             } else {
                 (1.0 + (argon::FOLLOW_AREA - 1.0) * (1.0 - ease_out_quint(frac(t, end, end + 300.0))), 1.0 - ease_out_quint(frac(t, end, end + 150.0)))
             };
+            // everything of the slider is drawn at the slider's own alpha too, which fades it out for 240 ms after its end
+            let fa = fa * alpha_whole;
             if fa > 0.0 {
                 self.sprite_add(out, "ar_follow", bp, k * fs, 0.0, fa, Some(ac));
             }
@@ -174,6 +179,7 @@ impl Scene {
                 ball_a *= 1.0 - ease_out_quint(frac(t, end, end + 50.0));
                 icon_k *= 1.0 - 0.1 * ease_out_quint(frac(t, end, end + 200.0));
             }
+            let ball_a = ball_a * alpha_whole;
             if ball_a > 0.0 {
                 self.sprite(out, "ar_ball_fill", 0, bp, k, 0.0, ball_a, Some(ac));
                 self.sprite(out, "ar_ball_border", 0, bp, k, 0.0, ball_a, None);

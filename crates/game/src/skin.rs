@@ -340,3 +340,20 @@ pub fn hitcircle_overlap(skin: &Skin) -> f32 {
 pub fn add_default_approach(sheet: &mut Sheet, object_scale: f32, ss: f32) {
     crate::argon::add_approach_ring(sheet, "approachcircle", object_scale * ss * 2.0);
 }
+
+/// The sheet of everything the gameplay draws from a skin: the Argon set drawn in code, or the skin's own images packed, with lazer's
+/// default approach ring for a skin that has none (osu!lazer falls back to its default skin for it).
+pub fn base_sheet(skin: &Skin, cs: f32, ss: f32) -> Sheet {
+    let scale = engine::lazer::circle_scale(cs);
+    if matches!(skin.style, Style::Argon { .. }) {
+        let mut s = Sheet::default();
+        crate::argon::add_to_sheet(&mut s, scale, ss);
+        s
+    } else {
+        let mut sheet = Sheet::pack(&gameplay_entries(skin, scale, ss));
+        if sheet.get("approachcircle").is_none() {
+            add_default_approach(&mut sheet, scale, ss);
+        }
+        sheet
+    }
+}

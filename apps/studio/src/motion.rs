@@ -31,7 +31,7 @@ pub fn graph(ui: &mut Ui, st: &mut Studio, pid: &str) {
     p.rect_filled(outer, CornerRadius::same(8), BACKGROUND5);
 
     // the value range: wide enough for the keys and the curve between them, held steady while a dot is dragged
-    let rid = ui.id().with(("motion-range", pid));
+    let rid = ui.scope_id().with(("motion-range", pid));
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
     for i in 0..=80 {
         let v = keys::eval(&nk, i as f32 / 80.0 * total, total);
@@ -92,7 +92,7 @@ pub fn graph(ui: &mut Ui, st: &mut Studio, pid: &str) {
         let is_end = jk.map(|k| k[0].is_string()).unwrap_or(false);
         let t = k.t.at(total);
         let pos = Pos2::new(to_x(t), to_y(k.v));
-        let id = ui.id().with(("motion-node", pid, i));
+        let id = ui.scope_id().with(("motion-node", pid, i));
         let r = ui.interact(Rect::from_center_size(pos, Vec2::splat(22.0)), id, Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::Grab);
         let first = i == 0 && t <= 0.0;
         if r.dragged() {
