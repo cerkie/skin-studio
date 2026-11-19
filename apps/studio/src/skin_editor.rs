@@ -98,7 +98,7 @@ pub struct SkinEditor {
     result_display: Option<Arc<Display>>,
     pub page: SkinPage,
     /// The list of ways to add an edit is open.
-    add_open: bool,
+    pub add_open: bool,
     /// Edits that are folded to their title line.
     collapsed: std::collections::HashSet<usize>,
     /// How the picture is stored when it is saved (everything before that is in 32-bit floating point).
@@ -377,7 +377,7 @@ impl SkinEditor {
         }
     }
 
-    fn out_dims(&self) -> (usize, usize) {
+    pub fn out_dims(&self) -> (usize, usize) {
         self.result.as_ref().map(|r| (r.w, r.h)).or_else(|| self.source.as_ref().map(|s| (s.w, s.h))).unwrap_or((1, 1))
     }
 
@@ -461,29 +461,68 @@ impl SkinEditor {
 
 // ==================================================================================================================== toolbar
 /// What the toolbar shows while the skin editor is open.
-pub fn toolbar(ui: &mut Ui, st: &mut Studio) {
+pub fn toolbar(ui: &mut Ui, st: &mut Studio, right: f32) {
     ui.spacing_mut().item_spacing.x = 8.0; // the pills of neighbouring buttons need air between them
-    if th::button(ui, "Open skin", Kind::Ghost, true).clicked() {
-        st.pick(PickKind::SkinEditSkin);
-    }
-    if th::button(ui, "Open picture", Kind::Ghost, true).clicked() {
-        st.pick(PickKind::SkinEditPicture);
-    }
-    ui.add_space(10.0); // opening and saving are two groups
     let can_save = st.skin_ed.current.is_some();
-    if th::button(ui, "Save", Kind::Ghost, can_save).clicked() {
-        do_save(st);
+    let has_dir = st.skin_ed.dir.is_some();
+    // (label, kind, enabled, how long it stays when the bar is narrow: the larger, the sooner it goes into the "More" menu)
+    let items: [(&str, Kind, bool, u8); 6] = [("Open skin", Kind::Ghost, true, 0), ("Open folder", Kind::Ghost, true, 3), ("Open picture", Kind::Ghost, true, 2), ("Save", Kind::Ghost, can_save, 0), ("Save as", Kind::Ghost, can_save, 4), ("Export .osk", Kind::Accent, has_dir, 1)];
+    let font = FontId::new(15.0, th::semibold());
+    let width = |ui: &Ui, label: &str| ui.painter().layout_no_wrap(label.to_string(), font.clone(), CONTENT1).size().x + 28.0 + 8.0;
+    let widths: Vec<f32> = items.iter().map(|i| width(ui, i.0)).collect();
+    let more_w = width(ui, "More");
+    let budget = right - ui.cursor().left() - 40.0; // (the gaps between the groups, and the dot of unsaved changes)
+    let mut shown = [true; 6];
+    let total = |shown: &[bool; 6]| -> f32 { widths.iter().zip(shown).filter(|(_, s)| **s).map(|(w, _)| w).sum::<f32>() + if shown.iter().any(|s| !*s) { more_w } else { 0.0 } };
+    while total(&shown) > budget {
+        // the one that goes first is the one that matters least that is still there
+        let Some(k) = (0..6).filter(|k| shown[*k]).max_by_key(|k| items[*k].3) else { break };
+        if items[k].3 == 0 && (0..6).filter(|k| shown[*k]).all(|k| items[k].3 == 0) {
+            break;
+        }
+        shown[k] = false;
     }
-    if th::button(ui, "Save as", Kind::Ghost, can_save).clicked() {
-        st.pick(PickKind::SkinEditSaveAs);
+    let mut clicked: Option<usize> = None;
+    for (k, (label, kind, enabled, _)) in items.iter().enumerate() {
+        if k == 3 || k == 5 {
+            ui.add_space(10.0); // opening and saving are two groups, and Export is apart
+        }
+        if shown[k] && th::button(ui, label, *kind, *enabled).clicked() {
+            clicked = Some(k);
+        }
+        if k == 4 && st.skin_ed.dirty && shown[3] {
+            let (d, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+            ui.painter().circle_filled(d.center(), 3.5, Color32::from_rgb(0xff, 0xad, 0x4d));
+        }
     }
-    if st.skin_ed.dirty {
-        let (d, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
-        ui.painter().circle_filled(d.center(), 3.5, Color32::from_rgb(0xff, 0xad, 0x4d));
+    if shown.iter().any(|s| !*s) {
+        let resp = th::button(ui, "More", Kind::Ghost, true);
+        egui::Popup::menu(&resp).gap(4.0).show(|ui| {
+            ui.set_min_width(150.0);
+            for (k, (label, _, enabled, _)) in items.iter().enumerate() {
+                if shown[k] {
+                    continue;
+                }
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(140.0), 30.0), Sense::click());
+                if resp.hovered() && *enabled {
+                    ui.painter().rect_filled(r, CornerRadius::same(4), DARK3);
+                }
+                ui.painter().text(r.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, label, FontId::new(14.5, FontFamily::Proportional), if *enabled { CONTENT1 } else { LIGHT3 });
+                if resp.clicked() && *enabled {
+                    clicked = Some(k);
+                    ui.close();
+                }
+            }
+        });
     }
-    ui.add_space(10.0);
-    if th::button(ui, "Export .osk", Kind::Accent, st.skin_ed.dir.is_some()).clicked() {
-        st.pick(PickKind::SkinEditExportOsk);
+    match clicked {
+        Some(0) => st.pick(PickKind::SkinEditSkin),
+        Some(1) => st.pick(PickKind::SkinEditSkinFolder),
+        Some(2) => st.pick(PickKind::SkinEditPicture),
+        Some(3) => do_save(st),
+        Some(4) => st.pick(PickKind::SkinEditSaveAs),
+        Some(5) => st.pick(PickKind::SkinEditExportOsk),
+        _ => {}
     }
 }
 
@@ -501,8 +540,7 @@ pub fn title(st: &Studio) -> String {
         (None, Some(d)) => d.to_string_lossy().to_string(),
         _ => "No skin open".to_string(),
     };
-    // the end of the path: it has to leave room for the buttons
-    if full.chars().count() > 44 { format!("…{}", full.chars().skip(full.chars().count() - 43).collect::<String>()) } else { full }
+    full
 }
 
 // ==================================================================================================================== page
@@ -667,8 +705,11 @@ fn open_preview_skin(st: &mut Studio, dir: &Path) {
 
 /// The buttons that open a skin or a picture (the empty state of the pictures page).
 fn open_buttons(ui: &mut Ui, st: &mut Studio) {
-    if th::button_wide(ui, "Open a skin...", Kind::Purple, true).clicked() {
+    if th::button_wide(ui, "Open a skin (.osk)...", Kind::Purple, true).clicked() {
         st.pick(PickKind::SkinEditSkin);
+    }
+    if th::button_wide(ui, "Open a skin folder...", Kind::Dark, true).clicked() {
+        st.pick(PickKind::SkinEditSkinFolder);
     }
     if let Some(dir) = st.current_skin_folder() {
         if th::button_wide(ui, "Edit the skin picked for the preview", Kind::Dark, st.skin_ed.dir.as_deref() != Some(dir.as_path())).clicked() {
@@ -700,6 +741,10 @@ fn num_row(ui: &mut Ui, bufs: &mut HashMap<String, String>, id: &str, label: &st
 /// The step that a slider over `range` moves by: 1, 2 or 5 times a power of ten, giving 40 to 100 positions, so that round values
 /// (8, 0.5, 80) can be hit exactly.
 fn nice_step(range: f32) -> f32 {
+    // a slider over twenty or more units moves in whole ones, so that no value is skipped
+    if range >= 20.0 {
+        return 1.0;
+    }
     let raw = (range / 80.0).max(1e-4);
     let p = 10f32.powf(raw.log10().floor());
     let m = raw / p;
@@ -739,6 +784,30 @@ fn slider(ui: &mut Ui, id: &str, label: &str, v: &mut f32, min: f32, max: f32, s
     changed
 }
 
+/// The edits that can be added, with what a new one starts as (for the menu, and for the layout audit).
+pub fn add_menu_items(cw: usize, ch: usize) -> Vec<(&'static str, Op)> {
+    vec![
+            ("Resize", Op::Resize { w: cw, h: ch, mode: Resample::Smooth }),
+            ("Crop", Op::Crop { x: 0, y: 0, w: cw, h: ch }),
+            ("Flip left-right", Op::Flip { horizontal: true }),
+            ("Flip up-down", Op::Flip { horizontal: false }),
+            ("Rotate right", Op::Rotate { quarter_turns: 1 }),
+            ("Rotate left", Op::Rotate { quarter_turns: 3 }),
+            ("Trim border", Op::Trim { threshold: 0.0 }),
+            ("Expand border", Op::Expand { amount: 16, fill: Fill::Clear }),
+            ("Colour", Op::Adjust { brightness: 0.0, contrast: 0.0, saturation: 0.0, hue: 0.0 }),
+            ("Tint", Op::Tint { rgb: [1.0, 0.4, 0.6], strength: 0.5 }),
+            ("Opacity", Op::Opacity { factor: 1.0 }),
+            ("Invert", Op::Invert),
+            ("Blur", Op::Blur { sigma: 1.5 }),
+            ("Sharpen", Op::Sharpen { amount: 0.8, sigma: 1.2 }),
+            ("Deband", Op::Deband { radius: 64.0, threshold: 6.0, iterations: 4, grain: 0.5, kind: Grain::Gaussian, mono: true, room: true, luma: LumaScale { scaling: 4.0, by_average: false }, limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: Mask { invert: true, ..Mask::off() }, adv: edit::Advanced::default() }),
+            ("Dehalo", Op::Dehalo(Dehalo::default())),
+            ("Denoise", Op::Denoise(Denoise::default())),
+            ("Anti-alias", Op::AntiAlias(AntiAlias::default())),
+            ]
+}
+
 fn edits_page(ui: &mut Ui, st: &mut Studio) {
     th::section_header(ui, "Edits");
     if st.skin_ed.source.is_none() {
@@ -774,26 +843,7 @@ fn edits_page(ui: &mut Ui, st: &mut Studio) {
     }
     if st.skin_ed.add_open {
         let (cw, ch) = st.skin_ed.out_dims();
-        let items: Vec<(&str, Op)> = vec![
-            ("Resize", Op::Resize { w: cw, h: ch, mode: Resample::Smooth }),
-            ("Crop", Op::Crop { x: 0, y: 0, w: cw, h: ch }),
-            ("Flip left-right", Op::Flip { horizontal: true }),
-            ("Flip up-down", Op::Flip { horizontal: false }),
-            ("Rotate right", Op::Rotate { quarter_turns: 1 }),
-            ("Rotate left", Op::Rotate { quarter_turns: 3 }),
-            ("Trim border", Op::Trim { threshold: 0.0 }),
-            ("Expand border", Op::Expand { amount: 16, fill: Fill::Clear }),
-            ("Colour", Op::Adjust { brightness: 0.0, contrast: 0.0, saturation: 0.0, hue: 0.0 }),
-            ("Tint", Op::Tint { rgb: [1.0, 0.4, 0.6], strength: 0.5 }),
-            ("Opacity", Op::Opacity { factor: 1.0 }),
-            ("Invert", Op::Invert),
-            ("Blur", Op::Blur { sigma: 1.5 }),
-            ("Sharpen", Op::Sharpen { amount: 0.8, sigma: 1.2 }),
-            ("Deband", Op::Deband { radius: 64.0, threshold: 6.0, iterations: 4, grain: 0.5, kind: Grain::Gaussian, mono: true, room: true, luma: LumaScale { scaling: 4.0, by_average: false }, limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: Mask { invert: true, ..Mask::off() }, adv: edit::Advanced::default() }),
-            ("Dehalo", Op::Dehalo(Dehalo::default())),
-            ("Denoise", Op::Denoise(Denoise::default())),
-            ("Anti-alias", Op::AntiAlias(AntiAlias::default())),
-        ];
+        let items = add_menu_items(cw, ch);
         let labels: Vec<&str> = items.iter().map(|(l, _)| *l).collect();
         if let Some(i) = th::button_grid(ui, &labels, 2, Kind::Dark) {
             // the new edit is open and the others fold away, so that its settings are in view
@@ -1044,7 +1094,7 @@ fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: 
                 ch |= slider(ui, &format!("hp{i}"), "Edge processing", &mut o.edgeproc, 0.0, 3.0, |v| format!("{v:.2}"));
             }
             ch |= target_row(ui, &format!("ht{i}"), &mut o.target);
-            ch |= mask_controls(ui, &format!("hk{i}"), &mut o.mask);
+            ch |= mask_controls(ui, &format!("hk{i}"), &mut o.mask, true);
             th::note(ui, "After vs-jetpack's dehalo_alpha and fine_dehalo. Bright halos are taken away by the bright strength, dark ones by the dark strength.");
         }
         Op::Denoise(o) => {
@@ -1062,7 +1112,7 @@ fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: 
                 ch |= slider(ui, &format!("nsr{i}"), "Difference", &mut o.sigma_r, 1.0, 60.0, |v| format!("{v:.0} levels"));
             }
             ch |= target_row(ui, &format!("nt{i}"), &mut o.target);
-            ch |= mask_controls(ui, &format!("nm{i}"), &mut o.mask);
+            ch |= mask_controls(ui, &format!("nm{i}"), &mut o.mask, true);
             th::note(ui, "The mask is turned around by default: noise is taken out away from the edges, so details stay sharp.");
         }
         Op::AntiAlias(o) => {
@@ -1071,7 +1121,7 @@ fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: 
             ch |= slider_u8(ui, &format!("ap{i}"), "Passes", &mut o.passes, 1, 6);
             ch |= th::switch_row(ui, &format!("af{i}"), "Clean up afterwards", &mut o.postfilter);
             ch |= target_row(ui, &format!("at{i}"), &mut o.target);
-            ch |= mask_controls(ui, &format!("am{i}"), &mut o.mask);
+            ch |= mask_controls(ui, &format!("am{i}"), &mut o.mask, true);
             th::note(ui, "Edges are smoothed along their own direction, within the mask, at a larger size. (Not the neural scalers of vs-jetpack.)");
         }
         Op::Expand { amount, fill } => {
@@ -1128,7 +1178,7 @@ fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: 
                 ch |= th::switch_row(ui, &format!("dm{i}"), "Grey grain", mono);
             }
             ch |= luma_controls(ui, &format!("dl{i}"), luma);
-            ch |= mask_controls(ui, &format!("dmk{i}"), protect);
+            ch |= mask_controls(ui, &format!("dmk{i}"), protect, false);
             ch |= th::switch_row(ui, &format!("dx{i}"), "Make room for cut-off glows", room);
             th::note(ui, "Radius: how far it looks for pixels to average with. Threshold: how different they may be and still count as one band. Smooth and gradient-aware methods are vszip's (f3kdb) modes 6 and 7: the line limit tells a step on a slope (banding) from a detail, so the reference limit can stay wide on steep gradients. Prefilter: the banding is looked for in a blurred copy and the fine detail put back (some of the band steps come back with it, so use it only on noisy pictures). Limit: a change bigger than this is no banding and is taken back. The mask (set to away from edges) keeps it off edges and details. Poisson grain follows the brightness; blue grain has less texture than Gaussian.");
         }
@@ -1164,7 +1214,7 @@ fn target_row(ui: &mut Ui, id: &str, t: &mut Target) -> bool {
 }
 
 /// The controls of an edge mask that limits a filter.
-fn mask_controls(ui: &mut Ui, id: &str, m: &mut Mask) -> bool {
+fn mask_controls(ui: &mut Ui, id: &str, m: &mut Mask, with_luma: bool) -> bool {
     let mut ch = th::switch_row(ui, &format!("{id}e"), "Limit with an edge mask", &mut m.enabled);
     if m.enabled {
         ch |= edge_row(ui, &format!("{id}d"), "Mask edge detector", &mut m.edge);
@@ -1173,7 +1223,9 @@ fn mask_controls(ui: &mut Ui, id: &str, m: &mut Mask) -> bool {
         ch |= slider_u8(ui, &format!("{id}s"), "Mask softening", &mut m.soften, 0, 6);
         ch |= th::switch_row(ui, &format!("{id}i"), "Away from the edges instead", &mut m.invert);
     }
-    ch |= luma_controls(ui, &format!("{id}l"), &mut m.luma);
+    if with_luma {
+        ch |= luma_controls(ui, &format!("{id}l"), &mut m.luma);
+    }
     ch |= th::switch_row(ui, &format!("{id}v"), "Show the mask", &mut m.show);
     ch
 }
@@ -1209,42 +1261,77 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
         ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::new(13.5, th::semibold()), if on || resp.hovered() { CONTENT1 } else { LIGHT1 });
         resp.clicked()
     };
-    for (s, label, tip) in [(Show::After, "After", "The picture with the edits"), (Show::Before, "Before", "The picture as it was loaded"), (Show::Split, "Split", "Before on the left, after on the right")] {
-        let r = place(if s == Show::Split { 58.0 } else { 62.0 });
-        if pill(ui, r, label, ed.show == s, tip) {
-            ed.show = s;
-        }
+    // everything that is in the bar, with how long it stays when the bar is narrow (the larger, the sooner it goes) and the gap before it
+    let zooms: [(&str, f32); 4] = [("100%", 1.0 / ppp), ("200%", 2.0 / ppp), ("400%", 4.0 / ppp), ("800%", 8.0 / ppp)];
+    #[derive(Clone, Copy)]
+    enum Pill {
+        Show(Show, &'static str, &'static str),
+        Fit,
+        Zoom(usize),
+        Back(Bg, &'static str),
     }
-    x.set(x.get() + 12.0);
-    let r = place(44.0);
-    if pill(ui, r, "Fit", ed.zoom == 0.0, "Fit the picture in the window") {
-        ed.zoom = 0.0;
-        ed.pan = Vec2::ZERO;
+    let mut pills: Vec<(Pill, f32, u8, f32)> = vec![
+        (Pill::Show(Show::After, "After", "The picture with the edits"), 62.0, 0, 0.0),
+        (Pill::Show(Show::Before, "Before", "The picture as it was loaded"), 62.0, 0, 0.0),
+        (Pill::Show(Show::Split, "Split", "Before on the left, after on the right"), 58.0, 0, 0.0),
+        (Pill::Fit, 44.0, 0, 12.0),
+        (Pill::Zoom(0), 52.0, 2, 0.0),
+        (Pill::Zoom(1), 52.0, 3, 0.0),
+        (Pill::Zoom(2), 52.0, 4, 0.0),
+        (Pill::Zoom(3), 52.0, 5, 0.0),
+        (Pill::Back(Bg::Dark, "Black"), 52.0, 1, 12.0),
+        (Pill::Back(Bg::Grey, "Grey"), 52.0, 1, 0.0),
+        (Pill::Back(Bg::Light, "Light"), 52.0, 1, 0.0),
+    ];
+    let fits = |p: &Vec<(Pill, f32, u8, f32)>| p.iter().map(|q| q.1 + 6.0 + q.3).sum::<f32>() + 12.0 <= bar.width();
+    while !fits(&pills) {
+        // the least important goes (the biggest zoom first), but what always stays stays
+        let Some(k) = pills.iter().enumerate().filter(|(_, q)| q.2 > 0).max_by_key(|(_, q)| q.2).map(|(k, _)| k) else { break };
+        pills.remove(k);
     }
-    for (label, z) in [("100%", 1.0 / ppp), ("200%", 2.0 / ppp), ("400%", 4.0 / ppp), ("800%", 8.0 / ppp)] {
-        let r = place(52.0);
-        if pill(ui, r, label, (ed.zoom - z).abs() < 1e-3, "Show the picture at this size: one pixel of it is this many pixels of the screen") {
-            ed.zoom = z;
-            ed.pan = Vec2::ZERO;
-        }
-    }
-    x.set(x.get() + 12.0);
-    for (b, label) in [(Bg::Dark, "Black"), (Bg::Grey, "Grey"), (Bg::Light, "Light")] {
-        let r = place(52.0);
-        if pill(ui, r, label, ed.bg == b, "What is behind the picture") {
-            ed.bg = b;
+    for (pill_kind, w, _, gap) in pills {
+        x.set(x.get() + gap);
+        let r = place(w);
+        match pill_kind {
+            Pill::Show(s, label, tip) => {
+                if pill(ui, r, label, ed.show == s, tip) {
+                    ed.show = s;
+                }
+            }
+            Pill::Fit => {
+                if pill(ui, r, "Fit", ed.zoom == 0.0, "Fit the picture in the window") {
+                    ed.zoom = 0.0;
+                    ed.pan = Vec2::ZERO;
+                }
+            }
+            Pill::Zoom(i) => {
+                let (label, z) = zooms[i];
+                if pill(ui, r, label, (ed.zoom - z).abs() < 1e-3, "Show the picture at this size: one pixel of it is this many pixels of the screen") {
+                    ed.zoom = z;
+                    ed.pan = Vec2::ZERO;
+                }
+            }
+            Pill::Back(b, label) => {
+                if pill(ui, r, label, ed.bg == b, "What is behind the picture") {
+                    ed.bg = b;
+                }
+            }
         }
     }
 
     // --- the picture
     let Some(after) = ed.result.clone().or_else(|| ed.source.clone()) else {
         ui.painter().rect_filled(area, 0.0, BACKGROUND6);
-        ui.painter().text(area.center(), Align2::CENTER_CENTER, "Open a skin or a picture, then pick a picture from the list", FontId::new(16.0, th::light()), LIGHT3);
+        let f = FontId::new(16.0, th::light());
+        let msg = th::fit_text(ui.painter(), "Open a skin or a picture, then pick a picture from the list", &f, area.width() - 32.0);
+        ui.painter().text(area.center(), Align2::CENTER_CENTER, msg, f, LIGHT3);
         return;
     };
     let before = ed.source.clone().unwrap_or_else(|| after.clone());
     let (iw, ih) = (after.w as f32, after.h as f32);
-    let fit = ((area.width() - 40.0) / iw).min((area.height() - 40.0) / ih).max(0.01);
+    // the line about the picture runs along the bottom: the picture keeps clear of it
+    let stage = Rect::from_min_max(area.min, Pos2::new(area.right(), area.bottom() - 30.0));
+    let fit = ((stage.width() - 40.0) / iw).min((stage.height() - 40.0) / ih).max(0.01);
     let z = if ed.zoom == 0.0 { fit } else { ed.zoom };
     let resp = ui.interact(area, ui.scope_id().with("sk-canvas"), Sense::click_and_drag());
     if resp.dragged() && ed.show != Show::Split {
@@ -1257,15 +1344,15 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
             let new = (old * (scroll * 0.003).exp()).clamp(0.02, 64.0);
             if let Some(m) = ui.input(|i| i.pointer.hover_pos()) {
                 // keep the point under the pointer where it is
-                let c = area.center() + ed.pan;
-                ed.pan = (m - area.center()) - (m - c) * (new / old);
+                let c = stage.center() + ed.pan;
+                ed.pan = (m - stage.center()) - (m - c) * (new / old);
             }
             ed.zoom = new;
         }
     }
     let z = if ed.zoom == 0.0 { fit } else { ed.zoom };
     let size = Vec2::new(iw * z, ih * z);
-    let rect = Rect::from_center_size(area.center() + ed.pan, size);
+    let rect = Rect::from_center_size(stage.center() + ed.pan, size);
     let clip = area;
     match ed.bg {
         Bg::Grey => {
@@ -1309,8 +1396,11 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
     painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_white_alpha(30)), egui::StrokeKind::Outside);
     // --- what it is
     let name = ed.current.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let info = if (before.w, before.h) == (after.w, after.h) { format!("{name}   {} × {} px   {:.0}%", after.w, after.h, z * ppp * 100.0) } else { format!("{name}   {} × {} px  →  {} × {} px   {:.0}%", before.w, before.h, after.w, after.h, z * ppp * 100.0) };
-    painter.text(Pos2::new(area.left() + 16.0, area.bottom() - 14.0), Align2::LEFT_CENTER, info + if ed.busy { "   working..." } else { "" }, FontId::new(13.0, FontFamily::Proportional), Color32::from_white_alpha(170));
+    let rest = if (before.w, before.h) == (after.w, after.h) { format!("   {} × {} px   {:.0}%", after.w, after.h, z * ppp * 100.0) } else { format!("   {} × {} px  →  {} × {} px   {:.0}%", before.w, before.h, after.w, after.h, z * ppp * 100.0) } + if ed.busy { "   working..." } else { "" };
+    let info_font = FontId::new(13.0, FontFamily::Proportional);
+    let rest_w = painter.layout_no_wrap(rest.clone(), info_font.clone(), CONTENT1).size().x;
+    let name = th::fit_text(&painter, &name, &info_font, (area.width() - 32.0 - rest_w).max(40.0));
+    painter.text(Pos2::new(area.left() + 16.0, area.bottom() - 14.0), Align2::LEFT_CENTER, name + &rest, info_font, Color32::from_white_alpha(170));
 }
 
 #[cfg(test)]
@@ -1575,7 +1665,7 @@ mod frame_timing {
         let (r, dims) = compute(st.skin_ed.source.as_ref().unwrap(), &st.skin_ed.ops);
         st.skin_ed.dims = dims;
         st.skin_ed.result = Some(Arc::new(r));
-        let mut run = |st: &mut Studio| {
+        let run = |st: &mut Studio| {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(2576.0 / 1.6, 1408.0 / 1.6)));
             let t = std::time::Instant::now();
@@ -1600,10 +1690,11 @@ mod frame_timing {
 
     #[test]
     fn sliders_move_in_round_steps_and_typed_numbers_are_read() {
-        assert_eq!(nice_step(39.0), 0.2);
+        assert_eq!(nice_step(39.0), 1.0);
         assert_eq!(nice_step(1.0), 0.01);
         assert_eq!(nice_step(126.0), 1.0);
-        assert_eq!(nice_step(255.0), 2.0);
+        assert_eq!(nice_step(255.0), 1.0);
+        assert_eq!(nice_step(3.0), 0.02);
         // 8 is a multiple of the step of a 1..40 slider
         let step = nice_step(39.0);
         assert!(((8.0f32 / step).round() * step - 8.0).abs() < 1e-6);
@@ -1635,8 +1726,8 @@ mod frame_timing {
         for k in 0..6 {
             frame(&ctx, vec![egui::Event::PointerMoved(Pos2::new(300.0 + k as f32 * 2.0, 30.0))], egui::Modifiers::NONE, &mut v);
         }
-        let steps = v / 0.2;
-        assert!((steps - steps.round()).abs() < 1e-3, "{v} is a multiple of 0.2");
+        let steps = v / 1.0;
+        assert!((steps - steps.round()).abs() < 1e-3, "{v} is a whole number");
         let after_fast = v;
         frame(&ctx, vec![egui::Event::PointerButton { pos: Pos2::new(312.0, 30.0), button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }], egui::Modifiers::NONE, &mut v);
         assert!(after_fast > 6.0 && after_fast < 39.0, "{after_fast}");

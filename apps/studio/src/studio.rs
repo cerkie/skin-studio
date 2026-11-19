@@ -36,6 +36,7 @@ pub const TABS: [(Tab, &str); 5] = [
 #[derive(Clone, Copy, Debug)]
 pub enum PickKind {
     SkinEditSkin,
+    SkinEditSkinFolder,
     SkinEditPicture,
     SkinEditSaveAs,
     SkinEditExportOsk,
@@ -43,7 +44,9 @@ pub enum PickKind {
     SaveSettings,
     CustomImage,
     Skin,
+    SkinFolder,
     SoundSkin,
+    SoundSkinFolder,
     Map,
     Songs,
     ExportDir,
@@ -54,6 +57,8 @@ pub enum Msg {
     SkinResult(u64, Arc<engine::img::Img>, Vec<(usize, usize)>, Arc<crate::skin_editor::Display>),
     /// A thumbnail of a picture of the skin: the list it belongs to, the file, its size and premultiplied RGBA.
     SkinThumb(u64, PathBuf, [usize; 2], Vec<u8>),
+    /// The hit sound of the picked skin, found and decoded in the background: (the skin and the sound skin it is for, where it is, the sound).
+    LogoSound((String, String), Option<PathBuf>, Option<preview_window::sfx::Clip>),
     Frames { frames: Vec<Frame>, atlas: Arc<Atlas>, fps: f32 },
     Prepared(Result<Prepared, String>),
     Picked(PickKind, PathBuf),
@@ -115,6 +120,8 @@ pub struct Studio {
     pub logo_pressed: Option<Instant>,
     pub sfx: preview_window::sfx::Sfx,
     logo_sound: Option<((String, String), Option<PathBuf>)>,
+    /// The skins whose hit sound is being found in the background.
+    logo_warm: Option<(String, String)>,
     skin_folder: std::cell::RefCell<Option<(String, Option<PathBuf>)>>,
     /// The motion editor's selection, zoom and undo history.
     pub motion: crate::motion::MotionState,
@@ -190,6 +197,7 @@ impl Studio {
             logo_pressed: None,
             sfx: preview_window::sfx::Sfx::new(),
             logo_sound: None,
+            logo_warm: None,
             skin_folder: Default::default(),
             motion: crate::motion::MotionState::from_config(&cfg_dock),
             anim_speed: 1.0,
@@ -257,6 +265,17 @@ impl Studio {
                 }
             }
         }
+        // SKIN_STUDIO_LANE=lane,key picks a lane of the motion editor and one of its keys (for checking it without clicking)
+        if let Ok(v) = std::env::var("SKIN_STUDIO_LANE") {
+            let mut it = v.split(',').map(|x| x.trim().parse::<usize>().unwrap_or(0));
+            let (lane, key) = (it.next().unwrap_or(0), it.next());
+            s.motion.prop = lane;
+            s.motion.curves = std::env::var("SKIN_STUDIO_KEYFRAMES").is_err();
+            if let Some(k) = key {
+                s.motion.sel = vec![(lane, k)];
+            }
+        }
+        s.warm_logo_sound();
         s
     }
 
@@ -281,22 +300,28 @@ impl Studio {
                 return found.clone();
             }
         }
-        let skin_path = PathBuf::from(if self.cfg.skin.is_empty() { "argon" } else { &self.cfg.skin });
-        let _ = paths::ensure_skin(&skin_path); // a skin of osu!lazer's database is copied out first
-        let mut skins: Vec<game::skin::Skin> = vec![];
-        if let Ok(s) = game::skin::Skin::open(&skin_path) {
-            if s.style == game::skin::Style::Legacy {
-                skins.push(s);
-            }
-        }
-        if !self.cfg.sound_skin.is_empty() {
-            if let Ok(s) = game::skin::Skin::open(std::path::Path::new(&self.cfg.sound_skin)) {
-                skins.push(s);
-            }
-        }
-        let found = skins.iter().find_map(|s| s.find_sound("normal-hitnormal"));
+        let found = find_hitsound(&key.0, &key.1);
         self.logo_sound = Some((key, found.clone()));
         found
+    }
+
+    /// Finds and decodes the hit sound of the picked skin in the background, and opens the audio device, so that the first click on the logo
+    /// does not have to (it is cheap to call every frame).
+    pub fn warm_logo_sound(&mut self) {
+        let same = |k: &(String, String)| k.0 == self.cfg.skin && k.1 == self.cfg.sound_skin;
+        if self.logo_sound.as_ref().is_some_and(|(k, _)| same(k)) || self.logo_warm.as_ref().is_some_and(same) {
+            return;
+        }
+        let key = (self.cfg.skin.clone(), self.cfg.sound_skin.clone());
+        self.logo_warm = Some(key.clone());
+        self.sfx.warm();
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let found = find_hitsound(&key.0, &key.1);
+            let clip = found.as_deref().and_then(preview_window::sfx::decode_file);
+            let _ = tx.send(Msg::LogoSound(key, found, clip));
+            ctx.request_repaint();
+        });
     }
 
     /// The folder of the skin picked for the followpoint preview, if it is one (not Argon).
@@ -423,6 +448,13 @@ impl Studio {
                 }
                 Msg::Status(s) => self.status = s,
                 Msg::SkinResult(gen, img, dims, display) => self.skin_ed.got_result(gen, img, dims, Some(display)),
+                Msg::LogoSound(key, path, clip) => {
+                    if let Some(p) = &path {
+                        self.sfx.insert(p, clip);
+                    }
+                    self.logo_sound = Some((key, path));
+                    self.logo_warm = None;
+                }
                 Msg::SkinThumb(gen, path, size, rgba) => self.skin_ed.got_thumb(&self.ctx, gen, path, size, rgba),
                 Msg::HistoryChanged => self.reload_history(),
                 Msg::ImportDone(r) => {
@@ -451,7 +483,7 @@ impl Studio {
     fn picked(&mut self, kind: PickKind, p: PathBuf) {
         let ps = p.to_string_lossy().to_string();
         match kind {
-            PickKind::SkinEditSkin => match self.skin_ed.open_skin(&p) {
+            PickKind::SkinEditSkin | PickKind::SkinEditSkinFolder => match self.skin_ed.open_skin(&p) {
                 Ok(()) => {
                     let (tx, c) = (self.tx.clone(), self.ctx.clone());
                     self.skin_ed.load_thumbs(&tx, &c);
@@ -496,7 +528,7 @@ impl Studio {
                 self.bufs.clear();
                 self.edited();
             }
-            PickKind::Skin => {
+            PickKind::Skin | PickKind::SkinFolder => {
                 if !self.skins.iter().any(|(_, q)| *q == ps) {
                     self.skins.insert(0, (label(&ps), ps.clone()));
                 }
@@ -504,7 +536,7 @@ impl Studio {
                 self.cfg.save();
                 self.load_session = true;
             }
-            PickKind::SoundSkin => {
+            PickKind::SoundSkin | PickKind::SoundSkinFolder => {
                 self.cfg.sound_skin = ps;
                 self.cfg.save();
                 self.load_session = true;
@@ -548,15 +580,18 @@ impl Studio {
         let songs = (!self.cfg.songs.is_empty()).then(|| PathBuf::from(&self.cfg.songs));
         std::thread::spawn(move || {
             let r = match kind {
-                PickKind::SkinEditSkin => rfd::FileDialog::new().set_title("Open a skin (.osk or .zip)").add_filter("skin", &["osk", "zip"]).pick_file().or_else(|| rfd::FileDialog::new().set_title("...or open a skin folder").pick_folder()),
+                PickKind::SkinEditSkin => rfd::FileDialog::new().set_title("Open a skin (.osk or .zip)").add_filter("skin", &["osk", "zip"]).pick_file(),
+                PickKind::SkinEditSkinFolder => rfd::FileDialog::new().set_title("Open a skin folder").pick_folder(),
                 PickKind::SkinEditPicture => rfd::FileDialog::new().set_title("Open a picture").add_filter("PNG image", &["png"]).pick_file(),
                 PickKind::SkinEditSaveAs => rfd::FileDialog::new().set_title("Save the picture as").add_filter("PNG image", &["png"]).save_file(),
                 PickKind::SkinEditExportOsk => rfd::FileDialog::new().set_title("Pack the skin into an .osk").set_file_name("skin.osk").add_filter("skin", &["osk"]).save_file(),
                 PickKind::OpenSettings => rfd::FileDialog::new().set_title("Open settings").add_filter("settings", &["json"]).pick_file(),
                 PickKind::SaveSettings => rfd::FileDialog::new().set_title("Save settings").set_file_name("followpoint-settings.json").add_filter("settings", &["json"]).save_file(),
                 PickKind::CustomImage => rfd::FileDialog::new().set_title("Choose the image").add_filter("PNG image", &["png"]).pick_file(),
-                PickKind::Skin => rfd::FileDialog::new().set_title("Choose a skin (.osk or .zip)").add_filter("skin", &["osk", "zip"]).pick_file().or_else(|| rfd::FileDialog::new().set_title("...or choose a skin folder").pick_folder()),
-                PickKind::SoundSkin => rfd::FileDialog::new().set_title("Skin to take hit sounds from").add_filter("skin", &["osk", "zip"]).pick_file().or_else(|| rfd::FileDialog::new().set_title("...or a skin folder").pick_folder()),
+                PickKind::Skin => rfd::FileDialog::new().set_title("Choose a skin (.osk or .zip)").add_filter("skin", &["osk", "zip"]).pick_file(),
+                PickKind::SkinFolder => rfd::FileDialog::new().set_title("Choose a skin folder").pick_folder(),
+                PickKind::SoundSkin => rfd::FileDialog::new().set_title("Skin to take hit sounds from").add_filter("skin", &["osk", "zip"]).pick_file(),
+                PickKind::SoundSkinFolder => rfd::FileDialog::new().set_title("Skin folder to take hit sounds from").pick_folder(),
                 PickKind::Map => {
                     let mut d = rfd::FileDialog::new().set_title("Choose a beatmap").add_filter("osu! beatmap or archive", &["osu", "osz", "olz"]);
                     if let Some(p) = songs {
@@ -739,4 +774,22 @@ pub fn load_settings_file(path: &Path) -> Result<Value, String> {
 
 pub fn save_settings_file(path: &Path, v: &Value) -> Result<(), String> {
     std::fs::write(path, serde_json::to_string_pretty(v).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The hit sound of a skin: its own `normal-hitnormal` when it has one, else the one of the skin the hit sounds fall back to.
+fn find_hitsound(skin: &str, sound_skin: &str) -> Option<PathBuf> {
+    let skin_path = PathBuf::from(if skin.is_empty() { "argon" } else { skin });
+    let _ = paths::ensure_skin(&skin_path); // a skin of osu!lazer's database is copied out first
+    let mut skins: Vec<game::skin::Skin> = vec![];
+    if let Ok(s) = game::skin::Skin::open(&skin_path) {
+        if s.style == game::skin::Style::Legacy {
+            skins.push(s);
+        }
+    }
+    if !sound_skin.is_empty() {
+        if let Ok(s) = game::skin::Skin::open(std::path::Path::new(sound_skin)) {
+            skins.push(s);
+        }
+    }
+    skins.iter().find_map(|s| s.find_sound("normal-hitnormal"))
 }

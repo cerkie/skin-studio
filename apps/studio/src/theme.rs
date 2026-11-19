@@ -46,7 +46,7 @@ pub fn darken(c: Color32, amount: f32) -> Color32 {
     Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
 }
 
-fn ease(ui: &Ui, id: Id, target: bool) -> f32 {
+pub fn ease(ui: &Ui, id: Id, target: bool) -> f32 {
     ui.ctx().animate_bool_with_time_and_easing(id, target, 0.25, easing::cubic_out)
 }
 
@@ -330,8 +330,9 @@ pub fn dropdown_row(ui: &mut Ui, id: &str, caption_text: &str, current: &str, it
     let bg = bg_begin(ui);
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
     ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, caption_text, FontId::new(14.0, light()), CONTENT2);
-    let label_rect = ui.painter().text(rect.min + Vec2::new(PAD, PAD + 17.0), Align2::LEFT_TOP, elide(current, 34), FontId::new(16.0, FontFamily::Proportional), CONTENT1);
-    let _ = label_rect;
+    let label_font = FontId::new(16.0, FontFamily::Proportional);
+    let label = fit_text(ui.painter(), current, &label_font, rect.width() - 2.0 * PAD - 26.0);
+    ui.painter().text(rect.min + Vec2::new(PAD, PAD + 17.0), Align2::LEFT_TOP, label, label_font, CONTENT1);
     // the chevron turns over while the list is open
     let t = ease(ui, rid.with("chev"), open);
     let c = Pos2::new(rect.right() - PAD - 8.0, rect.center().y);
@@ -348,7 +349,13 @@ pub fn dropdown_row(ui: &mut Ui, id: &str, caption_text: &str, current: &str, it
                 if ir.hovered() {
                     ui.painter().rect_filled(r, CornerRadius::same(4), DARK3);
                 }
-                ui.painter().text(r.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, it, FontId::new(16.0, FontFamily::Proportional), if sel { HIGHLIGHT1 } else { CONTENT1 });
+                let item_font = FontId::new(16.0, FontFamily::Proportional);
+                let shown = fit_text(ui.painter(), it, &item_font, r.width() - 20.0);
+                let long = shown != *it;
+                ui.painter().text(r.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, shown, item_font, if sel { HIGHLIGHT1 } else { CONTENT1 });
+                if long {
+                    ir.clone().on_hover_text(it);
+                }
                 if ir.clicked() {
                     picked = Some(i);
                     ui.close();
@@ -357,6 +364,46 @@ pub fn dropdown_row(ui: &mut Ui, id: &str, caption_text: &str, current: &str, it
         });
     });
     picked
+}
+
+/// `text` cut with an ellipsis so that it is at most `max_w` points wide in `font`.
+pub fn fit_text(painter: &egui::Painter, text: &str, font: &FontId, max_w: f32) -> String {
+    let wide = |t: &str| painter.layout_no_wrap(t.to_string(), font.clone(), CONTENT1).size().x;
+    if wide(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let t: String = chars[..mid].iter().collect::<String>() + "…";
+        if wide(&t) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    chars[..lo].iter().collect::<String>() + "…"
+}
+
+/// `text` cut at its start (with an ellipsis) so that it is at most `max_w` points wide: for paths, whose end is the part that matters.
+pub fn fit_text_start(painter: &egui::Painter, text: &str, font: &FontId, max_w: f32) -> String {
+    let wide = |t: &str| painter.layout_no_wrap(t.to_string(), font.clone(), CONTENT1).size().x;
+    if wide(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let t: String = "…".to_string() + &chars[chars.len() - mid..].iter().collect::<String>();
+        if wide(&t) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    "…".to_string() + &chars[chars.len() - lo..].iter().collect::<String>()
 }
 
 fn elide(s: &str, max: usize) -> String {
@@ -392,55 +439,71 @@ pub fn switch_row(ui: &mut Ui, id: &str, label: &str, on: &mut bool) -> bool {
     changed
 }
 
-/// Caption and value on the left, a 40 px slider bar on the right (FormSliderBar). `v` is 0..1.
-pub fn slider_row(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str, v: &mut f32) -> bool {
-    slider_row_ex(ui, id, caption_text, value_text, v, 0.01).0
-}
-
 /// The slider with what makes it easy to land on a value: hold Shift while dragging to move ten times slower, Left and Right keys over it
 /// move by one `step` (Shift: ten steps), and a click on the number lets you type it (the text typed is the second result, when it is
 /// confirmed with Enter or by leaving the box). `step` is in the units of `v` (0..1).
+/// The thin slider of the transport bar (volume, position, speed): a track, its filled part and a handle that is whole at both ends.
+/// Returns where the handle is.
+pub fn mini_track(ui: &Ui, area: Rect, f: f32, hot: bool, fill: Color32) -> f32 {
+    let line = Rect::from_center_size(area.center(), Vec2::new(area.width(), 6.0));
+    ui.painter().rect_filled(line, CornerRadius::same(3), BACKGROUND5);
+    let x = area.left() + 5.0 + (area.width() - 10.0) * f.clamp(0.0, 1.0);
+    ui.painter().rect_filled(Rect::from_min_max(line.min, Pos2::new(x, line.bottom())), CornerRadius::same(3), fill);
+    ui.painter().rect_filled(Rect::from_center_size(Pos2::new(x, area.center().y), Vec2::new(10.0, 22.0)), CornerRadius::same(5), if hot { HIGHLIGHT1 } else { LIGHT1 });
+    x
+}
+
 pub fn slider_row_ex(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str, v: &mut f32, step: f32) -> (bool, Option<String>) {
     let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 56.0 + ROW_GAP), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 66.0 + ROW_GAP), Sense::hover());
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     let bg = bg_begin(ui);
-    ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, caption_text, FontId::new(14.0, light()), CONTENT2);
-    // the number: a click turns it into a box to type in
-    let val_rect = Rect::from_min_size(rect.min + Vec2::new(PAD - 4.0, PAD + 14.0), Vec2::new(rect.width() / 2.0 - PAD - 8.0, 26.0));
+    // the caption has the whole width of the row, the number and the bar are on the line under it
+    let cap_font = FontId::new(14.0, light());
+    let cap = fit_text(ui.painter(), caption_text, &cap_font, rect.width() - 2.0 * PAD);
+    ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, cap, cap_font, CONTENT2);
+    let bar_left = rect.left() + (rect.width() * 0.36).max(96.0);
+    // the number: a click turns it into a box to type in. Enter takes what was typed; Escape, or a click anywhere else, drops it.
+    let val_rect = Rect::from_min_size(Pos2::new(rect.left() + PAD - 4.0, rect.top() + 26.0), Vec2::new(bar_left - rect.left() - PAD - 2.0, 30.0));
     let edit_id = rid.with("edit");
     let mut typed = None;
-    let mut buf: Option<String> = ui.memory(|m| m.data.get_temp::<String>(edit_id));
-    if let Some(text) = buf.as_mut() {
+    let mut open: Option<(String, u32)> = ui.memory(|m| m.data.get_temp::<(String, u32)>(edit_id));
+    if let Some((text, age)) = open.as_mut() {
         let r = put_free(ui, val_rect.shrink2(Vec2::new(4.0, 2.0)), egui::TextEdit::singleline(text).id(edit_id).frame(egui::Frame::NONE).desired_width(val_rect.width() - 8.0).font(FontId::new(16.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO));
-        if !r.has_focus() && !r.gained_focus() {
-            r.request_focus();
-        }
+        *age += 1;
         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
         let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        if enter || r.lost_focus() {
-            if !esc {
-                typed = Some(text.clone());
-            }
-            ui.memory_mut(|m| m.data.remove::<String>(edit_id));
-        } else if esc {
-            ui.memory_mut(|m| m.data.remove::<String>(edit_id));
+        // the box got its focus when it was opened: when it no longer has it (a click elsewhere), it is closed
+        let gone = *age > 2 && !r.has_focus();
+        if enter {
+            typed = Some(text.clone());
+            ui.memory_mut(|m| m.data.remove::<(String, u32)>(edit_id));
+            ui.memory_mut(|m| m.surrender_focus(edit_id));
+        } else if esc || gone {
+            ui.memory_mut(|m| m.data.remove::<(String, u32)>(edit_id));
+            ui.memory_mut(|m| m.surrender_focus(edit_id));
         } else {
-            let t = text.clone();
+            let t = (text.clone(), *age);
             ui.memory_mut(|m| m.data.insert_temp(edit_id, t));
         }
     } else {
-        ui.painter().text(rect.min + Vec2::new(PAD, PAD + 17.0), Align2::LEFT_TOP, value_text, FontId::new(16.0, FontFamily::Proportional), CONTENT1);
+        let val_font = FontId::new(16.0, FontFamily::Proportional);
+        let shown = fit_text(ui.painter(), value_text, &val_font, val_rect.width() - 4.0);
+        ui.painter().text(Pos2::new(rect.left() + PAD, val_rect.center().y), Align2::LEFT_CENTER, shown, val_font, CONTENT1);
         let click = ui.interact(val_rect, rid.with("val"), Sense::click()).on_hover_cursor(egui::CursorIcon::Text).on_hover_text("Click to type a value");
         if click.clicked() {
-            let start: String = value_text.split_whitespace().next().unwrap_or("").trim_end_matches(['%', '°']).trim_start_matches('+').to_string();
-            ui.memory_mut(|m| m.data.insert_temp(edit_id, start));
+            let start: String = value_text.split_whitespace().next().unwrap_or("").trim_end_matches(['%', '°', 'x']).trim_start_matches('+').to_string();
+            ui.memory_mut(|m| {
+                m.data.insert_temp(edit_id, (start, 0u32));
+                m.request_focus(edit_id);
+            });
         }
     }
-    let bar = Rect::from_min_size(Pos2::new(rect.center().x, rect.top() + 8.0), Vec2::new(rect.width() / 2.0 - 8.0, 40.0));
+    let bar = Rect::from_min_max(Pos2::new(bar_left, rect.top() + 28.0), Pos2::new(rect.right() - PAD, rect.bottom() - 8.0));
+    // the marker is a slim vertical pill: it stays 3 px clear of the ends of the bar, so it is whole at 0% and at 100%
+    let room = 8.0 + 2.0 * 3.0;
     let resp = ui.interact(bar, rid.with("bar"), Sense::click_and_drag());
-    let nub_w = 10.0;
     let mut changed = false;
     let raw_id = rid.with("raw");
     let shift = ui.input(|i| i.modifiers.shift);
@@ -449,13 +512,13 @@ pub fn slider_row_ex(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str
     }
     if resp.dragged() || resp.clicked() || resp.is_pointer_button_down_on() {
         if let Some(p) = resp.interact_pointer_pos() {
-            let travel = bar.width() - nub_w;
+            let travel = bar.width() - room;
             let mut raw = ui.memory(|m| m.data.get_temp::<f32>(raw_id)).unwrap_or(*v);
             if shift && resp.dragged() {
                 // slow: ten times less than the pointer moves, from where the value is
                 raw = (raw + resp.drag_delta().x / travel * 0.1).clamp(0.0, 1.0);
             } else {
-                raw = ((p.x - bar.left() - nub_w / 2.0) / travel).clamp(0.0, 1.0);
+                raw = ((p.x - bar.left() - room / 2.0) / travel).clamp(0.0, 1.0);
             }
             ui.memory_mut(|m| m.data.insert_temp(raw_id, raw));
             if (raw - *v).abs() > 1e-5 {
@@ -479,14 +542,95 @@ pub fn slider_row_ex(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str
         }
     }
     let hov = ease(ui, rid.with("h"), resp.hovered() || resp.dragged());
-    ui.painter().rect_filled(bar, CornerRadius::same(5), BACKGROUND5);
-    let nx = bar.left() + nub_w / 2.0 + (bar.width() - nub_w) * *v;
-    let fill = Rect::from_min_max(bar.min, Pos2::new(nx, bar.bottom()));
-    ui.painter().rect_filled(fill, CornerRadius { nw: 5, sw: 5, ne: 0, se: 0 }, lerp_c(darken(LIGHT4, 0.4), LIGHT4, hov.max(0.6)));
-    let nub = Rect::from_center_size(Pos2::new(nx, bar.center().y), Vec2::new(nub_w, 34.0));
-    ui.painter().rect_filled(nub, CornerRadius::same(5), lerp_c(darken(HIGHLIGHT1, 0.1), HIGHLIGHT1, hov));
+    let p = ui.painter();
+    // a rounded bar, the purple up to the value, and the slim pill of the marker at the end of it
+    let corner = CornerRadius::same(7);
+    p.rect_filled(bar, corner, lerp_c(BACKGROUND5, Color32::BLACK, 0.15));
+    let kx = bar.left() + room / 2.0 + (bar.width() - room) * *v;
+    // At the ends the fill does not move: what is added or taken away there is a sliver, and it fades. At 0% the sliver of fill behind the
+    // marker fades out; at 100% the sliver in front of it fades in, so the bar is full. (A fill that slid away at 0% took all of the purple
+    // with it, which looked far more drastic than a few more pixels of purple appearing at 100%.) The fill is cut from the shape of the bar.
+    // The marker has a little momentum: flicked all the way to an end it overshoots a few pixels and springs back. (The value itself stays
+    // between 0 and 100%, and the marker cannot be dragged past the ends: only the bounce moves it there.)
+    let spring_id = rid.with("spring");
+    let (mut off, mut vel, prev_v): (f32, f32, f32) = ui.memory(|m| m.data.get_temp(spring_id)).unwrap_or((0.0, 0.0, *v));
+    let dt = ui.input(|i| i.stable_dt).clamp(0.001, 0.05);
+    if resp.dragged() {
+        let at_end = *v >= 1.0 || *v <= 0.0;
+        let was_at_end = prev_v >= 1.0 || prev_v <= 0.0;
+        if at_end && !was_at_end {
+            // arriving at an end with speed: the marker goes on a little in that direction
+            let dir = if *v >= 1.0 { 1.0 } else { -1.0 };
+            let along = ui.input(|i| i.pointer.velocity().x) * dir;
+            // (how far it overshoots follows how fast it arrived: a slow arrival does not move it at all)
+            if along > 150.0 {
+                vel += dir * ((along - 150.0) * 0.10).min(200.0);
+            }
+        }
+    }
+    let (stiff, damp) = (460.0, 19.0);
+    // (it always settles back to the end, also while the button is still held)
+    vel += (-stiff * off - damp * vel) * dt;
+    off = (off + vel * dt).clamp(-6.0, 6.0);
+    if off.abs() < 0.02 && vel.abs() < 0.5 {
+        off = 0.0;
+        vel = 0.0;
+    } else {
+        ui.ctx().request_repaint();
+    }
+    ui.memory_mut(|m| m.data.insert_temp(spring_id, (off, vel, *v)));
+    let kxv = kx + off;
+    let empty = ui.ctx().animate_bool_with_time(rid.with("empty"), *v <= 0.0, 0.10);
+    // the fill gets more opaque the further the value is: 75% at 0%, as before (fully opaque) at 100%
+    let purple = lerp_c(Color32::from_rgb(0x5e, 0x45, 0xc4), Color32::from_rgb(0x74, 0x5a, 0xe4), hov);
+    let opacity = 0.75 + 0.25 * v.clamp(0.0, 1.0);
+    let faded = |a: f32| Color32::from_rgba_unmultiplied(purple.r(), purple.g(), purple.b(), (a.clamp(0.0, 1.0) * opacity * 255.0) as u8);
+    // 100%: the fill reaches past the marker to the end of the bar as the value comes up to it (over the last 6%, so it follows the marker and
+    // nothing snaps), while the marker keeps its place in its track
+    let reach = ((*v - 0.94) / 0.06).clamp(0.0, 1.0);
+    let reach = reach * reach * (3.0 - 2.0 * reach);
+    let fill_to = kxv + (bar.right() - kxv) * reach;
+    if empty < 0.99 {
+        p.with_clip_rect(Rect::from_min_max(bar.min, Pos2::new(fill_to, bar.bottom()))).rect_filled(bar, corner, faded(1.0 - empty));
+    }
+    p.rect_filled(Rect::from_center_size(Pos2::new(kxv, bar.center().y), Vec2::new(8.0, bar.height() - 6.0)), CornerRadius::same(4), lerp_c(Color32::from_rgb(0xea, 0xe5, 0xff), Color32::WHITE, hov));
     bg_end(ui, bg, rect, rid, resp.hovered() || resp.dragged(), false, false);
     (changed, typed)
+
+}
+
+/// A slider over `min..max` that moves in whole `step`s (so every value it shows can be landed on) and can be typed into: a click on the
+/// number opens a box, and `per_unit` is how many of the shown units make 1 of the value (100 for a value shown in percent). Returns true
+/// when the value changed.
+pub fn value_slider(ui: &mut Ui, id: &str, caption: &str, shown: &str, v: &mut f32, min: f32, max: f32, step: f32, per_unit: f32) -> bool {
+    value_slider_ex(ui, id, caption, shown, v, (min, max), (min, max), step, per_unit)
+}
+
+/// `value_slider` whose typed values may go beyond the range of the bar (`hard`): the bar is as short as can be dragged without skipping a step.
+pub fn value_slider_ex(ui: &mut Ui, id: &str, caption: &str, shown: &str, v: &mut f32, (min, max): (f32, f32), hard: (f32, f32), step: f32, per_unit: f32) -> bool {
+    let range = (max - min).max(1e-6);
+    let snap = |x: f32| (((x / step).round() * step * 1e5).round() / 1e5).clamp(min, max);
+    let mut f = ((*v - min) / range).clamp(0.0, 1.0);
+    let (moved, typed) = slider_row_ex(ui, id, caption, shown, &mut f, step / range);
+    let mut changed = false;
+    if moved {
+        let x = snap(min + f * range);
+        if (x - *v).abs() > 1e-6 {
+            *v = x;
+            changed = true;
+        }
+    }
+    if let Some(text) = typed {
+        let n: String = text.trim().chars().take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | ',')).collect();
+        if let Ok(x) = n.replace(',', ".").parse::<f32>() {
+            let x = (((x / per_unit / step).round() * step * 1e5).round() / 1e5).clamp(hard.0, hard.1);
+            if (x - *v).abs() > 1e-6 {
+                *v = x;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 #[derive(Clone, Copy, PartialEq)]

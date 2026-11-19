@@ -7,13 +7,14 @@ use rodio::Source;
 
 /// A decoded recording: interleaved samples with their channel count and rate.
 #[derive(Clone)]
-struct Clip {
+pub struct Clip {
     channels: NonZero<u16>,
     rate: NonZero<u32>,
     data: Vec<f32>,
 }
 
-fn decode_file(path: &Path) -> Option<Clip> {
+/// Decodes a sound file (meant for a thread of its own: it takes a while).
+pub fn decode_file(path: &Path) -> Option<Clip> {
     let file = std::fs::File::open(path).ok()?;
     let dec = rodio::Decoder::try_from(file).ok()?;
     let (channels, rate) = (dec.channels(), dec.sample_rate());
@@ -31,6 +32,19 @@ pub struct Sfx {
 impl Sfx {
     pub fn new() -> Sfx {
         Sfx::default()
+    }
+
+    /// Opens the audio device now instead of at the first sound (that is what made the first click on the logo late).
+    pub fn warm(&mut self) {
+        if self.sink.is_none() && !self.tried {
+            self.tried = true;
+            self.sink = rodio::DeviceSinkBuilder::open_default_sink().ok();
+        }
+    }
+
+    /// Gives a file that was decoded elsewhere, so that playing it does not have to.
+    pub fn insert(&mut self, path: &Path, clip: Option<Clip>) {
+        self.cache.insert(path.to_path_buf(), clip);
     }
 
     /// Play the sound in `path` at `volume` (0 to 1). False when there is no audio output or the file cannot be played.

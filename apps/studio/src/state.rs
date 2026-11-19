@@ -9,8 +9,8 @@ use engine::presets;
 pub const PROPS: [(&str, &str); 7] = [
     ("x", "Position (0-1)"),
     ("y", "Y offset (px)"),
-    ("sx", "Scale X (length)"),
-    ("sy", "Scale Y (thickness)"),
+    ("sx", "Scale X (width)"),
+    ("sy", "Scale Y (height)"),
     ("rot", "Rotation (deg)"),
     ("alpha", "Opacity"),
     ("blur", "Blur (px)"),

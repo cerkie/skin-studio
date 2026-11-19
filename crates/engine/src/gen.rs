@@ -445,18 +445,20 @@ mod tau_tests {
     fn the_default_animation_shows_the_blur_key_where_the_graph_says() {
         let s = Settings::from_json(&crate::presets::default_settings());
         let frames = build_frames(&s, 1, &Default::default());
-        // the window is shifted by -100 ms: the first frame shows time 0 (clamped) and the last real frame ends 100 ms early
-        assert_eq!(frame_tau(&s, 0), Some(0.0));
-        let n = round_f(s.real_length() * s.fps / 1000.0) as usize;
-        assert_eq!(frame_tau(&s, n - 1), Some(s.design_length() + s.shift));
-        assert_eq!(frame_tau(&s, n), None);
-        // time grows with the frames, and the padding after the animation is blank
-        let taus: Vec<f32> = (0..n).map(|i| frame_tau(&s, i).unwrap()).collect();
+        // frames that show a moment of the animation, and the padding blank after them
+        let real: Vec<usize> = (0..frames.len()).filter(|i| frame_tau(&s, *i).is_some()).collect();
+        assert!(!real.is_empty());
+        let (first, last) = (real[0], *real.last().unwrap());
+        assert_eq!(real.len(), last - first + 1, "the frames of the animation are in one run");
+        assert!(frames[last + 1..].iter().all(|f| f.is_none()));
+        // time grows with the frames
+        let taus: Vec<f32> = real.iter().map(|i| frame_tau(&s, *i).unwrap()).collect();
         assert!(taus.windows(2).all(|w| w[1] >= w[0]));
-        assert!(frames[n..].iter().all(|f| f.is_none()));
-        // the blur key sits at 250 ms: the frame that shows 250 ms is not at 250 ms of the loop but later, because of the shift
-        let at250 = taus.iter().position(|t| *t >= 250.0).unwrap();
-        let loop_ms = at250 as f32 * 1000.0 / s.fps;
-        assert!(loop_ms > 300.0 && loop_ms < 450.0, "{loop_ms}");
+        // the blur key sits at 250 ms of the animation: the frame that shows it is where the graph says, counted from the start of the
+        // animation, moved by the window shift (the default has none)
+        let at250 = real[taus.iter().position(|t| *t >= 250.0).unwrap()];
+        let loop_ms = (at250 - first) as f32 * 1000.0 / s.fps;
+        let expect = 250.0 - s.shift.min(0.0);
+        assert!((loop_ms - expect).abs() < 40.0, "{loop_ms} vs {expect}");
     }
 }

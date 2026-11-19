@@ -2,6 +2,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+#[cfg(test)]
+mod audit;
 mod motion;
 mod skin_editor;
 mod paths;

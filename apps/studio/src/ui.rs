@@ -64,11 +64,7 @@ fn mini_slider(ui: &mut Ui, id: &str, area: Rect, f: &mut f32, tip: impl Fn(f32)
             changed = true;
         }
     }
-    let line = Rect::from_center_size(area.center(), Vec2::new(area.width(), 6.0));
-    ui.painter().rect_filled(line, CornerRadius::same(3), BACKGROUND5);
-    let x = area.left() + 5.0 + (area.width() - 10.0) * *f;
-    ui.painter().rect_filled(Rect::from_min_max(line.min, Pos2::new(x, line.bottom())), CornerRadius::same(3), LIGHT4);
-    ui.painter().rect_filled(Rect::from_center_size(Pos2::new(x, area.center().y), Vec2::new(8.0, 20.0)), CornerRadius::same(4), if resp.hovered() || resp.dragged() { HIGHLIGHT1 } else { LIGHT3 });
+    let x = th::mini_track(ui, area, *f, resp.hovered() || resp.dragged(), LIGHT4);
     if resp.dragged() {
         bubble(ui, Pos2::new(x, area.top() - 2.0), &tip(*f));
     }
@@ -105,6 +101,7 @@ fn fmt_time(ms: f32) -> String {
 }
 
 pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
+    st.warm_logo_sound();
     // ---- toolbar
     egui::Panel::top("toolbar").exact_size(56.0).frame(egui::Frame::new().fill(BACKGROUND6).inner_margin(egui::Margin::ZERO)).show(root, |ui| {
         let bar = ui.max_rect();
@@ -117,7 +114,7 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
             mode_switch(ui, st);
             ui.add_space(14.0);
             if st.mode == Mode::Skin {
-                crate::skin_editor::toolbar(ui, st);
+                crate::skin_editor::toolbar(ui, st, bar.right() - 16.0);
             } else {
                 if th::button(ui, "New", Kind::Ghost, true).clicked() {
                     st.new_settings();
@@ -138,18 +135,22 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
                     st.export();
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(16.0);
-                let msg = if st.mode == Mode::Skin {
-                    crate::skin_editor::title(st)
-                } else if let Some(p) = &st.path {
-                    p.to_string_lossy().to_string()
-                } else {
-                    "Unsaved settings".to_string()
-                };
-                let msg = if msg.chars().count() > 90 { format!("…{}", msg.chars().skip(msg.chars().count() - 88).collect::<String>()) } else { msg };
-                ui.label(th::text(msg, 13.0, LIGHT3).family(th::light()));
-            });
+            // the path (or what is being edited) in what is left of the bar, cut at its start so that its end is the part that shows, and
+            // left out when there is no room for it
+            let msg = if st.mode == Mode::Skin {
+                crate::skin_editor::title(st)
+            } else if let Some(p) = &st.path {
+                p.to_string_lossy().to_string()
+            } else {
+                "Unsaved settings".to_string()
+            };
+            let left = ui.cursor().left() + 16.0;
+            let room = bar.right() - 16.0 - left;
+            if room > 80.0 {
+                let font = FontId::new(13.0, th::light());
+                let shown = th::fit_text_start(ui.painter(), &msg, &font, room);
+                ui.painter().text(Pos2::new(bar.right() - 16.0, bar.center().y), Align2::RIGHT_CENTER, shown, font, LIGHT3);
+            }
         });
     });
 
@@ -251,13 +252,20 @@ fn mode_switch(ui: &mut Ui, st: &mut Studio) {
         let (r, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 36.0, 34.0), Sense::click());
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
         let on = st.mode == m;
-        if on {
-            ui.painter().rect_filled(r, CornerRadius::same(8), Color32::from_rgba_unmultiplied(HIGHLIGHT1.r(), HIGHLIGHT1.g(), HIGHLIGHT1.b(), 60));
-            ui.painter().rect_filled(Rect::from_min_size(Pos2::new(r.left() + 12.0, r.bottom() - 3.0), Vec2::new(r.width() - 24.0, 3.0)), CornerRadius::same(2), HIGHLIGHT1);
-        } else if resp.hovered() {
-            ui.painter().rect_filled(r, CornerRadius::same(8), DARK2);
+        // the same animation as the entries of the sidebar: the pill fades in with the pointer and more with the selection, the text changes
+        // colour with it, and the bar under the selected tab grows out from the middle
+        let hov = th::ease(ui, resp.id.with("hov"), resp.hovered());
+        let sel = th::ease(ui, resp.id.with("sel"), on);
+        let col = if on { CONTENT1 } else { th::lerp_c(LIGHT3, LIGHT1, hov) };
+        let fill_a = (hov * 22.0).max(sel * 44.0) as u8;
+        if fill_a > 0 {
+            ui.painter().rect_filled(r, CornerRadius::same(8), Color32::from_rgba_unmultiplied(HIGHLIGHT1.r(), HIGHLIGHT1.g(), HIGHLIGHT1.b(), fill_a));
         }
-        ui.painter().galley(r.center() - galley.size() * 0.5, galley, if on { CONTENT1 } else { LIGHT1 });
+        let bar_w = (r.width() - 24.0) * sel;
+        if bar_w > 0.5 {
+            ui.painter().rect_filled(Rect::from_center_size(Pos2::new(r.center().x, r.bottom() - 2.0), Vec2::new(bar_w, 3.0)), CornerRadius::same(2), Color32::from_rgba_unmultiplied(HIGHLIGHT1.r(), HIGHLIGHT1.g(), HIGHLIGHT1.b(), (sel * 255.0) as u8));
+        }
+        ui.painter().galley(r.center() - galley.size() * 0.5, galley, col);
         if resp.clicked() {
             st.mode = m;
         }
@@ -344,7 +352,9 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
     if !sv.loaded {
         return;
     }
-    let btn = Rect::from_center_size(Pos2::new(r.left() + 36.0, r.center().y), Vec2::new(44.0, 34.0));
+    // play, a new map and the speed: the same size, the same gap
+    let (bw, bh, bgap) = (44.0, 36.0, 8.0);
+    let btn = Rect::from_min_size(Pos2::new(r.left() + 14.0, r.center().y - bh / 2.0), Vec2::new(bw, bh));
     let bresp = ui.interact(btn, ui.scope_id().with("play"), Sense::click());
     ui.painter().rect_filled(btn, CornerRadius::same(5), if bresp.hovered() { th::lighten(COLOR3, 0.2) } else { COLOR3 });
     if sv.playing {
@@ -359,7 +369,7 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
         out.toggle_play = true;
     }
     // a new random map, next to play (the die)
-    let nm = Rect::from_center_size(Pos2::new(btn.right() + 24.0, r.center().y), Vec2::new(36.0, 34.0));
+    let nm = Rect::from_min_size(Pos2::new(btn.right() + bgap, btn.top()), Vec2::new(bw, bh));
     let nresp = ui.interact(nm, ui.scope_id().with("newmap"), Sense::click());
     ui.painter().rect_filled(nm, CornerRadius::same(5), if nresp.hovered() { DARK3 } else { DARK2 });
     {
@@ -375,7 +385,7 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
         st.new_map();
     }
     // playback speed: a chip that opens a slider
-    let sp = Rect::from_center_size(Pos2::new(nm.right() + 34.0, r.center().y), Vec2::new(52.0, 34.0));
+    let sp = Rect::from_min_size(Pos2::new(nm.right() + bgap, btn.top()), Vec2::new(bw, bh));
     let spresp = ui.interact(sp, ui.scope_id().with("speed"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Playback speed");
     ui.painter().rect_filled(sp, CornerRadius::same(5), if spresp.hovered() { DARK3 } else { DARK2 });
     ui.painter().text(sp.center(), Align2::CENTER_CENTER, format!("{}x", fmt_speed(st.cfg.speed)), FontId::new(14.0, FontFamily::Proportional), if (st.cfg.speed - 1.0).abs() < 0.001 { CONTENT2 } else { HIGHLIGHT1 });
@@ -402,8 +412,16 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
         ui.add_space(4.0);
     });
     // right side, from the edge inwards: time, volume slider, mute button
+    // (what does not fit in a narrow window is left out: first the volume and the position bar, then the time)
+    let right_room = r.right() - sp.right() - 30.0;
+    if right_room < 100.0 {
+        return;
+    }
     let time = format!("{} / {}", fmt_time(sv.clock - sv.start), fmt_time(sv.end - sv.start));
     ui.painter().text(Pos2::new(r.right() - 14.0, r.center().y), Align2::RIGHT_CENTER, time, FontId::new(14.0, FontFamily::Proportional), CONTENT2);
+    if right_room < 300.0 {
+        return;
+    }
     let vol = Rect::from_min_max(Pos2::new(r.right() - 14.0 - 96.0 - 96.0, r.center().y - 12.0), Pos2::new(r.right() - 14.0 - 96.0 - 8.0, r.center().y + 12.0));
     let mute = Rect::from_center_size(Pos2::new(vol.left() - 22.0, r.center().y), Vec2::new(32.0, 32.0));
     let mresp = ui.interact(mute, ui.scope_id().with("mute"), Sense::click());
@@ -440,22 +458,18 @@ fn transport(ui: &mut Ui, r: Rect, st: &mut Studio, sv: &SessionView, out: &mut 
         }
     }
     let shown = if st.cfg.muted { 0.0 } else { st.cfg.volume };
-    let line = Rect::from_center_size(vol.center(), Vec2::new(vol.width(), 6.0));
-    ui.painter().rect_filled(line, CornerRadius::same(3), BACKGROUND5);
-    let vx = vol.left() + 5.0 + (vol.width() - 10.0) * shown;
-    ui.painter().rect_filled(Rect::from_min_max(line.min, Pos2::new(vx, line.bottom())), CornerRadius::same(3), LIGHT4);
-    ui.painter().rect_filled(Rect::from_center_size(Pos2::new(vx, vol.center().y), Vec2::new(8.0, 20.0)), CornerRadius::same(4), if vresp.hovered() || vresp.dragged() { HIGHLIGHT1 } else { LIGHT3 });
+    let vx = th::mini_track(ui, vol, shown, vresp.hovered() || vresp.dragged(), LIGHT4);
     if vresp.dragged() {
         bubble(ui, Pos2::new(vx, vol.top() - 6.0), &format!("{:.0}%", shown * 100.0));
     }
-    let bar = Rect::from_min_max(Pos2::new(nm.right() + 80.0, r.center().y - 14.0), Pos2::new(mute.left() - 22.0, r.center().y + 14.0));
+    let bar = Rect::from_min_max(Pos2::new(sp.right() + 22.0, r.center().y - 14.0), Pos2::new(mute.left() - 22.0, r.center().y + 14.0));
+    // (in a very narrow window there is no room for a position bar between the buttons and the volume)
+    if bar.width() < 80.0 {
+        return;
+    }
     let resp = ui.interact(bar, ui.scope_id().with("seek"), Sense::click_and_drag());
     let f = if sv.end > sv.start { ((sv.clock - sv.start) / (sv.end - sv.start)).clamp(0.0, 1.0) } else { 0.0 };
-    let line = Rect::from_center_size(bar.center(), Vec2::new(bar.width(), 6.0));
-    ui.painter().rect_filled(line, CornerRadius::same(3), BACKGROUND5);
-    let nx = bar.left() + 5.0 + (bar.width() - 10.0) * f;
-    ui.painter().rect_filled(Rect::from_min_max(line.min, Pos2::new(nx, line.bottom())), CornerRadius::same(3), th::lerp_c(LIGHT4, HIGHLIGHT1, 0.6));
-    ui.painter().rect_filled(Rect::from_center_size(Pos2::new(nx, bar.center().y), Vec2::new(10.0, 24.0)), CornerRadius::same(5), HIGHLIGHT1);
+    th::mini_track(ui, bar, f, resp.hovered() || resp.dragged(), th::lerp_c(LIGHT4, HIGHLIGHT1, 0.6));
     if resp.dragged() || resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             out.seek = Some(((p.x - bar.left() - 5.0) / (bar.width() - 10.0)).clamp(0.0, 1.0));
@@ -588,11 +602,7 @@ pub(crate) fn anim_card(ctx: &egui::Context, ui: &mut Ui, st: &mut Studio, origi
             st.anim_pos = f * loop_ms;
         }
     }
-    let line = Rect::from_center_size(bar.center(), Vec2::new(bar.width(), 5.0));
-    ui.painter().rect_filled(line, CornerRadius::same(3), BACKGROUND5);
-    let fx = bar.left() + 5.0 + (bar.width() - 10.0) * (st.anim_pos / loop_ms);
-    ui.painter().rect_filled(Rect::from_min_max(line.min, Pos2::new(fx, line.bottom())), CornerRadius::same(3), th::lerp_c(LIGHT4, HIGHLIGHT1, 0.6));
-    ui.painter().rect_filled(Rect::from_center_size(Pos2::new(fx, bar.center().y), Vec2::new(8.0, 18.0)), CornerRadius::same(4), if sresp.hovered() || sresp.dragged() { HIGHLIGHT1 } else { LIGHT3 });
+    th::mini_track(ui, bar, st.anim_pos / loop_ms, sresp.hovered() || sresp.dragged(), th::lerp_c(LIGHT4, HIGHLIGHT1, 0.6));
     // play / pause (a round button), the frame count, and the speed
     let ctrl = Rect::from_min_size(Pos2::new(card.left() + 12.0, card.bottom() - 48.0), Vec2::new(w - 24.0, 38.0));
     let play = Rect::from_min_size(ctrl.min, Vec2::new(38.0, 38.0));
@@ -666,7 +676,7 @@ fn num(ui: &mut Ui, st: &mut Studio, id: &str, label: &str) {
 }
 
 /// A color swatch that opens a color picker; returns the new color when it changes.
-fn swatch_picker(ui: &mut Ui, id: &str, rect: Rect, rgb: [u8; 3]) -> Option<[u8; 3]> {
+pub(crate) fn swatch_picker(ui: &mut Ui, id: &str, rect: Rect, rgb: [u8; 3]) -> Option<[u8; 3]> {
     let resp = ui.interact(rect, ui.scope_id().with(("swatch", id)), Sense::click());
     ui.painter().rect_filled(rect, CornerRadius::same(4), Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
     ui.painter().rect_stroke(rect, CornerRadius::same(4), Stroke::new(if resp.hovered() { 2.0 } else { 1.0 }, if resp.hovered() { LIGHT4 } else { DARK3 }), egui::StrokeKind::Inside);
@@ -703,7 +713,7 @@ const SEARCHABLE: &[(Tab, &str)] = &[
     (Tab::Animation, "Seamless line"), (Tab::Animation, "Circle size CS"), (Tab::Animation, "Approach rate AR"), (Tab::Animation, "Soften"), (Tab::Animation, "Tightness"), (Tab::Animation, "Thickness"), (Tab::Animation, "Tile overlap"),
     (Tab::Timing, "Frame rate fps"), (Tab::Timing, "Speed"), (Tab::Timing, "Time shift"), (Tab::Timing, "Fit the speed to the window"), (Tab::Timing, "Appear after"), (Tab::Timing, "Disappear at"), (Tab::Timing, "Blank at the end"),
     (Tab::Timing, "Fade in"), (Tab::Timing, "Fade out"), (Tab::Timing, "Copies in a row"), (Tab::Timing, "Play forward and back"), (Tab::Timing, "Play once"),
-    (Tab::Look, "Color keys tint"), (Tab::Look, "Add a color"), (Tab::Look, "Outline"), (Tab::Look, "Outline color"), (Tab::Look, "Drop shadow"), (Tab::Look, "Shadow blur"), (Tab::Look, "Debanding"), (Tab::Look, "Grain dither"),
+    (Tab::Timing, "Color keys tint"), (Tab::Timing, "Add a color"), (Tab::Look, "Outline"), (Tab::Look, "Outline color"), (Tab::Look, "Drop shadow"), (Tab::Look, "Shadow blur"), (Tab::Look, "Debanding"), (Tab::Look, "Grain dither"),
     (Tab::Preview, "Skin"), (Tab::Preview, "Hit sounds"), (Tab::Preview, "Map"), (Tab::Preview, "Random maps lazer stable library"), (Tab::Preview, "Snaking sliders in out"), (Tab::Preview, "Hit lighting"), (Tab::Preview, "Sound"), (Tab::Preview, "Volume"), (Tab::Preview, "Music offset"), (Tab::Preview, "Playback speed"), (Tab::Preview, "Cursor size"),
     (Tab::Export, "Export sizes 1x 2x"), (Tab::Export, "Export images"), (Tab::Export, "History saved versions"), (Tab::Export, "Import followpoint images"),
 ];
@@ -798,6 +808,9 @@ fn tab_timing(ui: &mut Ui, st: &mut Studio) {
     num(ui, st, "copies", "Copies in a row");
     toggle(ui, st, "pingpong", "Play forward and back");
     toggle(ui, st, "no_loop", "Play once (pad to a point's life)");
+    // the tint changes over time like the rest of the motion (and has a lane in the motion editor)
+    th::subsection_header(ui, "Colour");
+    tab_color(ui, st);
 }
 
 /// The animation's total length in ms. It is the designed length divided by the speed multiplier, so typing a length sets the
@@ -822,8 +835,6 @@ fn duration_row(ui: &mut Ui, st: &mut Studio) {
 }
 
 fn tab_look(ui: &mut Ui, st: &mut Studio) {
-    th::subsection_header(ui, "Color");
-    tab_color(ui, st);
     tab_finish(ui, st);
 }
 
@@ -932,14 +943,14 @@ fn tab_finish(ui: &mut Ui, st: &mut Studio) {
 fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
     th::subsection_header(ui, "Interface");
     {
-        // a slider from 50% to 200% in steps of 5%; the size changes when it is let go (the slider is part of the interface, so it
+        // a slider from 50% to 200% in steps of 1%; the size changes when it is let go (the slider is part of the interface, so it
         // would move under the pointer while it is dragged)
         let shown = st.ui_pending.unwrap_or(st.ui_now);
-        let mut v = ((shown - 0.5) / 1.5).clamp(0.0, 1.0);
+        let mut v = shown.clamp(0.5, 2.0);
         let auto = st.cfg.ui_scale < 0.5 && st.ui_pending.is_none();
-        let text = if auto { format!("Automatic ({}%)", (shown * 100.0).round() as i32) } else { format!("{}%", (shown * 100.0).round() as i32) };
-        if th::slider_row(ui, "ui_scale", "Interface size", &text, &mut v) {
-            st.ui_pending = Some(((0.5 + v * 1.5) * 20.0).round() / 20.0);
+        let text = if auto { format!("Auto ({}%)", (shown * 100.0).round() as i32) } else { format!("{}%", (shown * 100.0).round() as i32) };
+        if th::value_slider(ui, "ui_scale", "Interface size", &text, &mut v, 0.5, 2.0, 0.01, 100.0) {
+            st.ui_pending = Some(v);
         }
         if st.ui_pending.is_some() && !ui.input(|i| i.pointer.any_down()) {
             if let Some(x) = st.ui_pending.take() {
@@ -966,12 +977,18 @@ fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
         st.cfg.save();
         st.load_session = true;
     }
-    if th::button_wide(ui, "Browse for a skin...", Kind::Purple, true).clicked() {
+    if th::button_wide(ui, "Browse for a skin (.osk)...", Kind::Purple, true).clicked() {
         st.pick(PickKind::Skin);
     }
+    if th::button_wide(ui, "Browse for a skin folder...", Kind::Dark, true).clicked() {
+        st.pick(PickKind::SkinFolder);
+    }
     th::note(ui, &format!("Hit sounds come from: {}", if st.cfg.sound_skin.is_empty() { "the skin itself (Argon Pro has none of its own)".to_string() } else { crate::studio::label(&st.cfg.sound_skin) }));
-    if th::button_wide(ui, "Choose a skin for hit sounds...", Kind::Dark, true).clicked() {
+    if th::button_wide(ui, "Choose a skin for hit sounds (.osk)...", Kind::Dark, true).clicked() {
         st.pick(PickKind::SoundSkin);
+    }
+    if th::button_wide(ui, "Choose a skin folder for hit sounds...", Kind::Dark, true).clicked() {
+        st.pick(PickKind::SoundSkinFolder);
     }
     th::subsection_header(ui, "Map");
     let libs = ["Automatic (lazer if found)".to_string(), "osu!lazer".to_string(), "osu!stable (Songs folder)".to_string()];
@@ -1016,52 +1033,28 @@ fn tab_preview(ui: &mut Ui, st: &mut Studio, out: &mut UiOut) {
         out.volume = Some(st.effective_volume());
     }
     let mut v = st.cfg.volume;
-    if th::slider_row(ui, "volume", "Volume", &format!("{:.0}%", st.cfg.volume * 100.0), &mut v) {
+    if th::value_slider(ui, "volume", "Volume", &format!("{:.0}%", st.cfg.volume * 100.0), &mut v, 0.0, 1.0, 0.01, 100.0) {
         st.cfg.volume = v;
         st.cfg.muted = v <= 0.0;
         st.cfg.save();
         out.volume = Some(st.effective_volume());
     }
-    // the music offset: exact value in a box, plus 1 ms and 10 ms nudges (the slider alone is too coarse)
-    let cur = format!("{}", (st.cfg.offset_ms * 10.0).round() / 10.0);
-    let buf = st.bufs.entry("offset_ms".to_string()).or_insert_with(|| cur.clone());
-    let resp = th::text_row(ui, "offset_ms", "Music offset in ms (positive plays the song later)", buf);
-    let text = buf.clone();
-    if resp.changed() {
-        if let Ok(x) = text.trim().parse::<f32>() {
-            st.cfg.offset_ms = x.clamp(-1000.0, 1000.0);
-            st.cfg.save();
-            out.offset = Some(st.cfg.offset_ms);
-        }
-    } else if !resp.has_focus() && text != cur {
-        st.bufs.insert("offset_ms".to_string(), cur);
+    // the music offset, in whole milliseconds: Shift while dragging is ten times slower, the arrow keys over it move 1 ms, a click on the number types one
+    let mut off = st.cfg.offset_ms.round();
+    if th::value_slider_ex(ui, "offset_ms", "Music offset (+ plays the song later)", &format!("{:+.0} ms", off), &mut off, (-75.0, 75.0), (-1000.0, 1000.0), 1.0, 1.0) {
+        st.cfg.offset_ms = off;
+        st.cfg.save();
+        out.offset = Some(off);
     }
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        for (label, d) in [("-10", -10.0f32), ("-1", -1.0), ("+1", 1.0), ("+10", 10.0)] {
-            if th::button(ui, label, Kind::Dark, true).clicked() {
-                st.cfg.offset_ms = (st.cfg.offset_ms + d).clamp(-1000.0, 1000.0);
-                st.cfg.save();
-                st.bufs.remove("offset_ms");
-                out.offset = Some(st.cfg.offset_ms);
-            }
-        }
-        if th::button(ui, "Reset", Kind::Dark, true).clicked() {
-            st.cfg.offset_ms = 0.0;
-            st.cfg.save();
-            st.bufs.remove("offset_ms");
-            out.offset = Some(0.0);
-        }
-    });
-    let mut sp = (st.cfg.speed - 0.1) / 1.9;
-    if th::slider_row(ui, "speedrow", "Playback speed", &format!("{}x", fmt_speed(st.cfg.speed)), &mut sp) {
-        st.cfg.speed = (((0.1 + sp * 1.9) * 20.0).round() / 20.0).clamp(0.1, 2.0);
+    let mut sp = st.cfg.speed;
+    if th::value_slider_ex(ui, "speedrow", "Playback speed", &format!("{}x", fmt_speed(st.cfg.speed)), &mut sp, (0.25, 2.0), (0.1, 2.0), 0.01, 1.0) {
+        st.cfg.speed = sp.clamp(0.1, 2.0);
         st.cfg.save();
         out.speed = Some(st.cfg.speed);
     }
-    let mut c = (st.cfg.cursor_scale - 0.3) / 2.7;
-    if th::slider_row(ui, "cursor", "Cursor size", &format!("{:.0}%", st.cfg.cursor_scale * 100.0), &mut c) {
-        st.cfg.cursor_scale = ((c * 2.7 + 0.3) * 20.0).round() / 20.0;
+    let mut c = st.cfg.cursor_scale;
+    if th::value_slider_ex(ui, "cursor", "Cursor size", &format!("{:.0}%", st.cfg.cursor_scale * 100.0), &mut c, (0.5, 2.0), (0.3, 3.0), 0.01, 100.0) {
+        st.cfg.cursor_scale = c;
         st.cfg.save();
         out.cursor = Some(st.cfg.cursor_scale);
     }
@@ -1091,8 +1084,15 @@ fn tab_history(ui: &mut Ui, st: &mut Studio) {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 56.0 + th::ROW_GAP), Sense::hover());
         let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - th::ROW_GAP));
         ui.painter().rect_filled(rect, CornerRadius::same(5), CONTROL);
-        let name = if h.name.chars().count() > 30 { format!("{}…", h.name.chars().take(29).collect::<String>()) } else { h.name.clone() };
-        ui.painter().text(rect.min + Vec2::new(9.0, 9.0), Align2::LEFT_TOP, name, FontId::new(15.0, th::semibold()), CONTENT1);
+        // the name stops where the buttons begin (the whole of it is in the tip)
+        let name_font = FontId::new(15.0, th::semibold());
+        let name = th::fit_text(ui.painter(), &h.name, &name_font, rect.right() - 92.0 - 32.0 - rect.left() - 18.0);
+        let cut = name != h.name;
+        ui.painter().text(rect.min + Vec2::new(9.0, 9.0), Align2::LEFT_TOP, name, name_font, CONTENT1);
+        if cut {
+            let tip = Rect::from_min_max(rect.min, Pos2::new(rect.right() - 92.0 - 32.0, rect.min.y + 30.0));
+            ui.interact(tip, ui.scope_id().with(("histname", &h.name, &h.when)), Sense::hover()).on_hover_text(&h.name);
+        }
         ui.painter().text(rect.min + Vec2::new(9.0, 31.0), Align2::LEFT_TOP, &h.when, FontId::new(13.0, th::light()), CONTENT2);
         let load = Rect::from_center_size(Pos2::new(rect.right() - 92.0, rect.center().y), Vec2::new(64.0, 30.0));
         let del = Rect::from_center_size(Pos2::new(rect.right() - 30.0, rect.center().y), Vec2::new(54.0, 30.0));
