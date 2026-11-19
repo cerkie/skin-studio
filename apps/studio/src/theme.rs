@@ -394,24 +394,88 @@ pub fn switch_row(ui: &mut Ui, id: &str, label: &str, on: &mut bool) -> bool {
 
 /// Caption and value on the left, a 40 px slider bar on the right (FormSliderBar). `v` is 0..1.
 pub fn slider_row(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str, v: &mut f32) -> bool {
+    slider_row_ex(ui, id, caption_text, value_text, v, 0.01).0
+}
+
+/// The slider with what makes it easy to land on a value: hold Shift while dragging to move ten times slower, Left and Right keys over it
+/// move by one `step` (Shift: ten steps), and a click on the number lets you type it (the text typed is the second result, when it is
+/// confirmed with Enter or by leaving the box). `step` is in the units of `v` (0..1).
+pub fn slider_row_ex(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str, v: &mut f32, step: f32) -> (bool, Option<String>) {
     let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 56.0 + ROW_GAP), Sense::hover());
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     let bg = bg_begin(ui);
     ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, caption_text, FontId::new(14.0, light()), CONTENT2);
-    ui.painter().text(rect.min + Vec2::new(PAD, PAD + 17.0), Align2::LEFT_TOP, value_text, FontId::new(16.0, FontFamily::Proportional), CONTENT1);
+    // the number: a click turns it into a box to type in
+    let val_rect = Rect::from_min_size(rect.min + Vec2::new(PAD - 4.0, PAD + 14.0), Vec2::new(rect.width() / 2.0 - PAD - 8.0, 26.0));
+    let edit_id = rid.with("edit");
+    let mut typed = None;
+    let mut buf: Option<String> = ui.memory(|m| m.data.get_temp::<String>(edit_id));
+    if let Some(text) = buf.as_mut() {
+        let r = put_free(ui, val_rect.shrink2(Vec2::new(4.0, 2.0)), egui::TextEdit::singleline(text).id(edit_id).frame(egui::Frame::NONE).desired_width(val_rect.width() - 8.0).font(FontId::new(16.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO));
+        if !r.has_focus() && !r.gained_focus() {
+            r.request_focus();
+        }
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if enter || r.lost_focus() {
+            if !esc {
+                typed = Some(text.clone());
+            }
+            ui.memory_mut(|m| m.data.remove::<String>(edit_id));
+        } else if esc {
+            ui.memory_mut(|m| m.data.remove::<String>(edit_id));
+        } else {
+            let t = text.clone();
+            ui.memory_mut(|m| m.data.insert_temp(edit_id, t));
+        }
+    } else {
+        ui.painter().text(rect.min + Vec2::new(PAD, PAD + 17.0), Align2::LEFT_TOP, value_text, FontId::new(16.0, FontFamily::Proportional), CONTENT1);
+        let click = ui.interact(val_rect, rid.with("val"), Sense::click()).on_hover_cursor(egui::CursorIcon::Text).on_hover_text("Click to type a value");
+        if click.clicked() {
+            let start: String = value_text.split_whitespace().next().unwrap_or("").trim_end_matches(['%', '°']).trim_start_matches('+').to_string();
+            ui.memory_mut(|m| m.data.insert_temp(edit_id, start));
+        }
+    }
     let bar = Rect::from_min_size(Pos2::new(rect.center().x, rect.top() + 8.0), Vec2::new(rect.width() / 2.0 - 8.0, 40.0));
     let resp = ui.interact(bar, rid.with("bar"), Sense::click_and_drag());
     let nub_w = 10.0;
     let mut changed = false;
+    let raw_id = rid.with("raw");
+    let shift = ui.input(|i| i.modifiers.shift);
+    if resp.drag_started() || (resp.is_pointer_button_down_on() && !ui.memory(|m| m.data.get_temp::<f32>(raw_id).is_some())) {
+        ui.memory_mut(|m| m.data.insert_temp(raw_id, *v));
+    }
     if resp.dragged() || resp.clicked() || resp.is_pointer_button_down_on() {
         if let Some(p) = resp.interact_pointer_pos() {
-            let nv = ((p.x - bar.left() - nub_w / 2.0) / (bar.width() - nub_w)).clamp(0.0, 1.0);
-            if (nv - *v).abs() > 1e-4 {
-                *v = nv;
+            let travel = bar.width() - nub_w;
+            let mut raw = ui.memory(|m| m.data.get_temp::<f32>(raw_id)).unwrap_or(*v);
+            if shift && resp.dragged() {
+                // slow: ten times less than the pointer moves, from where the value is
+                raw = (raw + resp.drag_delta().x / travel * 0.1).clamp(0.0, 1.0);
+            } else {
+                raw = ((p.x - bar.left() - nub_w / 2.0) / travel).clamp(0.0, 1.0);
+            }
+            ui.memory_mut(|m| m.data.insert_temp(raw_id, raw));
+            if (raw - *v).abs() > 1e-5 {
+                *v = raw;
                 changed = true;
             }
+        }
+    } else {
+        ui.memory_mut(|m| m.data.remove::<f32>(raw_id));
+    }
+    // the arrow keys, over the slider
+    if resp.hovered() && !ui.memory(|m| m.focused().is_some()) {
+        let (l, r, fast) = ui.input_mut(|i| {
+            let fast = i.modifiers.shift;
+            (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft), i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight), fast)
+        });
+        let d = step.max(1e-4) * if fast { 10.0 } else { 1.0 };
+        if l || r {
+            *v = (*v + if r { d } else { -d }).clamp(0.0, 1.0);
+            changed = true;
         }
     }
     let hov = ease(ui, rid.with("h"), resp.hovered() || resp.dragged());
@@ -422,7 +486,7 @@ pub fn slider_row(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str, v
     let nub = Rect::from_center_size(Pos2::new(nx, bar.center().y), Vec2::new(nub_w, 34.0));
     ui.painter().rect_filled(nub, CornerRadius::same(5), lerp_c(darken(HIGHLIGHT1, 0.1), HIGHLIGHT1, hov));
     bg_end(ui, bg, rect, rid, resp.hovered() || resp.dragged(), false, false);
-    changed
+    (changed, typed)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -446,6 +510,26 @@ pub fn button_wide(ui: &mut Ui, label: &str, kind: Kind, enabled: bool) -> Respo
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     paint_button(ui, rect, &resp, label, kind, enabled);
     resp
+}
+
+/// Buttons of equal width in rows of `cols`, filling the width of the panel as `button_wide` does; returns the one that was clicked.
+pub fn button_grid(ui: &mut Ui, labels: &[&str], cols: usize, kind: Kind) -> Option<usize> {
+    let (gap, h) = (8.0, 34.0);
+    let total = ui.available_width() - 22.0;
+    let w = (total - gap * (cols as f32 - 1.0)) / cols as f32;
+    let mut clicked = None;
+    for (row, chunk) in labels.chunks(cols).enumerate() {
+        let (area, _) = ui.allocate_exact_size(Vec2::new(total + 22.0, h + gap), Sense::hover());
+        for (i, label) in chunk.iter().enumerate() {
+            let rect = Rect::from_min_size(area.min + Vec2::new(12.0 + i as f32 * (w + gap), 0.0), Vec2::new(w, h));
+            let resp = ui.interact(rect, ui.make_persistent_id(("grid_button", row, i)), Sense::click());
+            paint_button(ui, rect, &resp, label, kind, true);
+            if resp.clicked() {
+                clicked = Some(row * cols + i);
+            }
+        }
+    }
+    clicked
 }
 
 /// A button sized to its text.

@@ -381,7 +381,7 @@ fn debanded(frames: Vec<Frame>, s: &Settings, scale: usize) -> Vec<Frame> {
     if !s.deband_on {
         return frames;
     }
-    let p = crate::deband::Params { radius: s.deband_radius * scale as f32, thr_rgb: s.deband_thr_rgb, thr_a: s.deband_thr_a, iterations: s.deband_iter, grain: s.deband_grain };
+    let p = crate::deband::Params { radius: s.deband_radius * scale as f32, thr_rgb: s.deband_thr_rgb, thr_a: s.deband_thr_a, iterations: s.deband_iter, grain: s.deband_grain / 12.0f32.sqrt(), kind: if s.deband_grain > 0.0 { crate::deband::Grain::Uniform } else { crate::deband::Grain::None }, mono: true, quantize: true, limit: 0.0, elast: 3.0, narrowing: false, adv: crate::deband::Advanced::default() };
     frames.into_par_iter().map(|f| f.map(|im| crate::deband::deband(&im, &p))).collect()
 }
 

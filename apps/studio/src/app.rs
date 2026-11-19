@@ -7,7 +7,7 @@ use egui::ViewportId;
 use preview_window::session::{Prepared, Session};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -16,7 +16,35 @@ use crate::studio::Studio;
 use crate::theme;
 use crate::ui::{self, SessionView, UiOut, PANEL_W};
 
+/// Scroll acceleration for the mouse wheel: a notch or two scrolls as usual, a fast run of notches scrolls faster and faster.
+#[derive(Default)]
+struct Wheel {
+    last: Option<Instant>,
+    streak: u32,
+    /// The direction of the last notch (-1, 0, 1): turning the wheel back starts again.
+    dir: i32,
+}
+
+impl Wheel {
+    /// The factor for the next notch, `gap` seconds after the previous one (`None`: the first), turned in direction `dir`.
+    fn next(&mut self, gap: Option<f32>, dir: i32) -> f32 {
+        if gap.map_or(true, |g| g > 0.16) || dir != self.dir {
+            self.streak = 0;
+        } else {
+            self.streak = (self.streak + 1).min(60);
+        }
+        self.dir = dir;
+        wheel_factor(self.streak)
+    }
+}
+
+/// 1 for the first three notches of a run, then more and more, up to 10 times as fast.
+fn wheel_factor(streak: u32) -> f32 {
+    (1.0 + 0.4 * streak.saturating_sub(2) as f32).min(10.0)
+}
+
 struct Live {
+    wheel: Wheel,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -96,6 +124,14 @@ pub fn next_ui_size(current: f32, up: bool) -> f32 {
 }
 
 impl ApplicationHandler for App {
+    fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            if let Some(l) = &self.live {
+                l.window.request_redraw();
+            }
+        }
+    }
+
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.live.is_some() {
             return;
@@ -130,7 +166,7 @@ impl ApplicationHandler for App {
         theme::install(&ctx);
         let egui_state = egui_winit::State::new(ctx.clone(), ViewportId::ROOT, &*window, Some(window.scale_factor() as f32), window.theme(), Some(device.limits().max_texture_dimension_2d as usize));
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
-        self.live = Some(Live { window, surface, config, device, queue, format, ctx, egui_state, egui_renderer, studio, session: None, rescale: None, last_resize: Instant::now(), last: Instant::now(), atlas_seen: 0, cs_ar_seen: (0.0, 0.0), fps_count: 0, fps_since: Instant::now(), was_in_skin: false, resume_after_skin: false });
+        self.live = Some(Live { window, surface, config, device, queue, format, ctx, egui_state, egui_renderer, studio, session: None, rescale: None, last_resize: Instant::now(), last: Instant::now(), atlas_seen: 0, cs_ar_seen: (0.0, 0.0), wheel: Wheel::default(), fps_count: 0, fps_since: Instant::now(), was_in_skin: false, resume_after_skin: false });
         el.set_control_flow(ControlFlow::Poll);
         self.live.as_ref().unwrap().window.request_redraw();
     }
@@ -138,6 +174,10 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
         let Some(l) = self.live.as_mut() else { return };
         let resp = l.egui_state.on_window_event(&l.window, &ev);
+        // (egui asks for a repaint after a redraw too: that must not start another redraw, or the window never rests)
+        if resp.repaint && !matches!(ev, WindowEvent::RedrawRequested) {
+            l.window.request_redraw();
+        }
         match ev {
             WindowEvent::CloseRequested => {
                 l.session = None;
@@ -220,14 +260,29 @@ impl App {
         let ppp = ui_scale(&l.window, l.studio.cfg.ui_scale);
         l.studio.ui_now = ppp / l.window.scale_factor() as f32;
         l.ctx.set_pixels_per_point(ppp);
-        let raw = l.egui_state.take_egui_input(&l.window);
+        let mut raw = l.egui_state.take_egui_input(&l.window);
+        // acceleration for the wheel over the panel on the left (not for a touchpad, which has its own, and not for zooming)
+        let over_panel = l.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| p.x < 470.0);
+        for ev in raw.events.iter_mut() {
+            if let egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta, modifiers, .. } = ev {
+                if over_panel && !modifiers.any() && delta.y != 0.0 {
+                    let now = Instant::now();
+                    let gap = l.wheel.last.map(|t| now.duration_since(t).as_secs_f32());
+                    l.wheel.last = Some(now);
+                    let k = l.wheel.next(gap, delta.y.signum() as i32);
+                    delta.y *= k;
+                }
+            }
+        }
         let sv = match &l.session {
             Some(s) => SessionView { loaded: true, clock: s.clock_ms, start: s.start_ms, end: s.end_ms, playing: s.playing, info: s.info.clone() },
             None => SessionView::default(),
         };
+        let t_prep = t0.elapsed();
         let mut out = UiOut::default();
         let studio = &mut l.studio;
         let full = l.ctx.run_ui(raw, |ui| ui::draw(ui, studio, &sv, &mut out));
+        let t_ui = t0.elapsed();
         l.egui_state.handle_platform_output(&l.window, full.platform_output);
 
         // what the interface asked of the session
@@ -262,7 +317,12 @@ impl App {
         // what the view needs, from the window and the settings panel (the first frame has no layout yet)
         let from_window = ((size_px.0 - PANEL_W * ppp) / 640.0).min((size_px.1 - (46.0 + 360.0) * ppp) / 480.0);
         let from_layout = (vp_px[2] / 640.0).min(vp_px[3] / 480.0);
-        let want_ss = (if from_layout.is_finite() && from_layout > 0.2 && from_layout < 8.0 { from_layout } else { from_window }).clamp(0.4, 4.0);
+        let mut want_ss = (if from_layout.is_finite() && from_layout > 0.2 && from_layout < 8.0 { from_layout } else { from_window }).clamp(0.4, 4.0);
+        // the skin editor has no gameplay view, so there is no size to follow: without this the whole window counted as the view and the
+        // skin sheet of the gameplay was rasterized again and again in the background
+        if l.studio.mode == crate::studio::Mode::Skin {
+            want_ss = l.session.as_ref().map(|s| s.built_ss).unwrap_or(want_ss);
+        }
 
         if l.studio.load_session && l.rescale.is_none() {
             // a skin change carries on from the moment being played
@@ -297,6 +357,7 @@ impl App {
         }
 
         // draw
+        let t_a = t0.elapsed();
         let frame = match l.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => {
@@ -347,6 +408,7 @@ impl App {
             l.queue.submit(Some(enc.finish()));
         }
         // the interface on top
+        // when egui wants nothing drawn soon (nothing is animating): how long it can wait
         let prims = l.ctx.tessellate(full.shapes, full.pixels_per_point);
         let desc = egui_wgpu::ScreenDescriptor { size_in_pixels: [l.config.width, l.config.height], pixels_per_point: full.pixels_per_point };
         for (id, deltas) in &full.textures_delta.set {
@@ -372,10 +434,22 @@ impl App {
         for id in &full.textures_delta.free {
             l.egui_renderer.free_texture(id);
         }
+        let t_render = t0.elapsed();
         l.window.pre_present_notify();
         l.queue.present(frame);
+        let t_present = t0.elapsed();
         let _ = l.format;
         wait_for_refresh();
+        if t0.elapsed() > Duration::from_millis(40) {
+            // a frame that took long: where the time went, for finding out why (written next to the settings)
+            if let Some(dir) = std::env::var_os("APPDATA") {
+                use std::io::Write;
+                let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(std::path::Path::new(&dir).join("skin-studio").join("slow-frames.log")) {
+                    let _ = writeln!(f, "skin={} total {:.0} ms: prepare {:.0}, ui {:.0}, tessellate/etc {:.0}, render {:.0}, present {:.0}, display wait {:.0}", in_skin, ms(t0.elapsed()), ms(t_prep), ms(t_ui - t_prep), ms(t_render - t_ui), ms(t_render.saturating_sub(t_a)), ms(t_present - t_render), ms(t0.elapsed() - t_present));
+                }
+            }
+        }
         l.fps_count += 1;
         if l.fps_since.elapsed() >= Duration::from_secs(2) {
             if std::env::var("STUDIO_FPS").is_ok() {
@@ -384,7 +458,9 @@ impl App {
             l.fps_count = 0;
             l.fps_since = Instant::now();
         }
-        let _ = el;
+        // Drawn once per display refresh in every tab. (Waiting on a timer instead made the skin editor stutter, and window dragging
+        // crawl at a few frames a second, because Windows runs its own loop while a window is dragged.)
+        el.set_control_flow(ControlFlow::Poll);
         l.window.request_redraw();
     }
 }
@@ -422,6 +498,24 @@ pub fn run() {
 #[cfg(test)]
 mod scale_tests {
     use super::*;
+
+    #[test]
+    fn the_wheel_speeds_up_in_a_run_of_notches_and_starts_again_after_a_pause_or_a_turn() {
+        let mut w = Wheel::default();
+        // a notch or two: normal
+        assert_eq!(w.next(None, -1), 1.0);
+        assert_eq!(w.next(Some(0.3), -1), 1.0, "after a pause it starts again");
+        assert_eq!(w.next(Some(0.05), -1), 1.0);
+        // a fast run: faster and faster, up to a limit
+        let run: Vec<f32> = (0..30).map(|_| w.next(Some(0.03), -1)).collect();
+        assert!(run.windows(2).all(|p| p[1] >= p[0]) && run[5] > 1.5 && run[29] == 10.0, "{run:?}");
+        // turning the wheel back, or a pause, ends it
+        assert_eq!(w.next(Some(0.03), 1), 1.0);
+        for _ in 0..10 {
+            w.next(Some(0.03), 1);
+        }
+        assert_eq!(w.next(Some(0.5), 1), 1.0);
+    }
 
     #[test]
     fn the_interface_size_steps_up_and_down_through_the_list() {

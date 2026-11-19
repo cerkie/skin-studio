@@ -9,5 +9,6 @@ pub mod img;
 pub mod keys;
 pub mod lazer;
 pub mod presets;
+pub mod restore;
 pub mod settings;
 pub mod sources;

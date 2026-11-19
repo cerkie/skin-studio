@@ -51,7 +51,7 @@ pub enum PickKind {
 }
 
 pub enum Msg {
-    SkinResult(u64, Arc<engine::img::Img>, Vec<(usize, usize)>),
+    SkinResult(u64, Arc<engine::img::Img>, Vec<(usize, usize)>, Arc<crate::skin_editor::Display>),
     /// A thumbnail of a picture of the skin: the list it belongs to, the file, its size and premultiplied RGBA.
     SkinThumb(u64, PathBuf, [usize; 2], Vec<u8>),
     Frames { frames: Vec<Frame>, atlas: Arc<Atlas>, fps: f32 },
@@ -115,6 +115,7 @@ pub struct Studio {
     pub logo_pressed: Option<Instant>,
     pub sfx: preview_window::sfx::Sfx,
     logo_sound: Option<((String, String), Option<PathBuf>)>,
+    skin_folder: std::cell::RefCell<Option<(String, Option<PathBuf>)>>,
     /// The motion editor's selection, zoom and undo history.
     pub motion: crate::motion::MotionState,
     pub anim_speed: f32,
@@ -189,6 +190,7 @@ impl Studio {
             logo_pressed: None,
             sfx: preview_window::sfx::Sfx::new(),
             logo_sound: None,
+            skin_folder: Default::default(),
             motion: crate::motion::MotionState::from_config(&cfg_dock),
             anim_speed: 1.0,
             anim_zoom: 1.0,
@@ -241,9 +243,15 @@ impl Studio {
                 if let Some(f) = s.skin_ed.files.iter().find(|f| !pic.is_empty() && f.name.to_lowercase().contains(&pic)).map(|f| f.path.clone()) {
                     let (tx, c) = (s.tx.clone(), s.ctx.clone());
                     let _ = s.skin_ed.open_picture(&f, Some((&tx, &c)));
+                    if let Ok(v) = std::env::var("SKIN_STUDIO_EDIT_DEBAND") {
+                        // "strength,grain"
+                        let mut it = v.split(',').map(|x| x.trim().parse::<f32>().unwrap_or(0.0));
+                        s.skin_ed.ops = vec![engine::edit::Op::deband(it.next().unwrap_or(0.8), it.next().unwrap_or(0.0))];
+                        s.skin_ed.recompute(&tx, &c);
+                    }
                     if std::env::var("SKIN_STUDIO_EDIT_OPS").is_ok() {
                         use engine::edit::{Op, Resample};
-                        s.skin_ed.ops = vec![Op::Resize { w: 256, h: 256, mode: Resample::Crisp }, Op::Adjust { brightness: 0.0, contrast: 0.1, saturation: 0.2, hue: 20.0 }, Op::Deband { strength: 0.6, grain: 0.0 }];
+                        s.skin_ed.ops = vec![Op::Resize { w: 256, h: 256, mode: Resample::Crisp }, Op::Adjust { brightness: 0.0, contrast: 0.1, saturation: 0.2, hue: 20.0 }, Op::deband(0.6, 0.0)];
                         s.skin_ed.recompute(&tx, &c);
                     }
                 }
@@ -296,9 +304,17 @@ impl Studio {
         if self.cfg.skin.is_empty() || self.cfg.skin == "argon" {
             return None;
         }
+        // worked out once per picked skin: copying a skin out of lazer's database takes tens of milliseconds, and this is asked every frame
+        if let Some((k, v)) = &*self.skin_folder.borrow() {
+            if *k == self.cfg.skin {
+                return v.clone();
+            }
+        }
         let p = PathBuf::from(&self.cfg.skin);
         let _ = paths::ensure_skin(&p); // a skin of osu!lazer's database is copied out first
-        p.is_dir().then_some(p)
+        let found = p.is_dir().then_some(p);
+        *self.skin_folder.borrow_mut() = Some((self.cfg.skin.clone(), found.clone()));
+        found
     }
 
     /// The volume the session should have: nothing while muted.
@@ -406,7 +422,7 @@ impl Studio {
                     self.session_error = e;
                 }
                 Msg::Status(s) => self.status = s,
-                Msg::SkinResult(gen, img, dims) => self.skin_ed.got_result(gen, img, dims),
+                Msg::SkinResult(gen, img, dims, display) => self.skin_ed.got_result(gen, img, dims, Some(display)),
                 Msg::SkinThumb(gen, path, size, rgba) => self.skin_ed.got_thumb(&self.ctx, gen, path, size, rgba),
                 Msg::HistoryChanged => self.reload_history(),
                 Msg::ImportDone(r) => {
