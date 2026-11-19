@@ -85,9 +85,54 @@ fn font_bytes() -> Option<Vec<u8>> {
     Some(include_bytes!("Inter-SemiBold.otf").to_vec())
 }
 
-/// Rounded bold digits in the spirit of Torus (which cannot be redistributed): M PLUS Rounded 1c Bold, OFL, digits only.
+/// Rounded bold digits in the spirit of Torus (which cannot be redistributed): Baloo 2 at weight 800, OFL, digits only.
 fn digit_font_bytes() -> Vec<u8> {
-    include_bytes!("Digits-Bold.ttf").to_vec()
+    include_bytes!("Digits-Baloo2.ttf").to_vec()
+}
+
+/// A glyph made heavier by `r` pixels all the way round, with the corners staying round: the coverage is blown up 4 times, every point
+/// within `r` of the letter is added (exact distance transform), and it is averaged back down. The bitmap grows by `pad` on each side.
+fn embolden(bmp: &[u8], w: usize, h: usize, r: f32) -> (Vec<u8>, usize, usize, usize) {
+    const S: usize = 4;
+    let pad = r.ceil() as usize + 1;
+    let (ow, oh) = (w + 2 * pad, h + 2 * pad);
+    let (hw, hh) = (ow * S, oh * S);
+    let at = |x: i64, y: i64| -> f32 {
+        if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
+            0.0
+        } else {
+            bmp[y as usize * w + x as usize] as f32 / 255.0
+        }
+    };
+    // bilinear coverage at the high resolution: is the middle of this small cell inside the letter?
+    let mut inside = vec![false; hw * hh];
+    for y in 0..hh {
+        let sy = (y as f32 + 0.5) / S as f32 - pad as f32 - 0.5;
+        let (iy, ty) = (sy.floor(), sy - sy.floor());
+        for x in 0..hw {
+            let sx = (x as f32 + 0.5) / S as f32 - pad as f32 - 0.5;
+            let (ix, tx) = (sx.floor(), sx - sx.floor());
+            let (ix, iy_) = (ix as i64, iy as i64);
+            let v = (at(ix, iy_) * (1.0 - tx) + at(ix + 1, iy_) * tx) * (1.0 - ty) + (at(ix, iy_ + 1) * (1.0 - tx) + at(ix + 1, iy_ + 1) * tx) * ty;
+            inside[y * hw + x] = v >= 0.5;
+        }
+    }
+    let dist = engine::img::edt_sq(&inside, hw, hh);
+    let rr = r * S as f32;
+    let mut out = vec![0u8; ow * oh];
+    for y in 0..oh {
+        for x in 0..ow {
+            let mut acc = 0.0f32;
+            for sy in 0..S {
+                for sx in 0..S {
+                    let d = dist[(y * S + sy) * hw + x * S + sx].max(0.0).sqrt();
+                    acc += (rr + 0.5 - d).clamp(0.0, 1.0);
+                }
+            }
+            out[y * ow + x] = (acc / (S * S) as f32 * 255.0).round() as u8;
+        }
+    }
+    (out, ow, oh, pad)
 }
 
 /// An approach circle: a plain ring 128 units across and 5 thick, as lazer's default one looks.
@@ -282,17 +327,24 @@ pub fn add_to_sheet(sheet: &mut Sheet, scale: f32, ss: f32) {
     if let Ok(font) = fontdue::Font::from_bytes(digit_font_bytes(), fontdue::FontSettings::default()) {
         let probe = 100.0;
         let h0 = font.rasterize('0', probe).0.height.max(1) as f32;
-        let size = 52.0 * d * (0.475 * probe / h0);
+        let size0 = 52.0 * d * (0.475 * probe / h0);
+        // how much heavier than the font the letters are drawn (a fraction of the size; the size is lowered to keep the digits as tall as
+        // lazer's). Baloo 2 at 800 has the weight of Torus Bold already.
+        const BOLDER: f32 = 0.0;
+        let k = h0 / probe; // height of a digit per unit of size
+        let size = size0 * k / (k + 2.0 * BOLDER);
         let lm = font.horizontal_line_metrics(size);
         for dgt in 0..10u32 {
             let ch = char::from_digit(dgt, 10).unwrap();
             let (m, bmp) = font.rasterize(ch, size);
+            let (bmp, gw, gh, pad) = if BOLDER > 0.0 { embolden(&bmp, m.width, m.height, BOLDER * size) } else { (bmp, m.width, m.height, 0) };
             let (ascent, line) = lm.map(|l| (l.ascent, l.ascent - l.descent)).unwrap_or((size * 0.8, size * 1.2));
-            let adv = font.metrics(ch, size).advance_width;
-            let (cw, ch_) = (adv.ceil() as usize, line.ceil() as usize);
+            let adv = font.metrics(ch, size).advance_width + 2.0 * BOLDER * size;
+            let (cw, ch_) = ((adv.ceil() as usize).max(gw), (line.ceil() as usize + 2 * pad).max(gh));
             let mut px = vec![0u8; cw * ch_ * 4];
-            let gx = ((cw as f32 - m.width as f32) * 0.5).round() as i32;
+            let gx = ((cw as f32 - gw as f32) * 0.5).round() as i32;
             let gy = (ascent - m.height as f32 - m.ymin as f32).round() as i32;
+            let m = fontdue::Metrics { width: gw, height: gh, ..m };
             for y in 0..m.height {
                 for x in 0..m.width {
                     let (tx, ty) = (x as i32 + gx, y as i32 + gy);
@@ -340,5 +392,54 @@ pub fn add_to_sheet(sheet: &mut Sheet, scale: f32, ss: f32) {
                 sheet.add_image(key, cw as u32, ch_ as u32, &px, d);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod digit_tests {
+    use super::*;
+
+    #[test]
+    fn emboldening_grows_a_shape_by_the_radius_all_round_and_keeps_it_round() {
+        // a 10x10 square of full coverage in a 14x14 bitmap
+        let (w, h) = (14usize, 14usize);
+        let mut bmp = vec![0u8; w * h];
+        for y in 2..12 {
+            for x in 2..12 {
+                bmp[y * w + x] = 255;
+            }
+        }
+        let (out, ow, oh, pad) = embolden(&bmp, w, h, 2.0);
+        assert_eq!((ow, oh), (w + 2 * pad, h + 2 * pad));
+        let at = |x: usize, y: usize| out[(y + pad) * ow + x + pad];
+        // inside: full; two pixels beyond the old edge: the edge of the new shape; further: nothing
+        assert_eq!(at(6, 6), 255);
+        assert!(at(1, 6) > 200 && at(0, 6) > 200, "a band of 2 pixels was added on the left");
+        assert!(at(0, 6) > 100, "the new edge is about two pixels out");
+        // the corner is rounded: the point diagonal to the corner is not filled as a square would
+        assert!(at(0, 0) < 140, "{}", at(0, 0));
+    }
+
+    #[test]
+    fn the_digits_are_made_and_are_as_tall_as_lazers_with_heavier_strokes() {
+        let mut sheet = Sheet::default();
+        add_to_sheet(&mut sheet, 0.5, 2.0);
+        let mut heights = vec![];
+        for d in 0..10 {
+            let e = sheet.elems.get(&format!("num{d}")).unwrap_or_else(|| panic!("digit {d}"));
+            let r = e.frames[0];
+            // the rows of the cell that have any coverage
+            let mut rows = 0;
+            for y in 0..r.h {
+                let any = (0..r.w).any(|x| sheet.rgba[(((r.y + y) * sheet.w + r.x + x) * 4 + 3) as usize] > 100);
+                rows += any as u32;
+            }
+            heights.push(rows as f32 / e.ratio);
+        }
+        // every digit is about the same height (in display units), and it is the height lazer draws them at: 0.475 of 52 units
+        let (lo, hi) = heights.iter().fold((f32::MAX, f32::MIN), |a, h| (a.0.min(*h), a.1.max(*h)));
+        assert!(hi - lo < 4.0, "{heights:?}");
+        let want = 52.0 * 0.475;
+        assert!((heights[0] - want).abs() < 3.0, "a 0 is {} units tall, wanted about {want}", heights[0]);
     }
 }

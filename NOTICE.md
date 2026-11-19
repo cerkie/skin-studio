@@ -2,9 +2,9 @@
 
 - **Inter** (interface font): SIL Open Font License 1.1, see `apps/studio/ui/fonts/Inter-LICENSE.txt`. A copy of Inter SemiBold is
   also used by the Argon spinner labels (`crates/game/src/Inter-SemiBold.otf`).
-- **M PLUS Rounded 1c Bold** (only the digits 0-9, subset into `crates/game/src/Digits-Bold.ttf`, drawn on Argon hit circles):
-  SIL Open Font License 1.1, copyright 2016 The Rounded M+ Project Authors; license text in
-  `crates/game/MPLUSRounded1c-OFL.txt`.
+- **Baloo 2** (only the digits 0-9 at weight 800, subset into `crates/game/src/Digits-Baloo2.ttf`, drawn on Argon hit circles): SIL Open Font
+  License 1.1, copyright 2019 The Baloo 2 Project Authors (https://github.com/EkType/Baloo2); license text in `crates/game/Baloo2-OFL.txt`. Chosen as the
+  closest free match to lazer's Torus digits.
 - No textures or other assets from osu!lazer or osu-resources are included: the Argon pieces, including the approach ring and the repeat-arrow
   edge piece, are drawn in code to match lazer's look.
 - **osu!lazer** (https://github.com/ppy/osu, MIT, copyright ppy Pty Ltd): parts of this project are ports of lazer's logic into Rust,
