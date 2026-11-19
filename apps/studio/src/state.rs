@@ -120,30 +120,6 @@ pub fn edit_key(s: &mut Value, id: &str, idx: usize, field: i32, text: &str) {
     s["props"][id] = Value::Array(keys);
 }
 
-pub fn add_key(s: &mut Value, id: &str) {
-    let mut keys = prop_keys(s, id);
-    let last_t = keys.iter().filter_map(|k| k[0].as_f64()).fold(0.0, f64::max);
-    let last_v = keys.last().map(|k| k[1].clone()).unwrap_or(json!(0));
-    keys.push(json!([last_t + 100.0, last_v, "linear"]));
-    sort_keys(&mut keys);
-    s["props"][id] = Value::Array(keys);
-}
-
-/// A new key at `t` ms with value `v`, between its neighbours.
-pub fn insert_key(s: &mut Value, id: &str, t: f64, v: f64) {
-    let mut keys = prop_keys(s, id);
-    keys.push(json!([t, (v * 1000.0).round() / 1000.0, "linear"]));
-    sort_keys(&mut keys);
-    s["props"][id] = Value::Array(keys);
-}
-pub fn remove_key(s: &mut Value, id: &str, idx: usize) {
-    let mut keys = prop_keys(s, id);
-    if keys.len() > 1 && idx < keys.len() {
-        keys.remove(idx);
-    }
-    s["props"][id] = Value::Array(keys);
-}
-
 fn color_list(s: &Value) -> Vec<Value> {
     presets::color_keys_of(s)
 }

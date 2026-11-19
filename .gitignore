@@ -3,3 +3,5 @@ target/
 *.pdb
 thumbs.db
 testdata/arrow_slide_1000fps/
+dist/
+dev/host/

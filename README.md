@@ -3,6 +3,7 @@
 An editor for osu! followpoint animations with a live gameplay preview. Pick a skin and a map, edit on the left, and the changes show up in the preview right away.
 
 - Effect presets, drawn sources or your own PNG, timing, keyframe motion and color, outline, shadow and debanding
+- A motion editor docked under the view: a curve editor and a dope sheet for every property, with multi-select and box select, snapping, axis lock, a picker of easing curves, a scrubbable playhead tied to the animation card, copy and paste of keys, undo and redo, and zoom and pan
 - A gameplay preview drawn the way osu!lazer draws it (the logic is ported from its source), with Argon Pro or any skin, including the skins stored in osu!lazer itself, on a random map from your osu!lazer library (or stable's Songs folder, or a `.osu`/`.osz`/`.olz` you choose); when a map ends the next random one starts
 - The animation plays in a card over the preview that you can move, resize and fold away
 - Export as `followpoint-N.png` (and `@2x`), import an existing set, and keep a history of your saves
@@ -32,6 +33,8 @@ it is not part of the release). `dotnet publish dev/lazer-reference -c Release` 
 ## Build
 
     cargo build --release -p studio
+
+The executable ends up in `target/release/`. For day-to-day use there is one more folder: `dist/` (not in git) holds the latest build as `skin-studio.exe` with its icon. `dev/host/` (not in git) is the built osu!lazer reference host that `dev/compare.py` uses.
 
 On Linux you also need development packages for ALSA, fontconfig, xkbcommon, wayland/X11 and Vulkan or GL. On Debian/Ubuntu:
 

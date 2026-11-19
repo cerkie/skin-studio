@@ -20,16 +20,14 @@ use crate::state::{self, HistoryEntry};
 pub enum Tab {
     Animation,
     Timing,
-    Motion,
     Look,
     Preview,
     Export,
 }
 
-pub const TABS: [(Tab, &str); 6] = [
+pub const TABS: [(Tab, &str); 5] = [
     (Tab::Animation, "Animation"),
     (Tab::Timing, "Timing"),
-    (Tab::Motion, "Motion"),
     (Tab::Look, "Look"),
     (Tab::Preview, "Preview"),
     (Tab::Export, "Export"),
@@ -93,10 +91,23 @@ pub struct Studio {
     pub import: ImportState,
     /// Where the animation card is in its loop (ms), how fast it plays, and the last time it moved.
     pub anim_pos: f32,
+    /// The logo in the toolbar: its picture, when it was last pressed (it bounces), the sound player, and the hit sound of the picked skin
+    /// (found once per skin and kept).
+    pub logo_tex: Option<egui::TextureHandle>,
+    pub logo_pressed: Option<Instant>,
+    pub sfx: preview_window::sfx::Sfx,
+    logo_sound: Option<((String, String), Option<PathBuf>)>,
+    /// The motion editor's selection, zoom and undo history.
+    pub motion: crate::motion::MotionState,
     pub anim_speed: f32,
-    /// The animation card: its width in points, and whether it is folded down to its title.
-    pub anim_width: f32,
-    pub anim_collapsed: bool,
+    /// The animation preview: how many screen pixels each pixel of the animation gets (1 = real size). It is kept to what fits.
+    pub anim_zoom: f32,
+    /// The interface size in use now (a factor of the system's scaling, whether chosen or automatic), and the size a slider is being
+    /// dragged to (only applied when it is let go: the slider itself grows and shrinks with the interface).
+    pub ui_now: f32,
+    pub ui_pending: Option<f32>,
+    /// The most room the dock leaves the preview (width, height in points); the dock sets it every frame.
+    pub anim_limit: (f32, f32),
     pub anim_last: Instant,
     pub anim_scrub: bool,
     pub anim_playing: bool,
@@ -123,6 +134,7 @@ impl Studio {
         let cfg = Config::load();
         let skins = paths::detect_skins().into_iter().map(|(l, p)| (l, p.to_string_lossy().to_string())).collect();
         let _ = paths::ensure_skin(std::path::Path::new(&cfg.skin)); // a skin of osu!lazer's database, copied out the first time
+        let cfg_dock = (cfg.dock_open, cfg.dock_height);
         let mut s = Studio {
             cfg,
             settings: presets::default_settings(),
@@ -134,7 +146,14 @@ impl Studio {
             atlas: None,
             atlas_gen: 0,
             skins,
-            tab: Tab::Animation,
+            // SKIN_STUDIO_TAB opens a page directly (for checking the UI without clicking through it)
+            tab: match std::env::var("SKIN_STUDIO_TAB").unwrap_or_default().as_str() {
+                "timing" => Tab::Timing,
+                "look" => Tab::Look,
+                "preview" => Tab::Preview,
+                "export" => Tab::Export,
+                _ => Tab::Animation,
+            },
             bufs: HashMap::new(),
             status: String::new(),
             status_shown: String::new(),
@@ -145,9 +164,16 @@ impl Studio {
             history: vec![],
             import: ImportState::default(),
             anim_pos: 0.0,
+            logo_tex: None,
+            logo_pressed: None,
+            sfx: preview_window::sfx::Sfx::new(),
+            logo_sound: None,
+            motion: crate::motion::MotionState::from_config(&cfg_dock),
             anim_speed: 1.0,
-            anim_width: 320.0,
-            anim_collapsed: false,
+            anim_zoom: 1.0,
+            ui_now: 1.0,
+            ui_pending: None,
+            anim_limit: (900.0, 900.0),
             anim_last: Instant::now(),
             anim_scrub: false,
             anim_playing: true,
@@ -198,6 +224,33 @@ impl Studio {
         } else {
             self.skins.iter().find(|(_, p)| *p == self.cfg.skin).map(|(l, _)| l.clone()).unwrap_or_else(|| label(&self.cfg.skin))
         }
+    }
+
+    /// The hit sound of the skin that is picked: the skin's own `normal-hitnormal` when it has one, else the one of the skin the hit
+    /// sounds fall back to (the same order the preview uses). `None` when neither has it.
+    pub fn skin_hitsound(&mut self) -> Option<PathBuf> {
+        let key = (self.cfg.skin.clone(), self.cfg.sound_skin.clone());
+        if let Some((k, found)) = &self.logo_sound {
+            if *k == key {
+                return found.clone();
+            }
+        }
+        let skin_path = PathBuf::from(if self.cfg.skin.is_empty() { "argon" } else { &self.cfg.skin });
+        let _ = paths::ensure_skin(&skin_path); // a skin of osu!lazer's database is copied out first
+        let mut skins: Vec<game::skin::Skin> = vec![];
+        if let Ok(s) = game::skin::Skin::open(&skin_path) {
+            if s.style == game::skin::Style::Legacy {
+                skins.push(s);
+            }
+        }
+        if !self.cfg.sound_skin.is_empty() {
+            if let Ok(s) = game::skin::Skin::open(std::path::Path::new(&self.cfg.sound_skin)) {
+                skins.push(s);
+            }
+        }
+        let found = skins.iter().find_map(|s| s.find_sound("normal-hitnormal"));
+        self.logo_sound = Some((key, found.clone()));
+        found
     }
 
     /// The volume the session should have: nothing while muted.

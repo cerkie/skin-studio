@@ -385,6 +385,38 @@ fn debanded(frames: Vec<Frame>, s: &Settings, scale: usize) -> Vec<Frame> {
     frames.into_par_iter().map(|f| f.map(|im| crate::deband::deband(&im, &p))).collect()
 }
 
+// ---------------------------------------------------------------------------------------------- time of a frame
+/// The motion time (in ms of the design, the axis the keyframes are on) that frame `idx` of the animation shows, or `None` for
+/// the blank frames before and after the animation itself. This is what `render_frames` and `make_seamless_frames` evaluate the
+/// keys at, so a playhead drawn from it is where the picture really is on the motion graph.
+pub fn frame_tau(s: &Settings, idx: usize) -> Option<f32> {
+    if s.is_seamless() {
+        let flen = 1000.0 / s.fps;
+        let life = preempt_for(s.sl_ar) + FADE;
+        let tq = (idx as f32 + 0.5) * flen;
+        return (tq <= life).then(|| (tq * s.speed.max(0.05)).min(life));
+    }
+    let ms = |v: f32| round_f(v * s.fps / 1000.0);
+    let lead_f = if s.clamp_mode { 0 } else { ms(s.lead).max(0) as usize };
+    let n = ms(s.real_length()).max(1) as usize;
+    if idx < lead_f || idx >= lead_f + n {
+        return None;
+    }
+    let b = idx - lead_f;
+    let total = s.design_length();
+    let mut u = if s.copies > 1 {
+        (b as f32 / n as f32) % 1.0
+    } else if n > 1 {
+        b as f32 / (n - 1) as f32
+    } else {
+        0.5
+    };
+    if s.pingpong {
+        u = 1.0 - (2.0 * u - 1.0).abs();
+    }
+    Some((u * total + s.shift).clamp(0.0, total))
+}
+
 // ---------------------------------------------------------------------------------------------- entry point
 /// Frames at 1x (`scale` = 1) or @2x (`scale` = 2). Settings are the 1x design; everything is scaled for @2x.
 pub fn build_frames(s: &Settings, scale: usize, opt: &Options) -> Vec<Frame> {
@@ -403,4 +435,28 @@ pub fn build_frames(s: &Settings, scale: usize, opt: &Options) -> Vec<Frame> {
     }
     let f = render_frames(&t, &base, scale, opt);
     pad_to_life(debanded(decorate(windowed(f, s), s, scale), s, scale), s)
+}
+
+#[cfg(test)]
+mod tau_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_animation_shows_the_blur_key_where_the_graph_says() {
+        let s = Settings::from_json(&crate::presets::default_settings());
+        let frames = build_frames(&s, 1, &Default::default());
+        // the window is shifted by -100 ms: the first frame shows time 0 (clamped) and the last real frame ends 100 ms early
+        assert_eq!(frame_tau(&s, 0), Some(0.0));
+        let n = round_f(s.real_length() * s.fps / 1000.0) as usize;
+        assert_eq!(frame_tau(&s, n - 1), Some(s.design_length() + s.shift));
+        assert_eq!(frame_tau(&s, n), None);
+        // time grows with the frames, and the padding after the animation is blank
+        let taus: Vec<f32> = (0..n).map(|i| frame_tau(&s, i).unwrap()).collect();
+        assert!(taus.windows(2).all(|w| w[1] >= w[0]));
+        assert!(frames[n..].iter().all(|f| f.is_none()));
+        // the blur key sits at 250 ms: the frame that shows 250 ms is not at 250 ms of the loop but later, because of the shift
+        let at250 = taus.iter().position(|t| *t >= 250.0).unwrap();
+        let loop_ms = at250 as f32 * 1000.0 / s.fps;
+        assert!(loop_ms > 300.0 && loop_ms < 450.0, "{loop_ms}");
+    }
 }

@@ -26,7 +26,6 @@ pub mod pal {
     pub const CONTROL: Color32 = Color32::from_rgb(0x2c, 0x2a, 0x33);
     /// OsuColor.Pink3, the pink of a settings button; PinkDark for hover.
     pub const PINK3: Color32 = Color32::from_rgb(0xcc, 0x33, 0x78);
-    pub const RED: Color32 = Color32::from_rgb(0xed, 0x11, 0x21);
 }
 
 use pal::*;

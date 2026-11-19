@@ -57,10 +57,39 @@ fn wait_for_refresh() {
 
 /// The interface is laid out in points; this is how many pixels one point is, so the settings panel (570 points wide
 /// in lazer's own proportions) keeps a sensible size on a 1080p screen and on a 4K one.
-fn ui_scale(window: &Window) -> f32 {
+/// The application icon (the title bar, the taskbar and Alt-Tab); the same picture is built into the Windows executable.
+fn app_icon() -> Option<winit::window::Icon> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(&include_bytes!("../assets/icon-256.png")[..]));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut r = dec.read_info().ok()?;
+    let mut buf = vec![0; r.output_buffer_size()?];
+    let info = r.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba {
+        return None;
+    }
+    winit::window::Icon::from_rgba(buf[..(info.width * info.height * 4) as usize].to_vec(), info.width, info.height).ok()
+}
+
+/// Points per pixel of the interface: the system's scaling times the chosen size, or (automatic) a little more in a tall window.
+fn ui_scale(window: &Window, chosen: f32) -> f32 {
     let sf = window.scale_factor() as f32;
+    if chosen >= 0.5 {
+        return sf * chosen;
+    }
     let h = window.inner_size().height as f32;
     (sf * (h / (sf * 900.0)).clamp(1.0, 1.6)).max(1.0)
+}
+
+/// The interface sizes to step through with the keyboard and to pick from the settings (as factors; 0 is automatic).
+pub const UI_SIZES: [f32; 11] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+
+/// The next size up or down from `current` (the factor in use now).
+pub fn next_ui_size(current: f32, up: bool) -> f32 {
+    if up {
+        UI_SIZES.iter().copied().find(|s| *s > current + 0.01).unwrap_or(UI_SIZES[UI_SIZES.len() - 1])
+    } else {
+        UI_SIZES.iter().rev().copied().find(|s| *s < current - 0.01).unwrap_or(UI_SIZES[0])
+    }
 }
 
 impl ApplicationHandler for App {
@@ -68,7 +97,16 @@ impl ApplicationHandler for App {
         if self.live.is_some() {
             return;
         }
-        let window = Arc::new(el.create_window(Window::default_attributes().with_title("skin studio").with_inner_size(LogicalSize::new(1600.0, 940.0)).with_min_inner_size(LogicalSize::new(1000.0, 600.0))).expect("window"));
+        let mut attrs = Window::default_attributes().with_title("skin studio").with_inner_size(LogicalSize::new(1600.0, 940.0)).with_min_inner_size(LogicalSize::new(1280.0, 720.0));
+        if let Some(icon) = app_icon() {
+            attrs = attrs.with_window_icon(Some(icon.clone()));
+            #[cfg(windows)]
+            {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                attrs = attrs.with_taskbar_icon(Some(icon));
+            }
+        }
+        let window = Arc::new(el.create_window(attrs).expect("window"));
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone()).expect("surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: Some(&surface), ..Default::default() })).expect("adapter");
@@ -83,6 +121,8 @@ impl ApplicationHandler for App {
         surface.configure(&device, &config);
 
         let ctx = egui::Context::default();
+        // the interface size is ours (config, Ctrl + and Ctrl -): egui must not zoom on its own as well
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let studio = Studio::new(ctx.clone());
         theme::install(&ctx);
         let egui_state = egui_winit::State::new(ctx.clone(), ViewportId::ROOT, &*window, Some(window.scale_factor() as f32), window.theme(), Some(device.limits().max_texture_dimension_2d as usize));
@@ -160,7 +200,22 @@ impl App {
         }
 
         // the interface
-        let ppp = ui_scale(&l.window);
+        // Ctrl + and Ctrl - make the interface bigger and smaller, Ctrl 0 goes back to automatic
+        {
+            let sf = l.window.scale_factor() as f32;
+            let now = ui_scale(&l.window, l.studio.cfg.ui_scale) / sf;
+            let (up, down, reset) = l.ctx.input_mut(|i| {
+                let m = egui::Modifiers::COMMAND;
+                (i.consume_key(m, egui::Key::Plus) || i.consume_key(m, egui::Key::Equals), i.consume_key(m, egui::Key::Minus), i.consume_key(m, egui::Key::Num0))
+            });
+            let new = if up { Some(next_ui_size(now, true)) } else if down { Some(next_ui_size(now, false)) } else if reset { Some(0.0) } else { None };
+            if let Some(v) = new {
+                l.studio.cfg.ui_scale = v;
+                l.studio.cfg.save();
+            }
+        }
+        let ppp = ui_scale(&l.window, l.studio.cfg.ui_scale);
+        l.studio.ui_now = ppp / l.window.scale_factor() as f32;
         l.ctx.set_pixels_per_point(ppp);
         let raw = l.egui_state.take_egui_input(&l.window);
         let sv = match &l.session {
@@ -202,7 +257,7 @@ impl App {
         let size_px = (l.config.width as f32, l.config.height as f32);
         let vp_px = out.viewport.map(|r| [r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp]).unwrap_or([0.0, 0.0, size_px.0, size_px.1]);
         // what the view needs, from the window and the settings panel (the first frame has no layout yet)
-        let from_window = ((size_px.0 - PANEL_W * ppp) / 640.0).min((size_px.1 - 46.0 * ppp) / 480.0);
+        let from_window = ((size_px.0 - PANEL_W * ppp) / 640.0).min((size_px.1 - (46.0 + 360.0) * ppp) / 480.0);
         let from_layout = (vp_px[2] / 640.0).min(vp_px[3] / 480.0);
         let want_ss = (if from_layout.is_finite() && from_layout > 0.2 && from_layout < 8.0 { from_layout } else { from_window }).clamp(0.4, 4.0);
 
@@ -346,4 +401,21 @@ pub fn run() {
     let event_loop = builder.build().expect("event loop");
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("run");
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn the_interface_size_steps_up_and_down_through_the_list() {
+        assert_eq!(next_ui_size(1.0, true), 1.1);
+        assert_eq!(next_ui_size(1.0, false), 0.9);
+        assert_eq!(next_ui_size(1.37, true), 1.5, "from an in-between size (automatic) to the next one");
+        assert_eq!(next_ui_size(1.37, false), 1.25);
+        assert_eq!(next_ui_size(2.0, true), 2.0);
+        assert_eq!(next_ui_size(0.5, false), 0.5);
+        assert_eq!(next_ui_size(0.7, false), 0.6);
+        assert!(UI_SIZES.windows(2).all(|w| w[0] < w[1]));
+    }
 }

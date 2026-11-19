@@ -4,6 +4,7 @@
 //!
 //! The editor talks to it through [`Shared`]: swap in a new atlas / map, change settings, play, pause, seek.
 pub mod session;
+pub mod sfx;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

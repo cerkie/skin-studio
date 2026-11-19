@@ -95,7 +95,7 @@ impl Scene {
         // center: two rings that shrink while the spinner is being tracked
         let size = 80.0 + (40.0 - 80.0) * tracking;
         self.sprite(out, "ar_ring_thin", 0, c, size / 80.0 * center, 0.0, a, None);
-        self.sprite(out, "ar_ring_thick", 0, c, 0.8 * size / 64.0 * center * (80.0 / 80.0), 0.0, a, None);
+        self.sprite(out, "ar_ring_thick", 0, c, 0.8 * size / 64.0 * center, 0.0, a, None);
 
         // spins per minute
         let spm_a = frac(t, sp.start, sp.start + self.fade_in) * a;

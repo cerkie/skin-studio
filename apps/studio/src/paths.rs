@@ -196,6 +196,11 @@ pub struct Config {
     pub speed: f32,
     /// Where random maps come from: "auto", "lazer" or "stable".
     pub library: String,
+    /// The motion dock: open or folded, and how tall.
+    pub dock_open: bool,
+    pub dock_height: f32,
+    /// How big the interface is, as a factor of the system's scaling: 0 = automatic (grows a little with the window's height).
+    pub ui_scale: f32,
 }
 
 impl Default for Config {
@@ -215,6 +220,9 @@ impl Default for Config {
             snake_out: true,
             speed: 1.0,
             library: "auto".into(),
+            dock_open: true,
+            dock_height: 360.0,
+            ui_scale: 0.0,
         }
     }
 }
@@ -259,15 +267,28 @@ impl Config {
         if let Some(x) = v.get("speed").and_then(|x| x.as_f64()) {
             c.speed = (x as f32).clamp(0.1, 2.0);
         }
+        if let Some(b) = v.get("dock_open").and_then(|x| x.as_bool()) {
+            c.dock_open = b;
+        }
+        if let Some(x) = v.get("dock_height").and_then(|x| x.as_f64()) {
+            c.dock_height = (x as f32).clamp(300.0, 900.0);
+        }
+        if let Some(x) = v.get("ui_scale").and_then(|x| x.as_f64()) {
+            c.ui_scale = if x >= 0.5 { (x as f32).clamp(0.5, 2.5) } else { 0.0 };
+        }
         c
     }
 
     pub fn save(&self) {
+        // tests must never touch the real configuration
+        if cfg!(test) {
+            return;
+        }
         let Some(f) = config_file() else { return };
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let v = serde_json::json!({ "settings": self.settings, "skin": self.skin, "sound_skin": self.sound_skin, "map": self.map, "songs": self.songs, "volume": self.volume, "muted": self.muted, "offset_ms": self.offset_ms, "cursor_scale": self.cursor_scale, "hit_lighting": self.hit_lighting, "snake_in": self.snake_in, "snake_out": self.snake_out, "speed": self.speed, "library": self.library });
+        let v = serde_json::json!({ "settings": self.settings, "skin": self.skin, "sound_skin": self.sound_skin, "map": self.map, "songs": self.songs, "volume": self.volume, "muted": self.muted, "offset_ms": self.offset_ms, "cursor_scale": self.cursor_scale, "hit_lighting": self.hit_lighting, "snake_in": self.snake_in, "snake_out": self.snake_out, "speed": self.speed, "library": self.library, "dock_open": self.dock_open, "dock_height": self.dock_height, "ui_scale": self.ui_scale });
         let _ = std::fs::write(f, serde_json::to_string_pretty(&v).unwrap_or_default());
     }
 }
