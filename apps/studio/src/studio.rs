@@ -35,6 +35,10 @@ pub const TABS: [(Tab, &str); 5] = [
 
 #[derive(Clone, Copy, Debug)]
 pub enum PickKind {
+    SkinEditSkin,
+    SkinEditPicture,
+    SkinEditSaveAs,
+    SkinEditExportOsk,
     OpenSettings,
     SaveSettings,
     CustomImage,
@@ -47,6 +51,9 @@ pub enum PickKind {
 }
 
 pub enum Msg {
+    SkinResult(u64, Arc<engine::img::Img>, Vec<(usize, usize)>),
+    /// A thumbnail of a picture of the skin: the list it belongs to, the file, its size and premultiplied RGBA.
+    SkinThumb(u64, PathBuf, [usize; 2], Vec<u8>),
     Frames { frames: Vec<Frame>, atlas: Arc<Atlas>, fps: f32 },
     Prepared(Result<Prepared, String>),
     Picked(PickKind, PathBuf),
@@ -64,7 +71,16 @@ pub struct ImportState {
     pub running: bool,
 }
 
+/// The two halves of the application: making followpoint animations (with the gameplay preview) and editing the pictures of a skin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    Followpoints,
+    Skin,
+}
+
 pub struct Studio {
+    pub mode: Mode,
+    pub skin_ed: crate::skin_editor::SkinEditor,
     pub cfg: Config,
     pub settings: Value,
     pub path: Option<PathBuf>,
@@ -94,6 +110,8 @@ pub struct Studio {
     /// The logo in the toolbar: its picture, when it was last pressed (it bounces), the sound player, and the hit sound of the picked skin
     /// (found once per skin and kept).
     pub logo_tex: Option<egui::TextureHandle>,
+    /// The size in pixels the logo texture was made for.
+    pub logo_px: usize,
     pub logo_pressed: Option<Instant>,
     pub sfx: preview_window::sfx::Sfx,
     logo_sound: Option<((String, String), Option<PathBuf>)>,
@@ -136,6 +154,8 @@ impl Studio {
         let _ = paths::ensure_skin(std::path::Path::new(&cfg.skin)); // a skin of osu!lazer's database, copied out the first time
         let cfg_dock = (cfg.dock_open, cfg.dock_height);
         let mut s = Studio {
+            mode: if std::env::var("SKIN_STUDIO_TAB").is_ok_and(|v| v == "skin") { Mode::Skin } else { Mode::Followpoints },
+            skin_ed: Default::default(),
             cfg,
             settings: presets::default_settings(),
             path: None,
@@ -165,6 +185,7 @@ impl Studio {
             import: ImportState::default(),
             anim_pos: 0.0,
             logo_tex: None,
+            logo_px: 0,
             logo_pressed: None,
             sfx: preview_window::sfx::Sfx::new(),
             logo_sound: None,
@@ -211,6 +232,23 @@ impl Studio {
         if let Some(i) = std::env::var("STUDIO_TAB").ok().and_then(|v| v.parse::<usize>().ok()) {
             s.tab = TABS[i.min(TABS.len() - 1)].0;
         }
+        // for looking at the skin editor without clicking through it: SKIN_STUDIO_EDIT is a skin folder, SKIN_STUDIO_EDIT_PIC part of a name
+        if let Ok(dir) = std::env::var("SKIN_STUDIO_EDIT") {
+            if s.skin_ed.open_skin(std::path::Path::new(&dir)).is_ok() {
+                let (tx0, c0) = (s.tx.clone(), s.ctx.clone());
+                s.skin_ed.load_thumbs(&tx0, &c0);
+                let pic = std::env::var("SKIN_STUDIO_EDIT_PIC").unwrap_or_default().to_lowercase();
+                if let Some(f) = s.skin_ed.files.iter().find(|f| !pic.is_empty() && f.name.to_lowercase().contains(&pic)).map(|f| f.path.clone()) {
+                    let (tx, c) = (s.tx.clone(), s.ctx.clone());
+                    let _ = s.skin_ed.open_picture(&f, Some((&tx, &c)));
+                    if std::env::var("SKIN_STUDIO_EDIT_OPS").is_ok() {
+                        use engine::edit::{Op, Resample};
+                        s.skin_ed.ops = vec![Op::Resize { w: 256, h: 256, mode: Resample::Crisp }, Op::Adjust { brightness: 0.0, contrast: 0.1, saturation: 0.2, hue: 20.0 }, Op::Deband { strength: 0.6, grain: 0.0 }];
+                        s.skin_ed.recompute(&tx, &c);
+                    }
+                }
+            }
+        }
         s
     }
 
@@ -251,6 +289,16 @@ impl Studio {
         let found = skins.iter().find_map(|s| s.find_sound("normal-hitnormal"));
         self.logo_sound = Some((key, found.clone()));
         found
+    }
+
+    /// The folder of the skin picked for the followpoint preview, if it is one (not Argon).
+    pub fn current_skin_folder(&self) -> Option<PathBuf> {
+        if self.cfg.skin.is_empty() || self.cfg.skin == "argon" {
+            return None;
+        }
+        let p = PathBuf::from(&self.cfg.skin);
+        let _ = paths::ensure_skin(&p); // a skin of osu!lazer's database is copied out first
+        p.is_dir().then_some(p)
     }
 
     /// The volume the session should have: nothing while muted.
@@ -358,6 +406,8 @@ impl Studio {
                     self.session_error = e;
                 }
                 Msg::Status(s) => self.status = s,
+                Msg::SkinResult(gen, img, dims) => self.skin_ed.got_result(gen, img, dims),
+                Msg::SkinThumb(gen, path, size, rgba) => self.skin_ed.got_thumb(&self.ctx, gen, path, size, rgba),
                 Msg::HistoryChanged => self.reload_history(),
                 Msg::ImportDone(r) => {
                     self.import.running = false;
@@ -385,6 +435,28 @@ impl Studio {
     fn picked(&mut self, kind: PickKind, p: PathBuf) {
         let ps = p.to_string_lossy().to_string();
         match kind {
+            PickKind::SkinEditSkin => match self.skin_ed.open_skin(&p) {
+                Ok(()) => {
+                    let (tx, c) = (self.tx.clone(), self.ctx.clone());
+                    self.skin_ed.load_thumbs(&tx, &c);
+                    self.status = format!("{} pictures", self.skin_ed.files.len());
+                }
+                Err(e) => self.status = e,
+            },
+            PickKind::SkinEditPicture => {
+                let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+                if let Err(e) = self.skin_ed.open_picture(&p, Some((&tx, &ctx))) {
+                    self.status = e;
+                }
+            }
+            PickKind::SkinEditSaveAs => match self.skin_ed.save_as(&p) {
+                Ok(()) => self.status = format!("Saved {}", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+                Err(e) => self.status = format!("Could not save: {e}"),
+            },
+            PickKind::SkinEditExportOsk => match self.skin_ed.export_osk(&p) {
+                Ok(n) => self.status = format!("Packed {n} files into {}", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+                Err(e) => self.status = format!("Could not pack the skin: {e}"),
+            },
             PickKind::OpenSettings => match load_settings_file(&p) {
                 Ok(v) => {
                     self.settings = v;
@@ -460,6 +532,10 @@ impl Studio {
         let songs = (!self.cfg.songs.is_empty()).then(|| PathBuf::from(&self.cfg.songs));
         std::thread::spawn(move || {
             let r = match kind {
+                PickKind::SkinEditSkin => rfd::FileDialog::new().set_title("Open a skin (.osk or .zip)").add_filter("skin", &["osk", "zip"]).pick_file().or_else(|| rfd::FileDialog::new().set_title("...or open a skin folder").pick_folder()),
+                PickKind::SkinEditPicture => rfd::FileDialog::new().set_title("Open a picture").add_filter("PNG image", &["png"]).pick_file(),
+                PickKind::SkinEditSaveAs => rfd::FileDialog::new().set_title("Save the picture as").add_filter("PNG image", &["png"]).save_file(),
+                PickKind::SkinEditExportOsk => rfd::FileDialog::new().set_title("Pack the skin into an .osk").set_file_name("skin.osk").add_filter("skin", &["osk"]).save_file(),
                 PickKind::OpenSettings => rfd::FileDialog::new().set_title("Open settings").add_filter("settings", &["json"]).pick_file(),
                 PickKind::SaveSettings => rfd::FileDialog::new().set_title("Save settings").set_file_name("followpoint-settings.json").add_filter("settings", &["json"]).save_file(),
                 PickKind::CustomImage => rfd::FileDialog::new().set_title("Choose the image").add_filter("PNG image", &["png"]).pick_file(),

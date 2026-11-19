@@ -36,6 +36,9 @@ struct Live {
     cs_ar_seen: (f32, f32),
     fps_count: u32,
     fps_since: Instant,
+    /// The skin editor was open on the last frame, and the gameplay was playing when it was opened.
+    was_in_skin: bool,
+    resume_after_skin: bool,
 }
 
 pub struct App {
@@ -127,7 +130,7 @@ impl ApplicationHandler for App {
         theme::install(&ctx);
         let egui_state = egui_winit::State::new(ctx.clone(), ViewportId::ROOT, &*window, Some(window.scale_factor() as f32), window.theme(), Some(device.limits().max_texture_dimension_2d as usize));
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
-        self.live = Some(Live { window, surface, config, device, queue, format, ctx, egui_state, egui_renderer, studio, session: None, rescale: None, last_resize: Instant::now(), last: Instant::now(), atlas_seen: 0, cs_ar_seen: (0.0, 0.0), fps_count: 0, fps_since: Instant::now() });
+        self.live = Some(Live { window, surface, config, device, queue, format, ctx, egui_state, egui_renderer, studio, session: None, rescale: None, last_resize: Instant::now(), last: Instant::now(), atlas_seen: 0, cs_ar_seen: (0.0, 0.0), fps_count: 0, fps_since: Instant::now(), was_in_skin: false, resume_after_skin: false });
         el.set_control_flow(ControlFlow::Poll);
         self.live.as_ref().unwrap().window.request_redraw();
     }
@@ -303,7 +306,20 @@ impl App {
             }
         };
         let view = frame.texture.create_view(&Default::default());
-        if let Some(s) = &mut l.session {
+        // the skin editor has no gameplay: it is held (and silent) while that half of the application is open, and goes on when it is left
+        let in_skin = l.studio.mode == crate::studio::Mode::Skin;
+        if in_skin != l.was_in_skin {
+            l.was_in_skin = in_skin;
+            if let Some(s) = &mut l.session {
+                if in_skin {
+                    l.resume_after_skin = s.playing;
+                    s.set_playing(false);
+                } else if l.resume_after_skin {
+                    s.set_playing(true);
+                }
+            }
+        }
+        if let Some(s) = l.session.as_mut().filter(|_| !in_skin) {
             s.advance(dt);
             if s.ended {
                 // the map has played out: a random one goes on to the next, a chosen one plays again

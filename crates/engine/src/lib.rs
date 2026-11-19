@@ -3,6 +3,7 @@
 pub mod analyze;
 pub mod atlas;
 pub mod deband;
+pub mod edit;
 pub mod gen;
 pub mod img;
 pub mod keys;

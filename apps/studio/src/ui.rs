@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::paths;
 use crate::state;
-use crate::studio::{PickKind, Studio, Tab, TABS};
+use crate::studio::{Mode, PickKind, Studio, Tab, TABS};
 use crate::theme::{self as th, pal::*, Kind};
 
 pub const PANEL_W: f32 = 470.0;
@@ -113,28 +113,36 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
             logo(ui, st);
             ui.add_space(16.0);
             ui.label(th::text("skin studio", 17.0, CONTENT1).family(th::bold()));
-            ui.add_space(22.0);
-            if th::button(ui, "New", Kind::Ghost, true).clicked() {
-                st.new_settings();
-            }
-            if th::button(ui, "Open", Kind::Ghost, true).clicked() {
-                st.pick(PickKind::OpenSettings);
-            }
-            if th::button(ui, "Save", Kind::Ghost, true).clicked() {
-                st.save();
-            }
-            if st.dirty {
-                // unsaved changes
-                let (d, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
-                ui.painter().circle_filled(d.center(), 3.5, Color32::from_rgb(0xff, 0xad, 0x4d));
-            }
-            ui.add_space(10.0);
-            if th::button(ui, "Export images", Kind::Accent, true).clicked() {
-                st.export();
+            ui.add_space(18.0);
+            mode_switch(ui, st);
+            ui.add_space(14.0);
+            if st.mode == Mode::Skin {
+                crate::skin_editor::toolbar(ui, st);
+            } else {
+                if th::button(ui, "New", Kind::Ghost, true).clicked() {
+                    st.new_settings();
+                }
+                if th::button(ui, "Open", Kind::Ghost, true).clicked() {
+                    st.pick(PickKind::OpenSettings);
+                }
+                if th::button(ui, "Save", Kind::Ghost, true).clicked() {
+                    st.save();
+                }
+                if st.dirty {
+                    // unsaved changes
+                    let (d, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+                    ui.painter().circle_filled(d.center(), 3.5, Color32::from_rgb(0xff, 0xad, 0x4d));
+                }
+                ui.add_space(10.0);
+                if th::button(ui, "Export images", Kind::Accent, true).clicked() {
+                    st.export();
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(16.0);
-                let msg = if let Some(p) = &st.path {
+                let msg = if st.mode == Mode::Skin {
+                    crate::skin_editor::title(st)
+                } else if let Some(p) = &st.path {
                     p.to_string_lossy().to_string()
                 } else {
                     "Unsaved settings".to_string()
@@ -144,6 +152,13 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
             });
         });
     });
+
+    // the skin editor has the rest of the window to itself: no gameplay, no motion editor
+    if st.mode == Mode::Skin {
+        crate::skin_editor::draw(root, st);
+        toast(root, st, root.max_rect());
+        return;
+    }
 
     // ---- settings overlay
     egui::Panel::left("settings").exact_size(PANEL_W).resizable(false).frame(egui::Frame::new().fill(BACKGROUND4).inner_margin(egui::Margin::ZERO)).show(root, |ui| {
@@ -226,26 +241,57 @@ pub fn draw(root: &mut Ui, st: &mut Studio, sv: &SessionView, out: &mut UiOut) {
 
 }
 
+/// Followpoints or Skin editor: the two halves of the application, as two tabs in the toolbar.
+fn mode_switch(ui: &mut Ui, st: &mut Studio) {
+    for (n, (m, label, tip)) in [(Mode::Followpoints, "Followpoints", "Make followpoint animations and see them on a map"), (Mode::Skin, "Skin editor", "Edit the pictures of a skin")].into_iter().enumerate() {
+        if n > 0 {
+            ui.add_space(12.0);
+        }
+        let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::new(15.0, th::semibold()), CONTENT1);
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 36.0, 34.0), Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
+        let on = st.mode == m;
+        if on {
+            ui.painter().rect_filled(r, CornerRadius::same(8), Color32::from_rgba_unmultiplied(HIGHLIGHT1.r(), HIGHLIGHT1.g(), HIGHLIGHT1.b(), 60));
+            ui.painter().rect_filled(Rect::from_min_size(Pos2::new(r.left() + 12.0, r.bottom() - 3.0), Vec2::new(r.width() - 24.0, 3.0)), CornerRadius::same(2), HIGHLIGHT1);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(r, CornerRadius::same(8), DARK2);
+        }
+        ui.painter().galley(r.center() - galley.size() * 0.5, galley, if on { CONTENT1 } else { LIGHT1 });
+        if resp.clicked() {
+            st.mode = m;
+        }
+    }
+    ui.add_space(8.0);
+    ui.painter().line_segment([Pos2::new(ui.cursor().left(), ui.max_rect().center().y - 12.0), Pos2::new(ui.cursor().left(), ui.max_rect().center().y + 12.0)], Stroke::new(1.0, Color32::from_white_alpha(20)));
+}
+
 /// The logo at the left of the toolbar. Pressing it plays the hit sound of the skin that is picked and the logo bounces: it jumps,
 /// lands squashed, and settles after a few smaller hops, with a ring of light spreading from it.
 fn logo(ui: &mut Ui, st: &mut Studio) {
-    if st.logo_tex.is_none() {
-        let mut dec = png::Decoder::new(std::io::Cursor::new(&include_bytes!("../assets/icon-256.png")[..]));
+    // The logo is made for the screen it is on: the 512 pixel picture is averaged down to just above the size it is shown at, so that
+    // the graphics card only has a little to shrink (a big picture squeezed by a small factor is what looks jagged)
+    let want = ((50.0 * ui.ctx().pixels_per_point()).round() as usize).clamp(24, 512);
+    if st.logo_tex.is_none() || st.logo_px != want {
+        let mut dec = png::Decoder::new(std::io::Cursor::new(&include_bytes!("../assets/icon-512.png")[..]));
         dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         if let Ok(mut r) = dec.read_info() {
             if let Some(len) = r.output_buffer_size() {
                 let mut buf = vec![0; len];
                 if let Ok(info) = r.next_frame(&mut buf) {
                     if info.color_type == png::ColorType::Rgba {
-                        let img = egui::ColorImage::from_rgba_unmultiplied([info.width as usize, info.height as usize], &buf[..(info.width * info.height * 4) as usize]);
+                        let big = engine::img::Img::from_straight_u8(info.width as usize, info.height as usize, &buf[..(info.width * info.height * 4) as usize]);
+                        let small = engine::edit::resize(&big, want, want, engine::edit::Resample::Smooth);
+                        let img = egui::ColorImage::from_rgba_premultiplied([want, want], &small.to_premult_u8());
                         st.logo_tex = Some(ui.ctx().load_texture("logo", img, egui::TextureOptions::LINEAR));
+                        st.logo_px = want;
                     }
                 }
             }
         }
     }
     let (slot, resp) = ui.allocate_exact_size(Vec2::new(56.0, 56.0), Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    // nothing says that it can be pressed: the cursor stays the ordinary one and the logo does not react to the pointer
     if resp.clicked() {
         st.logo_pressed = Some(std::time::Instant::now());
         let vol = st.effective_volume();
@@ -263,7 +309,7 @@ fn logo(ui: &mut Ui, st: &mut Studio) {
     }
     let since = st.logo_pressed.map(|t| t.elapsed().as_secs_f32());
     let (mut lift, mut sx, mut sy) = (0.0f32, 1.0f32, 1.0f32);
-    let hover = if resp.hovered() { 1.05 } else { 1.0 };
+    let hover = 1.0;
     if let Some(t) = since.filter(|t| *t < 1.4) {
         // hops that get lower and quicker to die out; at every landing the logo is squashed flat for a moment, in the air it is stretched
         let hop = (t * 9.0).sin().abs();

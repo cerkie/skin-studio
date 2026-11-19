@@ -3,6 +3,7 @@
 
 mod app;
 mod motion;
+mod skin_editor;
 mod paths;
 mod state;
 mod studio;

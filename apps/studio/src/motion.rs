@@ -1,4 +1,4 @@
-//! The motion editor: a dock under the view with a curve editor and a dope sheet for every property of the animation.
+//! The motion editor: a dock under the view with a curve editor and a keyframes view with every property of the animation.
 //!
 //! Everything is on the keyboard and the mouse at once:
 //!   - click a key to select it, shift-click to add to the selection, drag on empty space to box-select;
@@ -624,8 +624,8 @@ fn header(ui: &mut Ui, st: &mut Studio, head: Rect, total: f32, view: (f32, f32)
             st.motion.curves = true;
         }
     }
-    if let Some(r) = place(92.0) {
-        if pill(ui, r, "Dope sheet", !st.motion.curves, "See the keys of every property on one timeline") {
+    if let Some(r) = place(90.0) {
+        if pill(ui, r, "Keyframes", !st.motion.curves, "Every property's keyframes as bars on one time axis") {
             st.motion.curves = false;
         }
     }
@@ -1296,7 +1296,7 @@ fn tooltip(p: &egui::Painter, bounds: Rect, pos: Pos2, text: &str) {
     p.galley(rect.min + Vec2::new(7.0, 4.0), g, CONTENT1);
 }
 
-// -------------------------------------------------------------------------------------------------------- dope sheet
+// -------------------------------------------------------------------------------------------------------- keyframes view
 
 fn dope(ui: &mut Ui, c: &mut Ctx, bg: &egui::Response, tau: f32) {
     let p = ui.painter().clone();
