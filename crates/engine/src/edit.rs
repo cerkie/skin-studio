@@ -4,13 +4,17 @@
 //! list of [`Op`]s applied in order to the picture that was loaded ([`apply_all`]) and nothing is lost along the way until it is saved.
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::deband;
 use crate::restore;
 use crate::img::{self, Img};
 
+const PAR_THRESHOLD: usize = 8192;
+
 /// How a picture is resampled when it is resized. Making a picture smaller always averages the area each new pixel covers (nothing
 /// can ring or leave a halo that way); the choice matters when it is made larger.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Resample {
     /// Bilinear: smooth, never overshoots.
     Smooth,
@@ -31,7 +35,11 @@ impl Resample {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+fn default_deband_target() -> restore::Target {
+    restore::Target::Both
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     Resize { w: usize, h: usize, mode: Resample },
     Flip { horizontal: bool },
@@ -61,11 +69,11 @@ pub enum Op {
     /// be (in 8-bit levels) to still count as the same band; `iterations`: how many times it goes over the picture; `grain`: the spread of the
     /// noise that fills the steps in (8-bit levels), of the given `kind`, grey when `mono`; `room`: give a glow that the picture cuts off
     /// the room to fade out.
-    Deband { radius: f32, threshold: f32, iterations: usize, grain: f32, kind: Grain, mono: bool, room: bool, luma: restore::LumaScale, limit: f32, elast: f32, narrowing: bool, prefilter: f32, protect: restore::Mask, adv: deband::Advanced },
+    Deband { radius: f32, threshold: f32, iterations: usize, grain: f32, kind: Grain, mono: bool, room: bool, luma: restore::LumaScale, limit: f32, elast: f32, narrowing: bool, prefilter: f32, protect: restore::Mask, adv: deband::Advanced, #[serde(default = "default_deband_target")] target: restore::Target },
 }
 
 /// What a border that is added is filled with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Fill {
     /// Empty (transparent).
     Clear,
@@ -92,7 +100,7 @@ impl Op {
     /// A deband made from the single slider of the first version: from a light touch (0) to a heavy one (1), with `grain` levels of uniform noise.
     pub fn deband(strength: f32, grain: f32) -> Op {
         let s = strength.clamp(0.0, 1.0);
-        Op::Deband { radius: 8.0 + 80.0 * s, threshold: 2.0 + 8.0 * s, iterations: 1 + (5.0 * s).round() as usize, grain, kind: if grain > 0.0 { Grain::Uniform } else { Grain::None }, mono: false, room: true, luma: restore::LumaScale::off(), limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: restore::Mask { invert: true, ..restore::Mask::off() }, adv: deband::Advanced::default() }
+        Op::Deband { radius: 8.0 + 80.0 * s, threshold: 2.0 + 8.0 * s, iterations: 1 + (5.0 * s).round() as usize, grain, kind: if grain > 0.0 { Grain::Uniform } else { Grain::None }, mono: false, room: true, luma: restore::LumaScale::off(), limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: restore::Mask { invert: true, ..restore::Mask::off() }, adv: deband::Advanced::default(), target: restore::Target::Both }
     }
 
     pub fn name(&self) -> &'static str {
@@ -102,7 +110,7 @@ impl Op {
             Op::Rotate { .. } => "Rotate",
             Op::Crop { .. } => "Crop",
             Op::Trim { .. } => "Trim empty border",
-            Op::Adjust { .. } => "Colour",
+            Op::Adjust { .. } => "Color",
             Op::Tint { .. } => "Tint",
             Op::Opacity { .. } => "Opacity",
             Op::Invert => "Invert",
@@ -143,29 +151,33 @@ pub fn apply(src: &Img, op: &Op) -> Img {
         Op::Dehalo(o) => restore::dehalo(src, o),
         Op::Denoise(o) => restore::denoise(src, o),
         Op::AntiAlias(o) => restore::antialias(src, o),
-        Op::Deband { radius, threshold, iterations, grain, kind, mono, room, luma, limit, elast, narrowing, prefilter, protect, adv } => {
-            let p = deband::Params { radius: *radius, thr_rgb: *threshold, thr_a: *threshold, iterations: (*iterations).clamp(1, 12), grain: *grain, kind: *kind, mono: *mono, quantize: false, limit: *limit, elast: *elast, narrowing: *narrowing, adv: *adv };
-            let base = if *room { room_for_the_fade(src) } else { src.clone() };
+        Op::Deband { radius, threshold, iterations, grain, kind, mono, room, luma, limit, elast, narrowing, prefilter, protect, adv, target } => {
+            let thr_rgb = if *target != restore::Target::Alpha { *threshold } else { 0.0 };
+            let thr_a = if *target != restore::Target::Colour { *threshold } else { 0.0 };
+            let p = deband::Params { radius: *radius, thr_rgb, thr_a, iterations: (*iterations).clamp(1, 12), grain: *grain, kind: *kind, mono: *mono, quantize: false, limit: *limit, elast: *elast, narrowing: *narrowing, adv: *adv };
+            let padded: Option<Img> = if *room { room_for_the_fade(src) } else { None };
+            let base: &Img = padded.as_ref().unwrap_or(src);
             if protect.show {
-                return restore::mask_image(&base, protect);
+                return restore::mask_image(base, protect);
             }
             // pfdeband: the banding is looked for in a slightly blurred copy (noise would hide it), and what the blur took away is put back
-            let work = if *prefilter > 0.05 { img::blur(&base, *prefilter) } else { base.clone() };
-            let mut out = deband::deband(&work, &p);
-            if *prefilter > 0.05 {
-                for ((o, b), w) in out.px.iter_mut().zip(&base.px).zip(&work.px) {
+            let blurred: Option<Img> = (*prefilter > 0.05).then(|| img::blur(base, *prefilter));
+            let work: &Img = blurred.as_ref().unwrap_or(base);
+            let mut out = deband::deband(work, &p);
+            if let Some(ref w_img) = blurred {
+                out.px.par_iter_mut().zip(base.px.par_iter()).zip(w_img.px.par_iter()).for_each(|((o, b), w)| {
                     let a = (o[3] + b[3] - w[3]).clamp(0.0, 1.0);
                     *o = [(o[0] + b[0] - w[0]).clamp(0.0, a), (o[1] + b[1] - w[1]).clamp(0.0, a), (o[2] + b[2] - w[2]).clamp(0.0, a), a];
-                }
+                });
             }
             if luma.scaling == 0.0 && !protect.enabled {
                 out
             } else {
                 // the dark parts get all of it and the light ones hardly any; the mask keeps it off edges and details
-                let lw = restore::luma_weights(&base, luma);
-                let mw = restore::mask_weights(&base, protect);
-                let w: Vec<f32> = lw.iter().zip(&mw).map(|(a, b)| a * b).collect();
-                restore::merge_weighted(&base, &out, &w)
+                let lw = restore::luma_weights(base, luma);
+                let mw = restore::mask_weights(base, protect);
+                let w: Vec<f32> = lw.par_iter().zip(mw.par_iter()).map(|(a, b)| a * b).collect();
+                restore::merge_weighted(base, &out, &w)
             }
         }
     }
@@ -206,10 +218,11 @@ fn expand(src: &Img, amount: usize, fill: Fill) -> Img {
 
 /// A soft glow that is cut off by the edge of its picture (something is still visible at the border) cannot be smoothed to nothing: the
 /// cut stays as a hard square. Such a picture is given room on all four sides (so it stays centred) and what is at the border fades out over it.
-fn room_for_the_fade(src: &Img) -> Img {
+/// Returns `None` when no padding is needed so the caller can borrow `src` without cloning.
+fn room_for_the_fade(src: &Img) -> Option<Img> {
     let (w, h) = (src.w, src.h);
     if w == 0 || h == 0 {
-        return src.clone();
+        return None;
     }
     let (mut edge, mut sum, mut n) = (0.0f32, 0.0f32, 0usize);
     let mut see = |a: f32| {
@@ -227,22 +240,34 @@ fn room_for_the_fade(src: &Img) -> Img {
     }
     // a picture that is solid at its border (a photo, a panel) is not a glow and keeps its size
     if edge * 255.0 < 1.5 || sum / n as f32 > 0.9 {
-        return src.clone();
+        return None;
     }
     let pad = ((w.max(h) as f32 * 0.15).round() as usize).clamp(16, 96);
     let (nw, nh) = (w + 2 * pad, h + 2 * pad);
     let mut out = Img::new(nw, nh);
-    for y in 0..nh {
-        for x in 0..nw {
-            let (ix, iy) = (x as i64 - pad as i64, y as i64 - pad as i64);
-            let (cx, cy) = (ix.clamp(0, w as i64 - 1), iy.clamp(0, h as i64 - 1));
-            let q = src.px[cy as usize * w + cx as usize];
-            let d = (((ix - cx) * (ix - cx) + (iy - cy) * (iy - cy)) as f32).sqrt();
-            let k = if d == 0.0 { 1.0 } else { 0.5 * (1.0 + (std::f32::consts::PI * (d / pad as f32).min(1.0)).cos()) };
-            out.px[y * nw + x] = [q[0] * k, q[1] * k, q[2] * k, q[3] * k];
+    let pad_i = pad as i64;
+    let inv_pad = 1.0 / pad as f32;
+    out.px.par_chunks_mut(nw).enumerate().for_each(|(y, row_out)| {
+        let iy = y as i64 - pad_i;
+        let cy = iy.clamp(0, h as i64 - 1) as usize;
+        let dy = iy - cy as i64;
+        if dy == 0 {
+            row_out[pad..pad + w].copy_from_slice(&src.px[cy * w..(cy + 1) * w]);
         }
-    }
-    out
+        for (x, dst) in row_out.iter_mut().enumerate() {
+            let ix = x as i64 - pad_i;
+            if dy == 0 && ix >= 0 && (ix as usize) < w {
+                continue;
+            }
+            let cx = ix.clamp(0, w as i64 - 1) as usize;
+            let q = src.px[cy * w + cx];
+            let dx = ix - cx as i64;
+            let d = ((dx * dx + dy * dy) as f32).sqrt();
+            let k = if d == 0.0 { 1.0 } else { 0.5 * (1.0 + (std::f32::consts::PI * (d * inv_pad).min(1.0)).cos()) };
+            *dst = [q[0] * k, q[1] * k, q[2] * k, q[3] * k];
+        }
+    });
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------------------------------------------- geometry
@@ -254,69 +279,129 @@ pub fn resize(src: &Img, w: usize, h: usize, mode: Resample) -> Img {
     }
     if mode == Resample::Pixels {
         let mut out = Img::new(w, h);
-        for y in 0..h {
+        let sx_lut: Vec<usize> = (0..w).map(|x| (x * src.w / w).min(src.w - 1)).collect();
+        let row_fn = |(y, row_out): (usize, &mut [[f32; 4]])| {
             let sy = (y * src.h / h).min(src.h - 1);
-            for x in 0..w {
-                out.px[y * w + x] = src.px[sy * src.w + (x * src.w / w).min(src.w - 1)];
+            let row_in = &src.px[sy * src.w..(sy + 1) * src.w];
+            for (dst, &sx) in row_out.iter_mut().zip(&sx_lut) {
+                *dst = row_in[sx];
             }
+        };
+        if w * h >= PAR_THRESHOLD {
+            out.px.par_chunks_mut(w).enumerate().for_each(row_fn);
+        } else {
+            out.px.chunks_mut(w).enumerate().for_each(row_fn);
         }
         return out;
     }
     // an axis that gets smaller is averaged exactly, then an axis that gets larger is interpolated
-    let mut cur = src.clone();
-    if w < cur.w {
-        cur = img::resize_area(&cur, w, cur.h);
+    let (dw, dh) = (w.min(src.w), h.min(src.h));
+    if (dw, dh) == (w, h) {
+        return img::resize_area(src, dw, dh);
     }
-    if h < cur.h {
-        cur = img::resize_area(&cur, cur.w, h);
+    if (dw, dh) != (src.w, src.h) {
+        let shrunk = img::resize_area(src, dw, dh);
+        return upscale(&shrunk, w, h, mode);
     }
-    if (cur.w, cur.h) == (w, h) {
-        return cur;
-    }
-    upscale(&cur, w, h, mode)
-}
-
-fn clamp_px(img: &Img, x: i64, y: i64) -> [f32; 4] {
-    img.px[(y.clamp(0, img.h as i64 - 1) as usize) * img.w + x.clamp(0, img.w as i64 - 1) as usize]
+    upscale(src, w, h, mode)
 }
 
 /// Interpolate onto a larger grid (an axis that does not grow is passed through). Edges repeat the outermost pixel.
 fn upscale(src: &Img, w: usize, h: usize, mode: Resample) -> Img {
     let (kx, ky) = (src.w as f32 / w as f32, src.h as f32 / h as f32);
+    let (sw_i, sh_i) = (src.w as i64 - 1, src.h as i64 - 1);
     let mut out = Img::new(w, h);
-    for y in 0..h {
-        let v = (y as f32 + 0.5) * ky - 0.5;
-        let (iy, ty) = (v.floor(), v - v.floor());
-        for x in 0..w {
-            let u = (x as f32 + 0.5) * kx - 0.5;
-            let (ix, tx) = (u.floor(), u - u.floor());
-            let (ix, iy_) = (ix as i64, iy as i64);
-            out.px[y * w + x] = match mode {
-                Resample::Crisp => {
-                    let (wx, wy) = (catmull(tx), catmull(ty));
-                    let mut acc = [0.0f32; 4];
-                    for (j, wyj) in wy.iter().enumerate() {
-                        for (i, wxi) in wx.iter().enumerate() {
-                            let p = clamp_px(src, ix + i as i64 - 1, iy_ + j as i64 - 1);
-                            for c in 0..4 {
-                                acc[c] += p[c] * wxi * wyj;
-                            }
-                        }
-                    }
+    let par = w * h >= PAR_THRESHOLD;
+
+    if mode == Resample::Crisp {
+        let x_taps: Vec<([usize; 4], [f32; 4])> = (0..w)
+            .map(|x| {
+                let u = (x as f32 + 0.5) * kx - 0.5;
+                let ix = u.floor();
+                let tx = u - ix;
+                let ix = ix as i64;
+                let cols = [
+                    (ix - 1).clamp(0, sw_i) as usize,
+                    ix.clamp(0, sw_i) as usize,
+                    (ix + 1).clamp(0, sw_i) as usize,
+                    (ix + 2).clamp(0, sw_i) as usize,
+                ];
+                (cols, catmull(tx))
+            })
+            .collect();
+        let row_fn = |(y, row_out): (usize, &mut [[f32; 4]])| {
+            let v = (y as f32 + 0.5) * ky - 0.5;
+            let iy = v.floor();
+            let ty = v - iy;
+            let iy = iy as i64;
+            let wy = catmull(ty);
+            let r0 = &src.px[(iy - 1).clamp(0, sh_i) as usize * src.w..((iy - 1).clamp(0, sh_i) as usize + 1) * src.w];
+            let r1 = &src.px[iy.clamp(0, sh_i) as usize * src.w..(iy.clamp(0, sh_i) as usize + 1) * src.w];
+            let r2 = &src.px[(iy + 1).clamp(0, sh_i) as usize * src.w..((iy + 1).clamp(0, sh_i) as usize + 1) * src.w];
+            let r3 = &src.px[(iy + 2).clamp(0, sh_i) as usize * src.w..((iy + 2).clamp(0, sh_i) as usize + 1) * src.w];
+            for (dst, &(cols, wx)) in row_out.iter_mut().zip(&x_taps) {
+                let p00 = r0[cols[0]]; let p01 = r0[cols[1]]; let p02 = r0[cols[2]]; let p03 = r0[cols[3]];
+                let p10 = r1[cols[0]]; let p11 = r1[cols[1]]; let p12 = r1[cols[2]]; let p13 = r1[cols[3]];
+                let p20 = r2[cols[0]]; let p21 = r2[cols[1]]; let p22 = r2[cols[2]]; let p23 = r2[cols[3]];
+                let p30 = r3[cols[0]]; let p31 = r3[cols[1]]; let p32 = r3[cols[2]]; let p33 = r3[cols[3]];
+                let mut acc = [0.0f32; 4];
+                for c in 0..4 {
+                    let s0 = p00[c] * wx[0] + p01[c] * wx[1] + p02[c] * wx[2] + p03[c] * wx[3];
+                    let s1 = p10[c] * wx[0] + p11[c] * wx[1] + p12[c] * wx[2] + p13[c] * wx[3];
+                    let s2 = p20[c] * wx[0] + p21[c] * wx[1] + p22[c] * wx[2] + p23[c] * wx[3];
+                    let s3 = p30[c] * wx[0] + p31[c] * wx[1] + p32[c] * wx[2] + p33[c] * wx[3];
+                    let val = s0 * wy[0] + s1 * wy[1] + s2 * wy[2] + s3 * wy[3];
                     // never beyond the four pixels the new one lies between: that is what rings are made of
-                    let near = [clamp_px(src, ix, iy_), clamp_px(src, ix + 1, iy_), clamp_px(src, ix, iy_ + 1), clamp_px(src, ix + 1, iy_ + 1)];
-                    for c in 0..4 {
-                        let lo = near.iter().fold(f32::MAX, |m, p| m.min(p[c]));
-                        let hi = near.iter().fold(f32::MIN, |m, p| m.max(p[c]));
-                        acc[c] = acc[c].clamp(lo, hi);
-                    }
-                    acc
+                    let lo = p11[c].min(p12[c]).min(p21[c]).min(p22[c]);
+                    let hi = p11[c].max(p12[c]).max(p21[c]).max(p22[c]);
+                    acc[c] = val.clamp(lo, hi);
                 }
-                _ => {
-                    let (a, b, c, d) = (clamp_px(src, ix, iy_), clamp_px(src, ix + 1, iy_), clamp_px(src, ix, iy_ + 1), clamp_px(src, ix + 1, iy_ + 1));
-                    std::array::from_fn(|k| (a[k] * (1.0 - tx) + b[k] * tx) * (1.0 - ty) + (c[k] * (1.0 - tx) + d[k] * tx) * ty)
-                }
-            };
+                *dst = acc;
+            }
+        };
+        if par {
+            out.px.par_chunks_mut(w).enumerate().for_each(row_fn);
+        } else {
+            out.px.chunks_mut(w).enumerate().for_each(row_fn);
+        }
+    } else {
+        let x_taps: Vec<(usize, usize, f32)> = (0..w)
+            .map(|x| {
+                let u = (x as f32 + 0.5) * kx - 0.5;
+                let ix = u.floor();
+                let tx = u - ix;
+                let ix = ix as i64;
+                (ix.clamp(0, sw_i) as usize, (ix + 1).clamp(0, sw_i) as usize, tx)
+            })
+            .collect();
+        let row_fn = |(y, row_out): (usize, &mut [[f32; 4]])| {
+            let v = (y as f32 + 0.5) * ky - 0.5;
+            let iy = v.floor();
+            let ty = v - iy;
+            let iy = iy as i64;
+            let y0 = iy.clamp(0, sh_i) as usize;
+            let y1 = (iy + 1).clamp(0, sh_i) as usize;
+            let r0 = &src.px[y0 * src.w..(y0 + 1) * src.w];
+            let r1 = &src.px[y1 * src.w..(y1 + 1) * src.w];
+            let ity = 1.0 - ty;
+            for (dst, &(x0, x1, tx)) in row_out.iter_mut().zip(&x_taps) {
+                let a = r0[x0];
+                let b = r0[x1];
+                let c = r1[x0];
+                let d = r1[x1];
+                let itx = 1.0 - tx;
+                *dst = [
+                    (a[0] * itx + b[0] * tx) * ity + (c[0] * itx + d[0] * tx) * ty,
+                    (a[1] * itx + b[1] * tx) * ity + (c[1] * itx + d[1] * tx) * ty,
+                    (a[2] * itx + b[2] * tx) * ity + (c[2] * itx + d[2] * tx) * ty,
+                    (a[3] * itx + b[3] * tx) * ity + (c[3] * itx + d[3] * tx) * ty,
+                ];
+            }
+        };
+        if par {
+            out.px.par_chunks_mut(w).enumerate().for_each(row_fn);
+        } else {
+            out.px.chunks_mut(w).enumerate().for_each(row_fn);
         }
     }
     out
@@ -328,36 +413,83 @@ fn catmull(t: f32) -> [f32; 4] {
 }
 
 pub fn flip(src: &Img, horizontal: bool) -> Img {
-    let mut out = Img::new(src.w, src.h);
-    for y in 0..src.h {
-        for x in 0..src.w {
-            let (sx, sy) = if horizontal { (src.w - 1 - x, y) } else { (x, src.h - 1 - y) };
-            out.px[y * src.w + x] = src.px[sy * src.w + sx];
+    if src.w == 0 || src.h == 0 {
+        return src.clone();
+    }
+    let (w, h) = (src.w, src.h);
+    let mut out = Img::new(w, h);
+    let row_fn = |(y, row_out): (usize, &mut [[f32; 4]])| {
+        if horizontal {
+            let row_in = &src.px[y * w..(y + 1) * w];
+            for (dst, &p) in row_out.iter_mut().zip(row_in.iter().rev()) {
+                *dst = p;
+            }
+        } else {
+            let sy = h - 1 - y;
+            row_out.copy_from_slice(&src.px[sy * w..(sy + 1) * w]);
         }
+    };
+    if w * h >= PAR_THRESHOLD {
+        out.px.par_chunks_mut(w).enumerate().for_each(row_fn);
+    } else {
+        out.px.chunks_mut(w).enumerate().for_each(row_fn);
     }
     out
 }
 
 pub fn rotate(src: &Img, quarter_turns: u8) -> Img {
+    if src.w == 0 || src.h == 0 {
+        return src.clone();
+    }
+    let (w, h) = (src.w, src.h);
+    let par = w * h >= PAR_THRESHOLD;
     match quarter_turns % 4 {
         0 => src.clone(),
         1 => {
-            // clockwise: the left column becomes the top row
-            let mut out = Img::new(src.h, src.w);
-            for y in 0..src.h {
-                for x in 0..src.w {
-                    out.px[x * src.h + (src.h - 1 - y)] = src.px[y * src.w + x];
+            // clockwise: destination row `dy` (0..w) reads source column `x = dy` from bottom to top
+            let mut out = Img::new(h, w);
+            let row_fn = |(dy, row_out): (usize, &mut [[f32; 4]])| {
+                for (dx, dst) in row_out.iter_mut().enumerate() {
+                    let sy = h - 1 - dx;
+                    *dst = src.px[sy * w + dy];
                 }
+            };
+            if par {
+                out.px.par_chunks_mut(h).enumerate().for_each(row_fn);
+            } else {
+                out.px.chunks_mut(h).enumerate().for_each(row_fn);
             }
             out
         }
-        2 => flip(&flip(src, true), false),
-        _ => {
-            let mut out = Img::new(src.h, src.w);
-            for y in 0..src.h {
-                for x in 0..src.w {
-                    out.px[(src.w - 1 - x) * src.h + y] = src.px[y * src.w + x];
+        2 => {
+            let mut out = Img::new(w, h);
+            let row_fn = |(y, row_out): (usize, &mut [[f32; 4]])| {
+                let sy = h - 1 - y;
+                let row_in = &src.px[sy * w..(sy + 1) * w];
+                for (dst, &p) in row_out.iter_mut().zip(row_in.iter().rev()) {
+                    *dst = p;
                 }
+            };
+            if par {
+                out.px.par_chunks_mut(w).enumerate().for_each(row_fn);
+            } else {
+                out.px.chunks_mut(w).enumerate().for_each(row_fn);
+            }
+            out
+        }
+        _ => {
+            // counter-clockwise: destination row `dy` (0..w) reads source column `x = w - 1 - dy` from top to bottom
+            let mut out = Img::new(h, w);
+            let row_fn = |(dy, row_out): (usize, &mut [[f32; 4]])| {
+                let sx = w - 1 - dy;
+                for (dx, dst) in row_out.iter_mut().enumerate() {
+                    *dst = src.px[dx * w + sx];
+                }
+            };
+            if par {
+                out.px.par_chunks_mut(h).enumerate().for_each(row_fn);
+            } else {
+                out.px.chunks_mut(h).enumerate().for_each(row_fn);
             }
             out
         }
@@ -401,16 +533,25 @@ pub fn trim(src: &Img, threshold: f32) -> Img {
 
 // ---------------------------------------------------------------------------------------------------------------- colour
 /// Change the colour of every pixel on its straight (not premultiplied) colour; `f` gets the colour and the alpha.
-fn map_straight(src: &Img, f: impl Fn([f32; 3], f32) -> ([f32; 3], f32)) -> Img {
-    let mut out = src.clone();
-    for p in &mut out.px {
+fn map_straight(src: &Img, f: impl Fn([f32; 3], f32) -> ([f32; 3], f32) + Sync) -> Img {
+    let map_px = |p: &[f32; 4]| {
         let a = p[3];
-        let c = if a > 1e-6 { [p[0] / a, p[1] / a, p[2] / a] } else { [0.0; 3] };
+        let c = if a > 1e-6 {
+            let inv = 1.0 / a;
+            [p[0] * inv, p[1] * inv, p[2] * inv]
+        } else {
+            [0.0; 3]
+        };
         let (c, a) = f(c, a);
         let a = a.clamp(0.0, 1.0);
-        *p = [c[0].clamp(0.0, 1.0) * a, c[1].clamp(0.0, 1.0) * a, c[2].clamp(0.0, 1.0) * a, a];
-    }
-    out
+        [c[0].clamp(0.0, 1.0) * a, c[1].clamp(0.0, 1.0) * a, c[2].clamp(0.0, 1.0) * a, a]
+    };
+    let px = if src.px.len() >= PAR_THRESHOLD {
+        src.px.par_iter().map(map_px).collect()
+    } else {
+        src.px.iter().map(map_px).collect()
+    };
+    Img { w: src.w, h: src.h, px }
 }
 
 pub fn adjust(src: &Img, brightness: f32, contrast: f32, saturation: f32, hue: f32) -> Img {
@@ -435,31 +576,46 @@ pub fn adjust(src: &Img, brightness: f32, contrast: f32, saturation: f32, hue: f
 
 /// Unsharp mask with the result held between the smallest and the largest value of the 3x3 pixels around each one.
 pub fn sharpen(src: &Img, amount: f32, sigma: f32) -> Img {
-    if amount == 0.0 {
+    if amount == 0.0 || src.w == 0 || src.h == 0 {
         return src.clone();
     }
     let soft = img::blur(src, sigma.max(0.1));
-    let mut out = src.clone();
-    for y in 0..src.h {
-        for x in 0..src.w {
-            let (mut lo, mut hi) = ([f32::MAX; 4], [f32::MIN; 4]);
-            for dy in -1i64..=1 {
-                for dx in -1i64..=1 {
-                    let p = clamp_px(src, x as i64 + dx, y as i64 + dy);
-                    for c in 0..4 {
-                        lo[c] = lo[c].min(p[c]);
-                        hi[c] = hi[c].max(p[c]);
-                    }
+    let (w, h) = (src.w, src.h);
+    let mut out = Img::new(w, h);
+    let row_fn = |(y, row_out): (usize, &mut [[f32; 4]])| {
+        let ym = y.saturating_sub(1);
+        let yp = (y + 1).min(h - 1);
+        let r_up = &src.px[ym * w..(ym + 1) * w];
+        let r_mid = &src.px[y * w..(y + 1) * w];
+        let r_dn = &src.px[yp * w..(yp + 1) * w];
+        let r_soft = &soft.px[y * w..(y + 1) * w];
+        for (x, dst) in row_out.iter_mut().enumerate() {
+            let xm = x.saturating_sub(1);
+            let xp = (x + 1).min(w - 1);
+            let ps = [r_up[xm], r_up[x], r_up[xp], r_mid[xm], r_mid[x], r_mid[xp], r_dn[xm], r_dn[x], r_dn[xp]];
+            let s = r_mid[x];
+            let b = r_soft[x];
+            let mut v = [0.0f32; 4];
+            for c in 0..4 {
+                let mut lo = ps[0][c];
+                let mut hi = ps[0][c];
+                for p in &ps[1..] {
+                    lo = lo.min(p[c]);
+                    hi = hi.max(p[c]);
                 }
+                v[c] = (s[c] + amount * (s[c] - b[c])).clamp(lo, hi);
             }
-            let (s, b) = (src.px[y * src.w + x], soft.px[y * src.w + x]);
-            let mut v: [f32; 4] = std::array::from_fn(|c| (s[c] + amount * (s[c] - b[c])).clamp(lo[c], hi[c]));
             // a premultiplied colour never exceeds its alpha
-            for c in 0..3 {
-                v[c] = v[c].min(v[3]);
-            }
-            out.px[y * src.w + x] = v;
+            v[0] = v[0].min(v[3]);
+            v[1] = v[1].min(v[3]);
+            v[2] = v[2].min(v[3]);
+            *dst = v;
         }
+    };
+    if w * h >= PAR_THRESHOLD {
+        out.px.par_chunks_mut(w).enumerate().for_each(row_fn);
+    } else {
+        out.px.chunks_mut(w).enumerate().for_each(row_fn);
     }
     out
 }
@@ -536,29 +692,36 @@ impl Default for Output {
     }
 }
 
-/// Straight 8-bit RGBA of a picture. Rounded, with dither if asked: a value within a thousandth of a level of a whole level is rounded
-/// to it, so that an untouched picture comes back exactly as it was loaded.
+/// Straight 8-bit RGBA of a picture (parallelized per row with rayon). Rounded, with dither if asked: a value within a
+/// thousandth of a level of a whole level is rounded to it, so that an untouched picture comes back exactly as it was loaded.
 pub fn to_rgba8_with(img: &Img, dither: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(img.px.len() * 4);
     let w = img.w.max(1);
-    for (i, p) in img.px.iter().enumerate() {
-        let (x, y) = (i % w, i / w);
-        let a = p[3];
-        let c = if a > 1e-6 { [p[0] / a, p[1] / a, p[2] / a] } else { [0.0; 3] };
-        for (k, v) in [c[0], c[1], c[2], a].into_iter().enumerate() {
-            let lv = v.clamp(0.0, 1.0) * 255.0;
-            let near = lv.round();
-            let q = if !dither || (lv - near).abs() < 1e-3 || lv <= 0.25 || lv >= 254.75 {
-                near
+    let mut out = vec![0u8; img.px.len() * 4];
+    out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row_out)| {
+        let row_px = &img.px[y * w..(y * w + row_out.len() / 4)];
+        for (x, p) in row_px.iter().enumerate() {
+            let a = p[3];
+            let c = if a > 1e-6 {
+                let inv = 1.0 / a;
+                [p[0] * inv, p[1] * inv, p[2] * inv]
             } else {
-                // interleaved gradient noise, a different offset for each channel
-                let (ox, oy) = (k as f32 * 41.0 + 5.0, k as f32 * 13.0 + 3.0);
-                let t = (0.06711056 * (x as f32 + ox) + 0.00583715 * (y as f32 + oy)).fract();
-                (lv + (52.9829189 * t).fract()).floor()
+                [0.0; 3]
             };
-            out.push(q.clamp(0.0, 255.0) as u8);
+            let o = x * 4;
+            for (k, v) in [c[0], c[1], c[2], a].into_iter().enumerate() {
+                let lv = v.clamp(0.0, 1.0) * 255.0;
+                let near = lv.round();
+                let q = if !dither || (lv - near).abs() < 1e-3 || lv <= 0.25 || lv >= 254.75 {
+                    near
+                } else {
+                    let (ox, oy) = (k as f32 * 41.0 + 5.0, k as f32 * 13.0 + 3.0);
+                    let t = (0.06711056 * (x as f32 + ox) + 0.00583715 * (y as f32 + oy)).fract();
+                    (lv + (52.9829189 * t).fract()).floor()
+                };
+                row_out[o + k] = q.clamp(0.0, 255.0) as u8;
+            }
         }
-    }
+    });
     out
 }
 
@@ -567,16 +730,66 @@ pub fn to_rgba8(img: &Img) -> Vec<u8> {
     to_rgba8_with(img, false)
 }
 
+/// Same quantization and dither as [`to_rgba8_with`], premultiplied in-place in the same parallel pass for screen display.
+pub fn to_display_rgba8_with(img: &Img, dither: bool) -> Vec<u8> {
+    let w = img.w.max(1);
+    let mut out = vec![0u8; img.px.len() * 4];
+    out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row_out)| {
+        let row_px = &img.px[y * w..(y * w + row_out.len() / 4)];
+        for (x, p) in row_px.iter().enumerate() {
+            let a = p[3];
+            let c = if a > 1e-6 {
+                let inv = 1.0 / a;
+                [p[0] * inv, p[1] * inv, p[2] * inv]
+            } else {
+                [0.0; 3]
+            };
+            let mut q8 = [0u8; 4];
+            for (k, v) in [c[0], c[1], c[2], a].into_iter().enumerate() {
+                let lv = v.clamp(0.0, 1.0) * 255.0;
+                let near = lv.round();
+                let q = if !dither || (lv - near).abs() < 1e-3 || lv <= 0.25 || lv >= 254.75 {
+                    near
+                } else {
+                    let (ox, oy) = (k as f32 * 41.0 + 5.0, k as f32 * 13.0 + 3.0);
+                    let t = (0.06711056 * (x as f32 + ox) + 0.00583715 * (y as f32 + oy)).fract();
+                    (lv + (52.9829189 * t).fract()).floor()
+                };
+                q8[k] = q.clamp(0.0, 255.0) as u8;
+            }
+            let a_u = q8[3] as u32;
+            let o = x * 4;
+            row_out[o] = ((q8[0] as u32 * a_u + 127) / 255) as u8;
+            row_out[o + 1] = ((q8[1] as u32 * a_u + 127) / 255) as u8;
+            row_out[o + 2] = ((q8[2] as u32 * a_u + 127) / 255) as u8;
+            row_out[o + 3] = q8[3];
+        }
+    });
+    out
+}
+
 /// Straight 16-bit RGBA, big-endian as a PNG stores it.
 pub fn to_rgba16(img: &Img) -> Vec<u8> {
-    let mut out = Vec::with_capacity(img.px.len() * 8);
-    for p in &img.px {
-        let a = p[3];
-        let c = if a > 1e-9 { [p[0] / a, p[1] / a, p[2] / a] } else { [0.0; 3] };
-        for v in [c[0], c[1], c[2], a] {
-            out.extend_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_be_bytes());
+    let w = img.w.max(1);
+    let mut out = vec![0u8; img.px.len() * 8];
+    out.par_chunks_mut(w * 8).enumerate().for_each(|(y, row_out)| {
+        let row_px = &img.px[y * w..(y * w + row_out.len() / 8)];
+        for (x, p) in row_px.iter().enumerate() {
+            let a = p[3];
+            let c = if a > 1e-9 {
+                let inv = 1.0 / a;
+                [p[0] * inv, p[1] * inv, p[2] * inv]
+            } else {
+                [0.0; 3]
+            };
+            let o = x * 8;
+            for (k, v) in [c[0], c[1], c[2], a].into_iter().enumerate() {
+                let b = ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_be_bytes();
+                row_out[o + k * 2] = b[0];
+                row_out[o + k * 2 + 1] = b[1];
+            }
         }
-    }
+    });
     out
 }
 
@@ -933,11 +1146,11 @@ mod deband_pictures {
                 save_png(&dir.join(format!("out{}.png", (s * 10.0) as i32)), &apply(&im, &Op::deband(s, 0.0))).unwrap();
             }
             let mk = |pre: f32, limit: f32, name: &str| {
-                let op = Op::Deband { radius: 64.0, threshold: 8.0, iterations: 4, grain: 0.0, kind: Grain::None, mono: true, room: false, luma: restore::LumaScale::off(), limit, elast: 3.0, narrowing: false, prefilter: pre, protect: restore::Mask::off(), adv: deband::Advanced::default() };
+                let op = Op::Deband { radius: 64.0, threshold: 8.0, iterations: 4, grain: 0.0, kind: Grain::None, mono: true, room: false, luma: restore::LumaScale::off(), limit, elast: 3.0, narrowing: false, prefilter: pre, protect: restore::Mask::off(), adv: deband::Advanced::default(), target: restore::Target::Both };
                 save_png(&dir.join(name), &apply(&im, &op)).unwrap();
             };
             let mm = |mode: deband::Mode, thr1: f32, thr2: f32, name: &str| {
-                let op = Op::Deband { radius: 64.0, threshold: 4.0, iterations: 4, grain: 0.0, kind: Grain::None, mono: true, room: false, luma: restore::LumaScale::off(), limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: restore::Mask::off(), adv: deband::Advanced { mode, thr1, thr2, ..deband::Advanced::default() } };
+                let op = Op::Deband { radius: 64.0, threshold: 4.0, iterations: 4, grain: 0.0, kind: Grain::None, mono: true, room: false, luma: restore::LumaScale::off(), limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: restore::Mask::off(), adv: deband::Advanced { mode, thr1, thr2, ..deband::Advanced::default() }, target: restore::Target::Both };
                 let t = std::time::Instant::now();
                 save_png(&dir.join(name), &apply(&im, &op)).unwrap();
                 eprintln!("{name}: {:?}", t.elapsed());
@@ -1045,7 +1258,7 @@ mod expand_tests {
             im
         };
         let luma = restore::LumaScale { scaling: 6.0, by_average: false };
-        let go = |im: &Img, l: restore::LumaScale| apply(im, &Op::Deband { radius: 40.0, threshold: 4.0, iterations: 3, grain: 0.0, kind: Grain::None, mono: true, room: false, luma: l, limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: restore::Mask::off(), adv: deband::Advanced::default() });
+        let go = |im: &Img, l: restore::LumaScale| apply(im, &Op::Deband { radius: 40.0, threshold: 4.0, iterations: 3, grain: 0.0, kind: Grain::None, mono: true, room: false, luma: l, limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: restore::Mask::off(), adv: deband::Advanced::default(), target: restore::Target::Both });
         let changed = |a: &Img, b: &Img| a.px.iter().zip(&b.px).map(|(p, q)| (p[0] - q[0]).abs()).sum::<f32>() * 255.0 / a.px.len() as f32;
         let (dark, light) = (make(20.0), make(190.0));
         let (d_on, l_on) = (changed(&dark, &go(&dark, luma)), changed(&light, &go(&light, luma)));
@@ -1066,7 +1279,7 @@ mod expand_tests {
                 im.px[y * w + x] = [v, v, v, 1.0];
             }
         }
-        let out = apply(&im, &Op::Deband { radius: 24.0, threshold: 4.0, iterations: 3, grain: 0.0, kind: Grain::None, mono: true, room: false, luma: restore::LumaScale::off(), limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: restore::Mask::off(), adv: deband::Advanced::default() });
+        let out = apply(&im, &Op::Deband { radius: 24.0, threshold: 4.0, iterations: 3, grain: 0.0, kind: Grain::None, mono: true, room: false, luma: restore::LumaScale::off(), limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: restore::Mask::off(), adv: deband::Advanced::default(), target: restore::Target::Both });
         // the result is not rounded: it holds the ramp between the levels
         let off_grid = out.px.iter().filter(|p| ((p[0] * 255.0).fract() - 0.0).abs() > 0.1 && (p[0] * 255.0).fract() < 0.9).count();
         assert!(off_grid > w * h / 3, "{off_grid} values between levels");

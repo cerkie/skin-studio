@@ -115,7 +115,17 @@ impl Skin {
         index(&root, &root, &mut files);
         let ini = files.get("skin.ini").and_then(|p| std::fs::read(p).ok()).map(|b| Ini::parse(&String::from_utf8_lossy(&b))).unwrap_or_default();
         let name = ini.get("general", "name").map(|s| s.to_string()).unwrap_or_else(|| root.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
-        Ok(Skin { style: Style::Legacy, name, root, ini, fallbacks: vec![], files })
+        let mut fallbacks = Vec::new();
+        if let Some(def_dir) = crate::lazer_legacy::legacy_default_skin_dir() {
+            if def_dir != root {
+                let mut df = HashMap::new();
+                index(&def_dir, &def_dir, &mut df);
+                if !df.is_empty() {
+                    fallbacks.push(Skin { style: Style::Legacy, name: "osu! Legacy Default".into(), root: def_dir, ini: Ini::default(), fallbacks: vec![], files: df });
+                }
+            }
+        }
+        Ok(Skin { style: Style::Legacy, name, root, ini, fallbacks, files })
     }
 
     pub fn flag(&self, key: &str, alt: &str, default: bool) -> bool {
@@ -131,15 +141,19 @@ impl Skin {
         }
     }
 
-    /// Path and image ratio (2 for @2x) of an element, searching fallbacks.
-    pub fn find(&self, name: &str) -> Option<(PathBuf, f32)> {
+    fn find_own(&self, name: &str) -> Option<(PathBuf, f32)> {
         let n = name.to_lowercase().replace('\\', "/");
         for (suffix, ratio) in [("@2x.png", 2.0), (".png", 1.0)] {
             if let Some(p) = self.files.get(&format!("{n}{suffix}")) {
                 return Some((p.clone(), ratio));
             }
         }
-        self.fallbacks.iter().find_map(|f| f.find(name))
+        None
+    }
+
+    /// Path and image ratio (2 for @2x) of an element, searching fallbacks.
+    pub fn find(&self, name: &str) -> Option<(PathBuf, f32)> {
+        self.find_own(name).or_else(|| self.fallbacks.iter().find_map(|f| f.find(name)))
     }
 
     pub fn find_sound(&self, name: &str) -> Option<PathBuf> {
@@ -152,19 +166,33 @@ impl Skin {
         self.fallbacks.iter().find_map(|f| f.find_sound(name))
     }
 
-    /// Animation frames `name-0`, `name-1`... (separator `-`), or `name0`... (empty separator), else the single
-    /// still image `name`.
-    pub fn frames(&self, name: &str, sep: &str) -> Vec<(PathBuf, f32)> {
+    fn own_frames(&self, name: &str, sep: &str) -> Vec<(PathBuf, f32)> {
         let mut v = Vec::new();
-        while let Some(f) = self.find(&format!("{name}{sep}{}", v.len())) {
+        while let Some(f) = self.find_own(&format!("{name}{sep}{}", v.len())) {
             v.push(f);
         }
         if v.is_empty() {
-            if let Some(f) = self.find(name) {
+            if let Some(f) = self.find_own(name) {
                 v.push(f);
             }
         }
         v
+    }
+
+    /// Animation frames `name-0`, `name-1`... (separator `-`), or `name0`... (empty separator), else the single
+    /// still image `name`. Checks this skin's own files first so a single still image is never overridden by fallback frames.
+    pub fn frames(&self, name: &str, sep: &str) -> Vec<(PathBuf, f32)> {
+        let own = self.own_frames(name, sep);
+        if !own.is_empty() {
+            return own;
+        }
+        for fb in &self.fallbacks {
+            let f = fb.frames(name, sep);
+            if !f.is_empty() {
+                return f;
+            }
+        }
+        Vec::new()
     }
 
     pub fn combo_colors(&self) -> Vec<[f32; 3]> {
@@ -306,13 +334,21 @@ pub fn gameplay_entries(skin: &Skin, object_scale: f32, ss: f32) -> Vec<(String,
             e.push((key.to_string(), frames, target));
         }
     };
-    for n in ["hitcircle", "hitcircleoverlay", "sliderstartcircle", "sliderstartcircleoverlay", "sliderendcircle", "sliderendcircleoverlay", "reversearrow", "sliderscorepoint", "sliderb-nd", "sliderb-spec"] {
+    for n in ["hitcircle", "hitcircleoverlay", "sliderstartcircle", "sliderstartcircleoverlay", "sliderendcircle", "sliderendcircleoverlay", "reversearrow", "sliderscorepoint"] {
         add(n, skin.frames(n, "-").into_iter().take(1).collect(), obj);
     }
+    // osu! rule: fallback sliderb-nd / sliderb-spec are ignored when the skin provides its own sliderb.
+    let custom_ball = !skin.own_frames("sliderb", "").is_empty();
+    for n in ["sliderb-nd", "sliderb-spec"] {
+        let frames = if custom_ball { skin.own_frames(n, "-") } else { skin.frames(n, "-") };
+        add(n, frames.into_iter().take(1).collect(), obj);
+    }
     add("approachcircle", skin.frames("approachcircle", "-").into_iter().take(1).collect(), Some(object_scale * ss * 2.0));
-    for n in ["cursor", "cursormiddle", "cursortrail"] {
+    for n in ["cursor", "cursortrail"] {
         add(n, skin.frames(n, "-").into_iter().take(1).collect(), one);
     }
+    // osu! rule: never pull cursormiddle from fallback (its presence changes cursortrail to continuous smooth trail).
+    add("cursormiddle", skin.own_frames("cursormiddle", "-").into_iter().take(1).collect(), one);
     add("sliderb", skin.frames("sliderb", ""), obj);
     for n in ["spinner-background", "spinner-circle", "spinner-metre", "spinner-approachcircle", "spinner-spin", "spinner-clear", "spinner-rpm", "spinner-glow", "spinner-bottom", "spinner-top", "spinner-middle", "spinner-middle2"] {
         add(n, skin.frames(n, "-").into_iter().take(1).collect(), one);
@@ -341,8 +377,55 @@ pub fn add_default_approach(sheet: &mut Sheet, object_scale: f32, ss: f32) {
     crate::argon::add_approach_ring(sheet, "approachcircle", object_scale * ss * 2.0);
 }
 
-/// The sheet of everything the gameplay draws from a skin: the Argon set drawn in code, or the skin's own images packed, with lazer's
-/// default approach ring for a skin that has none (osu!lazer falls back to its default skin for it).
+/// Fill in procedural default osu! sprites for any standard gameplay elements missing from a legacy skin
+/// (e.g. "not quite default" skins that rely on osu!'s built-in hitcircles, overlays, numbers, sliderball, cursor, etc.).
+/// Intentional 1×1 blank PNGs in the skin folder are already present in `sheet` and are never overwritten.
+fn add_legacy_defaults(sheet: &mut Sheet, object_scale: f32, ss: f32) {
+    use engine::create::{ElementDoc, ElementKind};
+    let obj_target = object_scale * ss * 1.5;
+    let one_target = ss * 1.5;
+    let mut put_elem = |key: &str, kind: ElementKind, target: f32| {
+        if sheet.get(key).is_some() {
+            return;
+        }
+        let img = ElementDoc::template(kind).render(); // native @2x (ratio = 2.0)
+        let ratio = if target < 2.0 { target.max(0.25) } else { 2.0 };
+        let img = if ratio < 2.0 {
+            let f = ratio / 2.0;
+            let nw = ((img.w as f32 * f).round() as usize).max(1);
+            let nh = ((img.h as f32 * f).round() as usize).max(1);
+            engine::img::resize_area(&img, nw, nh)
+        } else {
+            img
+        };
+        let mut px = Vec::with_capacity(img.w * img.h * 4);
+        for p in &img.px {
+            px.extend_from_slice(&[(p[0] * 255.0 + 0.5) as u8, (p[1] * 255.0 + 0.5) as u8, (p[2] * 255.0 + 0.5) as u8, (p[3] * 255.0 + 0.5) as u8]);
+        }
+        sheet.add_image(key, img.w as u32, img.h as u32, &px, ratio);
+    };
+
+    put_elem("hitcircle", ElementKind::HitCircle, obj_target);
+    put_elem("hitcircleoverlay", ElementKind::HitCircleOverlay, obj_target);
+    put_elem("sliderb", ElementKind::SliderBall, obj_target);
+    put_elem("sliderfollowcircle", ElementKind::SliderFollowCircle, object_scale * ss * 3.0);
+    put_elem("reversearrow", ElementKind::ReverseArrow, obj_target);
+    put_elem("sliderscorepoint", ElementKind::SliderTick, obj_target);
+    put_elem("cursor", ElementKind::Cursor, one_target);
+    put_elem("cursortrail", ElementKind::CursorTrail, one_target);
+    drop(put_elem);
+
+    if sheet.get("approachcircle").is_none() {
+        add_default_approach(sheet, object_scale, ss);
+    }
+
+    if (0..10).any(|d| sheet.get(&format!("num{d}")).is_none()) {
+        crate::argon::add_default_digits(sheet, (object_scale * ss * 1.5).max(0.5), 62.0);
+    }
+}
+
+/// The sheet of everything the gameplay draws from a skin: the Argon set drawn in code, or the skin's own images packed,
+/// falling back to clean procedural defaults for any standard gameplay pieces omitted by a partial/minimal legacy skin.
 pub fn base_sheet(skin: &Skin, cs: f32, ss: f32) -> Sheet {
     let scale = engine::lazer::circle_scale(cs);
     if matches!(skin.style, Style::Argon { .. }) {
@@ -351,9 +434,36 @@ pub fn base_sheet(skin: &Skin, cs: f32, ss: f32) -> Sheet {
         s
     } else {
         let mut sheet = Sheet::pack(&gameplay_entries(skin, scale, ss));
-        if sheet.get("approachcircle").is_none() {
-            add_default_approach(&mut sheet, scale, ss);
-        }
+        add_legacy_defaults(&mut sheet, scale, ss);
         sheet
+    }
+}
+
+#[cfg(test)]
+mod default_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn partial_legacy_skin_gets_missing_defaults_and_preserves_blank_overrides() {
+        let dir = std::env::temp_dir().join(format!("ss-partial-skin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("skin.ini"), "[General]\nName: Partial\nVersion: 2.5\n").unwrap();
+        // Intentional 1x1 blank hitcircleoverlay.png must be respected (not replaced by default overlay)
+        engine::edit::save_png(&dir.join("hitcircleoverlay.png"), &engine::img::Img::new(1, 1)).unwrap();
+
+        let skin = Skin::open(&dir).unwrap();
+        let sheet = base_sheet(&skin, 4.0, 1.5);
+        assert!(sheet.get("hitcircle").is_some(), "missing hitcircle gets default");
+        assert!(sheet.get("approachcircle").is_some(), "missing approachcircle gets default");
+        assert!(sheet.get("sliderb").is_some(), "missing sliderb gets default");
+        assert!(sheet.get("cursor").is_some(), "missing cursor gets default");
+        assert!(sheet.get("cursormiddle").is_none(), "missing cursormiddle must not fall back");
+        for d in 0..10 {
+            assert!(sheet.get(&format!("num{d}")).is_some(), "missing num{d} gets default");
+        }
+        let ov = sheet.get("hitcircleoverlay").expect("blank overlay kept");
+        assert_eq!((ov.frames[0].w, ov.frames[0].h), (1, 1), "intentional 1x1 blank PNG must not be overwritten");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

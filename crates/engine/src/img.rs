@@ -1,5 +1,9 @@
 //! Float RGBA images and the resampling / blur / distance-transform primitives the frame generator is built from.
 //! Images are stored premultiplied; straight-alpha conversions happen only at the edges.
+use rayon::prelude::*;
+
+/// Pixel-count threshold above which rayon parallelization pays off over single-threaded execution.
+const PAR_THRESHOLD: usize = 8192;
 
 /// Which kernel `affine` uses when it samples. Catmull-Rom matches the Python reference (and rings at hard edges);
 /// Hermite never overshoots and is the default.
@@ -49,26 +53,51 @@ impl Img {
 
     /// Straight-alpha RGBA, rounded to 8 bits.
     pub fn to_straight_u8(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.px.len() * 4);
-        for (i, p) in self.px.iter().enumerate() {
-            let a = p[3];
-            let (r, g, b) = if a > 1e-6 { (p[0] / a, p[1] / a, p[2] / a) } else { (0.0, 0.0, 0.0) };
-            let (x, y) = (i % self.w.max(1), i / self.w.max(1));
-            for (k, v) in [r, g, b, a].into_iter().enumerate() {
-                out.push(quantize(v, x, y, k));
+        let w = self.w.max(1);
+        let mut out = vec![0u8; self.px.len() * 4];
+        let row_fn = |(y, row_out): (usize, &mut [u8])| {
+            let row_px = &self.px[y * w..y * w + row_out.len() / 4];
+            for (x, p) in row_px.iter().enumerate() {
+                let a = p[3];
+                let (r, g, b) = if a > 1e-6 {
+                    let inv = 1.0 / a;
+                    (p[0] * inv, p[1] * inv, p[2] * inv)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+                let o = x * 4;
+                row_out[o] = quantize(r, x, y, 0);
+                row_out[o + 1] = quantize(g, x, y, 1);
+                row_out[o + 2] = quantize(b, x, y, 2);
+                row_out[o + 3] = quantize(a, x, y, 3);
             }
+        };
+        if self.px.len() >= PAR_THRESHOLD {
+            out.par_chunks_mut(w * 4).enumerate().for_each(row_fn);
+        } else {
+            out.chunks_mut(w * 4).enumerate().for_each(row_fn);
         }
         out
     }
 
     /// Premultiplied RGBA rounded to 8 bits (what the GPU atlas stores).
     pub fn to_premult_u8(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.px.len() * 4);
-        for (i, p) in self.px.iter().enumerate() {
-            let (x, y) = (i % self.w.max(1), i / self.w.max(1));
-            for (k, v) in p.iter().enumerate() {
-                out.push(quantize(*v, x, y, k));
+        let w = self.w.max(1);
+        let mut out = vec![0u8; self.px.len() * 4];
+        let row_fn = |(y, row_out): (usize, &mut [u8])| {
+            let row_px = &self.px[y * w..y * w + row_out.len() / 4];
+            for (x, p) in row_px.iter().enumerate() {
+                let o = x * 4;
+                row_out[o] = quantize(p[0], x, y, 0);
+                row_out[o + 1] = quantize(p[1], x, y, 1);
+                row_out[o + 2] = quantize(p[2], x, y, 2);
+                row_out[o + 3] = quantize(p[3], x, y, 3);
             }
+        };
+        if self.px.len() >= PAR_THRESHOLD {
+            out.par_chunks_mut(w * 4).enumerate().for_each(row_fn);
+        } else {
+            out.chunks_mut(w * 4).enumerate().for_each(row_fn);
         }
         out
     }
@@ -192,35 +221,57 @@ fn area_weights(n_in: usize, n_out: usize) -> Vec<Vec<(usize, f32)>> {
 /// Exact area-average resize (every output pixel is the mean of the source area it covers): no ringing, no
 /// halos. The right filter for shrinking.
 pub fn resize_area(src: &Img, w: usize, h: usize) -> Img {
-    if (w, h) == (src.w, src.h) {
+    if (w, h) == (src.w, src.h) || src.w == 0 || src.h == 0 || w == 0 || h == 0 {
         return src.clone();
     }
-    let (wx, wy) = (area_weights(src.w, w), area_weights(src.h, h));
-    let mut tmp = Img::new(w, src.h);
-    for y in 0..src.h {
-        for (x, ws) in wx.iter().enumerate() {
-            let mut acc = [0.0f32; 4];
-            for &(i, k) in ws {
-                let p = &src.px[y * src.w + i];
-                for c in 0..4 {
-                    acc[c] += p[c] * k;
+    let tmp_owned: Img;
+    let mid: &Img = if w != src.w {
+        let wx = area_weights(src.w, w);
+        let mut tmp = Img::new(w, src.h);
+        let row_fn = |(y, row_out): (usize, &mut [[f32; 4]])| {
+            let row_in = &src.px[y * src.w..(y + 1) * src.w];
+            for (x, ws) in wx.iter().enumerate() {
+                let mut acc = [0.0f32; 4];
+                for &(i, k) in ws {
+                    let p = &row_in[i];
+                    acc[0] += p[0] * k;
+                    acc[1] += p[1] * k;
+                    acc[2] += p[2] * k;
+                    acc[3] += p[3] * k;
                 }
+                row_out[x] = acc;
             }
-            tmp.px[y * w + x] = acc;
+        };
+        if w * src.h >= PAR_THRESHOLD {
+            tmp.px.par_chunks_mut(w).enumerate().for_each(row_fn);
+        } else {
+            tmp.px.chunks_mut(w).enumerate().for_each(row_fn);
         }
-    }
+        if h == src.h {
+            return tmp;
+        }
+        tmp_owned = tmp;
+        &tmp_owned
+    } else {
+        src
+    };
+    let wy = area_weights(mid.h, h);
     let mut out = Img::new(w, h);
-    for (y, ws) in wy.iter().enumerate() {
-        for x in 0..w {
-            let mut acc = [0.0f32; 4];
-            for &(j, k) in ws {
-                let p = &tmp.px[j * w + x];
-                for c in 0..4 {
-                    acc[c] += p[c] * k;
-                }
+    let row_fn = |(y, row_out): (usize, &mut [[f32; 4]])| {
+        for &(j, k) in &wy[y] {
+            let row_in = &mid.px[j * w..(j + 1) * w];
+            for (dst, p) in row_out.iter_mut().zip(row_in) {
+                dst[0] += p[0] * k;
+                dst[1] += p[1] * k;
+                dst[2] += p[2] * k;
+                dst[3] += p[3] * k;
             }
-            out.px[y * w + x] = acc;
         }
+    };
+    if w * h >= PAR_THRESHOLD {
+        out.px.par_chunks_mut(w).enumerate().for_each(row_fn);
+    } else {
+        out.px.chunks_mut(w).enumerate().for_each(row_fn);
     }
     out
 }
@@ -236,51 +287,154 @@ fn gauss_kernel(sigma: f32) -> Vec<f32> {
 
 /// Separable Gaussian blur of a premultiplied image (edges read as transparent).
 pub fn blur(src: &Img, sigma: f32) -> Img {
-    if sigma <= 0.05 {
+    if sigma <= 0.05 || src.w == 0 || src.h == 0 {
         return src.clone();
     }
     let k = gauss_kernel(sigma);
-    let r = (k.len() / 2) as i64;
-    let (w, h) = (src.w as i64, src.h as i64);
-    let mut tmp = Img::new(src.w, src.h);
-    for y in 0..h {
-        for x in 0..w {
+    let r = k.len() / 2;
+    let (w, h) = (src.w, src.h);
+    let par = w * h >= PAR_THRESHOLD;
+
+    let mut tmp = Img::new(w, h);
+    let h_row = |(y, row_out): (usize, &mut [[f32; 4]])| {
+        let row_in = &src.px[y * w..(y + 1) * w];
+        let left_end = r.min(w);
+        let right_start = w.saturating_sub(r).max(left_end);
+        for x in 0..left_end {
             let mut acc = [0.0f32; 4];
-            for (i, wk) in k.iter().enumerate() {
-                let xx = x + i as i64 - r;
-                if xx >= 0 && xx < w {
-                    let p = &src.px[(y * w + xx) as usize];
-                    for c in 0..4 {
-                        acc[c] += p[c] * wk;
-                    }
-                }
+            let k_start = r - x;
+            let k_end = (r + w - x).min(k.len());
+            for ki in k_start..k_end {
+                let p = &row_in[x + ki - r];
+                let wk = k[ki];
+                acc[0] += p[0] * wk;
+                acc[1] += p[1] * wk;
+                acc[2] += p[2] * wk;
+                acc[3] += p[3] * wk;
             }
-            tmp.px[(y * w + x) as usize] = acc;
+            row_out[x] = acc;
         }
+        for x in left_end..right_start {
+            let mut acc = [0.0f32; 4];
+            let base = &row_in[x - r..x + r + 1];
+            for (p, &wk) in base.iter().zip(&k) {
+                acc[0] += p[0] * wk;
+                acc[1] += p[1] * wk;
+                acc[2] += p[2] * wk;
+                acc[3] += p[3] * wk;
+            }
+            row_out[x] = acc;
+        }
+        for x in right_start..w {
+            let mut acc = [0.0f32; 4];
+            let k_start = r.saturating_sub(x);
+            let k_end = (r + w - x).min(k.len());
+            for ki in k_start..k_end {
+                let p = &row_in[x + ki - r];
+                let wk = k[ki];
+                acc[0] += p[0] * wk;
+                acc[1] += p[1] * wk;
+                acc[2] += p[2] * wk;
+                acc[3] += p[3] * wk;
+            }
+            row_out[x] = acc;
+        }
+    };
+    if par {
+        tmp.px.par_chunks_mut(w).enumerate().for_each(h_row);
+    } else {
+        tmp.px.chunks_mut(w).enumerate().for_each(h_row);
     }
-    let mut out = Img::new(src.w, src.h);
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = [0.0f32; 4];
-            for (i, wk) in k.iter().enumerate() {
-                let yy = y + i as i64 - r;
-                if yy >= 0 && yy < h {
-                    let p = &tmp.px[(yy * w + x) as usize];
-                    for c in 0..4 {
-                        acc[c] += p[c] * wk;
-                    }
-                }
+
+    let mut out = Img::new(w, h);
+    let v_row = |(y, row_out): (usize, &mut [[f32; 4]])| {
+        let k_start = r.saturating_sub(y);
+        let k_end = (r + h - y).min(k.len());
+        for ki in k_start..k_end {
+            let yy = y + ki - r;
+            let wk = k[ki];
+            let row_in = &tmp.px[yy * w..(yy + 1) * w];
+            for (dst, p) in row_out.iter_mut().zip(row_in) {
+                dst[0] += p[0] * wk;
+                dst[1] += p[1] * wk;
+                dst[2] += p[2] * wk;
+                dst[3] += p[3] * wk;
             }
-            out.px[(y * w + x) as usize] = acc;
         }
+    };
+    if par {
+        out.px.par_chunks_mut(w).enumerate().for_each(v_row);
+    } else {
+        out.px.chunks_mut(w).enumerate().for_each(v_row);
     }
     out
 }
 
 /// Blur a single float plane (used for shadows).
 pub fn blur_plane(a: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
-    let img = Img { w, h, px: a.iter().map(|&v| [0.0, 0.0, 0.0, v]).collect() };
-    blur(&img, sigma).px.iter().map(|p| p[3]).collect()
+    if sigma <= 0.05 || w == 0 || h == 0 {
+        return a.to_vec();
+    }
+    let k = gauss_kernel(sigma);
+    let r = k.len() / 2;
+    let par = w * h >= PAR_THRESHOLD;
+
+    let mut tmp = vec![0.0f32; w * h];
+    let h_row = |(y, row_out): (usize, &mut [f32])| {
+        let row_in = &a[y * w..(y + 1) * w];
+        let left_end = r.min(w);
+        let right_start = w.saturating_sub(r).max(left_end);
+        for x in 0..left_end {
+            let mut acc = 0.0f32;
+            let k_start = r - x;
+            let k_end = (r + w - x).min(k.len());
+            for ki in k_start..k_end {
+                acc += row_in[x + ki - r] * k[ki];
+            }
+            row_out[x] = acc;
+        }
+        for x in left_end..right_start {
+            let mut acc = 0.0f32;
+            for (&v, &wk) in row_in[x - r..x + r + 1].iter().zip(&k) {
+                acc += v * wk;
+            }
+            row_out[x] = acc;
+        }
+        for x in right_start..w {
+            let mut acc = 0.0f32;
+            let k_start = r.saturating_sub(x);
+            let k_end = (r + w - x).min(k.len());
+            for ki in k_start..k_end {
+                acc += row_in[x + ki - r] * k[ki];
+            }
+            row_out[x] = acc;
+        }
+    };
+    if par {
+        tmp.par_chunks_mut(w).enumerate().for_each(h_row);
+    } else {
+        tmp.chunks_mut(w).enumerate().for_each(h_row);
+    }
+
+    let mut out = vec![0.0f32; w * h];
+    let v_row = |(y, row_out): (usize, &mut [f32])| {
+        let k_start = r.saturating_sub(y);
+        let k_end = (r + h - y).min(k.len());
+        for ki in k_start..k_end {
+            let yy = y + ki - r;
+            let wk = k[ki];
+            let row_in = &tmp[yy * w..(yy + 1) * w];
+            for (dst, &v) in row_out.iter_mut().zip(row_in) {
+                *dst += v * wk;
+            }
+        }
+    };
+    if par {
+        out.par_chunks_mut(w).enumerate().for_each(v_row);
+    } else {
+        out.chunks_mut(w).enumerate().for_each(v_row);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------------- distance transform

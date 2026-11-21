@@ -4,8 +4,10 @@
 mod app;
 #[cfg(test)]
 mod audit;
+mod element_creator;
 mod motion;
 mod skin_editor;
+mod skin_ini;
 mod paths;
 mod state;
 mod studio;

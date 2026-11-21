@@ -135,6 +135,47 @@ fn embolden(bmp: &[u8], w: usize, h: usize, r: f32) -> (Vec<u8>, usize, usize, u
     (out, ow, oh, pad)
 }
 
+/// Rasterize default hitcircle digits `num0..num9` into `sheet` at `d` pixels per object unit (`height_units` ~ 52 for Argon, 64 for legacy).
+pub fn add_default_digits(sheet: &mut Sheet, d: f32, height_units: f32) {
+    if let Ok(font) = fontdue::Font::from_bytes(digit_font_bytes(), fontdue::FontSettings::default()) {
+        let probe = 100.0;
+        let h0 = font.rasterize('0', probe).0.height.max(1) as f32;
+        let size0 = height_units * d * (0.475 * probe / h0);
+        const BOLDER: f32 = 0.0;
+        let k = h0 / probe;
+        let size = size0 * k / (k + 2.0 * BOLDER);
+        let lm = font.horizontal_line_metrics(size);
+        for dgt in 0..10u32 {
+            let key = format!("num{dgt}");
+            if sheet.get(&key).is_some() {
+                continue;
+            }
+            let ch = char::from_digit(dgt, 10).unwrap();
+            let (m, bmp) = font.rasterize(ch, size);
+            let (bmp, gw, gh, pad) = if BOLDER > 0.0 { embolden(&bmp, m.width, m.height, BOLDER * size) } else { (bmp, m.width, m.height, 0) };
+            let (ascent, line) = lm.map(|l| (l.ascent, l.ascent - l.descent)).unwrap_or((size * 0.8, size * 1.2));
+            let adv = font.metrics(ch, size).advance_width + 2.0 * BOLDER * size;
+            let (cw, ch_) = ((adv.ceil() as usize).max(gw), (line.ceil() as usize + 2 * pad).max(gh));
+            let mut px = vec![0u8; cw * ch_ * 4];
+            let gx = ((cw as f32 - gw as f32) * 0.5).round() as i32;
+            let gy = (ascent - m.height as f32 - m.ymin as f32).round() as i32;
+            let m = fontdue::Metrics { width: gw, height: gh, ..m };
+            for y in 0..m.height {
+                for x in 0..m.width {
+                    let (tx, ty) = (x as i32 + gx, y as i32 + gy);
+                    if tx < 0 || ty < 0 || tx >= cw as i32 || ty >= ch_ as i32 {
+                        continue;
+                    }
+                    let a = bmp[y * m.width + x];
+                    let o = (ty as usize * cw + tx as usize) * 4;
+                    px[o..o + 4].copy_from_slice(&[a, a, a, a]);
+                }
+            }
+            sheet.add_image(&key, cw as u32, ch_ as u32, &px, d);
+        }
+    }
+}
+
 /// An approach circle: a plain ring 128 units across and 5 thick, as lazer's default one looks.
 pub fn add_approach_ring(sheet: &mut Sheet, key: &str, density: f32) {
     let (pw, ph, px) = raster(128.0, 128.0, density, |x, y| {
@@ -324,41 +365,7 @@ pub fn add_to_sheet(sheet: &mut Sheet, scale: f32, ss: f32) {
     put(sheet, "ar_ring_thick", 64.0, 64.0, ss * 3.0, &|x, y| white(ring(32.0, 10.0, x, y)));
 
     // numbers: one cell per digit, sized like lazer's 52-unit bold Torus digits (measured against the clip: a digit is about 0.23 of a circle tall)
-    if let Ok(font) = fontdue::Font::from_bytes(digit_font_bytes(), fontdue::FontSettings::default()) {
-        let probe = 100.0;
-        let h0 = font.rasterize('0', probe).0.height.max(1) as f32;
-        let size0 = 52.0 * d * (0.475 * probe / h0);
-        // how much heavier than the font the letters are drawn (a fraction of the size; the size is lowered to keep the digits as tall as
-        // lazer's). Baloo 2 at 800 has the weight of Torus Bold already.
-        const BOLDER: f32 = 0.0;
-        let k = h0 / probe; // height of a digit per unit of size
-        let size = size0 * k / (k + 2.0 * BOLDER);
-        let lm = font.horizontal_line_metrics(size);
-        for dgt in 0..10u32 {
-            let ch = char::from_digit(dgt, 10).unwrap();
-            let (m, bmp) = font.rasterize(ch, size);
-            let (bmp, gw, gh, pad) = if BOLDER > 0.0 { embolden(&bmp, m.width, m.height, BOLDER * size) } else { (bmp, m.width, m.height, 0) };
-            let (ascent, line) = lm.map(|l| (l.ascent, l.ascent - l.descent)).unwrap_or((size * 0.8, size * 1.2));
-            let adv = font.metrics(ch, size).advance_width + 2.0 * BOLDER * size;
-            let (cw, ch_) = ((adv.ceil() as usize).max(gw), (line.ceil() as usize + 2 * pad).max(gh));
-            let mut px = vec![0u8; cw * ch_ * 4];
-            let gx = ((cw as f32 - gw as f32) * 0.5).round() as i32;
-            let gy = (ascent - m.height as f32 - m.ymin as f32).round() as i32;
-            let m = fontdue::Metrics { width: gw, height: gh, ..m };
-            for y in 0..m.height {
-                for x in 0..m.width {
-                    let (tx, ty) = (x as i32 + gx, y as i32 + gy);
-                    if tx < 0 || ty < 0 || tx >= cw as i32 || ty >= ch_ as i32 {
-                        continue;
-                    }
-                    let a = bmp[y * m.width + x];
-                    let o = (ty as usize * cw + tx as usize) * 4;
-                    px[o..o + 4].copy_from_slice(&[a, a, a, a]);
-                }
-            }
-            sheet.add_image(&format!("num{dgt}"), cw as u32, ch_ as u32, &px, d);
-        }
-    }
+    add_default_digits(sheet, d, 52.0);
     if let Some(bytes) = font_bytes() {
         if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
             // spinner labels

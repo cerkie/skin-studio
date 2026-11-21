@@ -52,6 +52,7 @@ pub struct GameRenderer {
     format: wgpu::TextureFormat,
     scratch: Vec<Instance>,
     sinst: Vec<SliderInst>,
+    sheet_tex: wgpu::Texture,
     sheet_size: (u32, u32),
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -100,9 +101,13 @@ impl GameRenderer {
     /// `sheet` is premultiplied RGBA8 of `sheet_size`; `geoms` the slider meshes; `scale` the view-to-pixel factor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat, size: (u32, u32), sheet: &[u8], sheet_size: (u32, u32), geoms: &[Option<SliderGeom>], scale: f32) -> Self {
+        let max_dim = device.limits().max_texture_dimension_2d;
+        // Allocate vertical headroom (+1024 px) so live followpoint atlas updates write directly into the GPU texture
+        // via `update_sheet_region` without cloning the 20 MB base skin sheet or recreating the texture.
+        let alloc_size = (sheet_size.0.max(2048).min(max_dim), (sheet_size.1 + 1024).min(max_dim));
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("skin sheet"),
-            size: wgpu::Extent3d { width: sheet_size.0, height: sheet_size.1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: alloc_size.0, height: alloc_size.1, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -248,38 +253,90 @@ impl GameRenderer {
         let slider_insts = device.create_buffer(&wgpu::BufferDescriptor { label: Some("slider instances"), size: (slider_cap * std::mem::size_of::<SliderInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let depth = depth_tex(&device, size);
         let msaa = msaa_tex(&device, size, format);
-        GameRenderer { device, queue, sprite_pipe, add_pipe, prepass_pipe, body_pipe, bind_group, globals, instances, inst_cap, slider_insts, slider_cap, verts, dyn_verts, dyn_cap, dyn_scratch: Vec::new(), dyn_ranges: Vec::new(), base, depth, msaa, format, scratch: Vec::new(), sinst: Vec::new(), sheet_size, bgl, sampler, size, scale, origin: [0.0, 0.0] }
+        GameRenderer { device, queue, sprite_pipe, add_pipe, prepass_pipe, body_pipe, bind_group, globals, instances, inst_cap, slider_insts, slider_cap, verts, dyn_verts, dyn_cap, dyn_scratch: Vec::new(), dyn_ranges: Vec::new(), base, depth, msaa, format, scratch: Vec::new(), sinst: Vec::new(), sheet_tex: tex, sheet_size: alloc_size, bgl, sampler, size, scale, origin: [0.0, 0.0] }
     }
 
-    /// Replace the skin sheet (a new follow-point animation was appended to it).
-    pub fn set_sheet(&mut self, sheet: &[u8], sheet_size: (u32, u32)) {
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("skin sheet"),
-            size: wgpu::Extent3d { width: sheet_size.0, height: sheet_size.1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    /// Replace the static slider mesh buffer in-place (e.g. after live CS/AR/HR changes without reloading audio).
+    pub fn set_geoms(&mut self, geoms: &[Option<SliderGeom>]) {
+        let mut all: Vec<[f32; 3]> = Vec::new();
+        self.base.clear();
+        for g in geoms {
+            self.base.push(all.len() as u32);
+            if let Some(g) = g {
+                all.extend_from_slice(&g.verts);
+            }
+        }
+        let need = (all.len().max(1) * 12) as u64;
+        if need > self.verts.size() {
+            self.verts = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("slider verts"),
+                size: need,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !all.is_empty() {
+            self.queue.write_buffer(&self.verts, 0, bytemuck::cast_slice(&all));
+        }
+    }
+
+    /// Fast-path GPU sub-upload for followpoint atlas refreshes at row `y0`: zero base-sheet copy and zero texture reallocation.
+    /// Returns `false` if the region exceeds the current texture capacity (caller falls back to `set_sheet`).
+    pub fn update_sheet_region(&mut self, y0: u32, rgba: &[u8], size: (u32, u32)) -> bool {
+        if size.0 == 0 || size.1 == 0 {
+            return true;
+        }
+        if size.0 > self.sheet_size.0 || y0 + size.1 > self.sheet_size.1 {
+            return false;
+        }
         self.queue.write_texture(
-            tex.as_image_copy(),
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.sheet_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.0 * 4), rows_per_image: Some(size.1) },
+            wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+        );
+        true
+    }
+
+    /// Replace the skin sheet (allocating vertical headroom so subsequent follow-point refreshes hit `update_sheet_region`).
+    pub fn set_sheet(&mut self, sheet: &[u8], sheet_size: (u32, u32)) {
+        let max_dim = self.device.limits().max_texture_dimension_2d;
+        let alloc_size = (sheet_size.0.max(2048).min(max_dim), (sheet_size.1 + 1024).min(max_dim));
+        if alloc_size.0 > self.sheet_size.0 || sheet_size.1 > self.sheet_size.1 {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("skin sheet"),
+                size: wgpu::Extent3d { width: alloc_size.0, height: alloc_size.1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.globals.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            self.sheet_tex = tex;
+            self.sheet_size = alloc_size;
+        }
+        self.queue.write_texture(
+            self.sheet_tex.as_image_copy(),
             sheet,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(sheet_size.0 * 4), rows_per_image: Some(sheet_size.1) },
             wgpu::Extent3d { width: sheet_size.0, height: sheet_size.1, depth_or_array_layers: 1 },
         );
-        let view = tex.create_view(&Default::default());
-        self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.globals.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-            ],
-        });
-        self.sheet_size = sheet_size;
     }
 
     pub fn device(&self) -> &wgpu::Device {

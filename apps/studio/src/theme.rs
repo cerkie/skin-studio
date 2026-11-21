@@ -171,23 +171,48 @@ pub fn icon_glyph(p: &egui::Painter, c: Pos2, which: usize, col: Color32) {
             p.add(Shape::line(vec![v(-9.5, -3.0), v(-8.0, -0.5), v(-5.5, -2.5)], s));
         }
         // import: a tray with an arrow down
-        _ => {
+        8 => {
             p.add(Shape::line(vec![v(-8.0, 2.0), v(-8.0, 8.0), v(8.0, 8.0), v(8.0, 2.0)], s));
             p.line_segment([v(0.0, -8.0), v(0.0, 3.0)], s);
             p.add(Shape::line(vec![v(-4.0, -1.0), v(0.0, 3.5), v(4.0, -1.0)], s));
         }
+        // export / output: a tray with an arrow up
+        _ => {
+            p.add(Shape::line(vec![v(-8.0, 2.0), v(-8.0, 8.0), v(8.0, 8.0), v(8.0, 2.0)], s));
+            p.line_segment([v(0.0, 3.0), v(0.0, -8.0)], s);
+            p.add(Shape::line(vec![v(-4.0, -4.0), v(0.0, -8.5), v(4.0, -4.0)], s));
+        }
     }
 }
 
-/// lazer's settings search box: a magnifier at the right, a hint while empty.
+/// lazer's settings search box: a magnifier at the right, a hint while empty, and a clear button when non-empty.
 pub fn search_box(ui: &mut Ui, rect: Rect, text: &mut String) -> Response {
     ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(46));
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, Color32::from_white_alpha(10)));
     let edit_rect = Rect::from_min_max(rect.left_top() + Vec2::new(20.0, 14.0), rect.right_bottom() - Vec2::new(56.0, 14.0));
     let resp = put_free(ui, edit_rect, egui::TextEdit::singleline(text).hint_text(RichText::new("type to search").color(LIGHT3).size(20.0)).frame(egui::Frame::NONE).desired_width(edit_rect.width()).font(FontId::new(20.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO));
-    let c = Pos2::new(rect.right() - 30.0, rect.center().y - 1.0);
-    ui.painter().circle_stroke(c, 7.5, Stroke::new(2.4, CONTENT1));
-    ui.painter().line_segment([c + Vec2::new(5.5, 5.5), c + Vec2::new(11.0, 11.0)], Stroke::new(2.6, CONTENT1));
+    if (resp.has_focus() || resp.lost_focus()) && !text.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        text.clear();
+    }
+    let c = Pos2::new(rect.right() - 28.0, rect.center().y);
+    if !text.is_empty() {
+        let cr = Rect::from_center_size(c, Vec2::splat(28.0));
+        let cresp = ui.interact(cr, ui.scope_id().with("search-clear"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Clear search (Esc)");
+        let h = ease(ui, cresp.id.with("h"), cresp.hovered());
+        if h > 0.01 {
+            ui.painter().rect_filled(cr, CornerRadius::same(5), Color32::from_white_alpha((h * 26.0) as u8));
+        }
+        let col = lerp_c(LIGHT1, CONTENT1, h);
+        ui.painter().line_segment([c + Vec2::new(-5.5, -5.5), c + Vec2::new(5.5, 5.5)], Stroke::new(2.0, col));
+        ui.painter().line_segment([c + Vec2::new(-5.5, 5.5), c + Vec2::new(5.5, -5.5)], Stroke::new(2.0, col));
+        if cresp.clicked() {
+            text.clear();
+        }
+    } else {
+        let mc = c + Vec2::new(-2.0, -1.0);
+        ui.painter().circle_stroke(mc, 7.5, Stroke::new(2.4, CONTENT1));
+        ui.painter().line_segment([mc + Vec2::new(5.5, 5.5), mc + Vec2::new(11.0, 11.0)], Stroke::new(2.6, CONTENT1));
+    }
     resp
 }
 
@@ -305,20 +330,28 @@ pub fn put_free(ui: &mut Ui, rect: Rect, widget: impl egui::Widget) -> Response 
 
 /// A caption above a single-line text box.
 pub fn text_row(ui: &mut Ui, id: &str, caption_text: &str, buf: &mut String) -> Response {
+    text_row_pad(ui, id, caption_text, buf, 0.0).0
+}
+
+/// A caption above a single-line text box, leaving `right_pad` points clear on the right (e.g. for a colour swatch).
+/// Returns `(text_edit_response, outer_row_rect)`.
+pub fn text_row_pad(ui: &mut Ui, id: &str, caption_text: &str, buf: &mut String, right_pad: f32) -> (Response, Rect) {
     let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 54.0 + ROW_GAP), Sense::hover());
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     let bg = bg_begin(ui);
-    ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, caption_text, FontId::new(14.0, light()), CONTENT2);
-    let edit_rect = Rect::from_min_size(rect.min + Vec2::new(PAD, PAD + 17.0), Vec2::new(rect.width() - 2.0 * PAD, 20.0));
-    let resp = put_free(ui, 
+    let cap_font = FontId::new(14.0, light());
+    let cap = fit_text(ui.painter(), caption_text, &cap_font, (rect.width() - 2.0 * PAD - right_pad).max(20.0));
+    ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, cap, cap_font, CONTENT2);
+    let edit_rect = Rect::from_min_size(rect.min + Vec2::new(PAD, PAD + 17.0), Vec2::new((rect.width() - 2.0 * PAD - right_pad).max(20.0), 20.0));
+    let resp = put_free(ui,
         edit_rect,
         egui::TextEdit::singleline(buf).id(rid).frame(egui::Frame::NONE).desired_width(edit_rect.width()).font(FontId::new(16.0, FontFamily::Proportional)).text_color(CONTENT1).margin(egui::Margin::ZERO),
     );
     let hovered = ui.rect_contains_pointer(rect);
     bg_end(ui, bg, rect, rid, hovered, resp.has_focus(), false);
-    resp
+    (resp, rect)
 }
 
 /// A caption and the current choice, a chevron, and a list that opens below. Returns the index picked.
@@ -326,10 +359,13 @@ pub fn dropdown_row(ui: &mut Ui, id: &str, caption_text: &str, current: &str, it
     let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 54.0 + ROW_GAP), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     let bg = bg_begin(ui);
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
-    ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, caption_text, FontId::new(14.0, light()), CONTENT2);
+    let cap_font = FontId::new(14.0, light());
+    let cap = fit_text(ui.painter(), caption_text, &cap_font, (rect.width() - 2.0 * PAD - 26.0).max(20.0));
+    ui.painter().text(rect.min + Vec2::new(PAD, PAD - 1.0), Align2::LEFT_TOP, cap, cap_font, CONTENT2);
     let label_font = FontId::new(16.0, FontFamily::Proportional);
     let label = fit_text(ui.painter(), current, &label_font, rect.width() - 2.0 * PAD - 26.0);
     ui.painter().text(rect.min + Vec2::new(PAD, PAD + 17.0), Align2::LEFT_TOP, label, label_font, CONTENT1);
@@ -406,23 +442,17 @@ pub fn fit_text_start(painter: &egui::Painter, text: &str, font: &FontId, max_w:
     "…".to_string() + &chars[chars.len() - lo..].iter().collect::<String>()
 }
 
-fn elide(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let t: String = s.chars().take(max - 1).collect();
-        format!("{t}…")
-    }
-}
-
 /// An outlined pill that fills with the highlight color when on (SwitchButton, 56 x 16).
 pub fn switch_row(ui: &mut Ui, id: &str, label: &str, on: &mut bool) -> bool {
     let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 38.0 + ROW_GAP), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     let bg = bg_begin(ui);
-    ui.painter().text(rect.left_center() + Vec2::new(PAD, 0.0), Align2::LEFT_CENTER, elide(label, 44), FontId::new(14.0, FontFamily::Proportional), CONTENT2);
+    let lbl_font = FontId::new(14.0, FontFamily::Proportional);
+    let lbl = fit_text(ui.painter(), label, &lbl_font, (rect.width() - 2.0 * PAD - 64.0).max(20.0));
+    ui.painter().text(rect.left_center() + Vec2::new(PAD, 0.0), Align2::LEFT_CENTER, lbl, lbl_font, CONTENT2);
     let mut changed = false;
     if resp.clicked() {
         *on = !*on;
@@ -439,21 +469,66 @@ pub fn switch_row(ui: &mut Ui, id: &str, label: &str, on: &mut bool) -> bool {
     changed
 }
 
-/// The slider with what makes it easy to land on a value: hold Shift while dragging to move ten times slower, Left and Right keys over it
-/// move by one `step` (Shift: ten steps), and a click on the number lets you type it (the text typed is the second result, when it is
-/// confirmed with Enter or by leaving the box). `step` is in the units of `v` (0..1).
-/// The thin slider of the transport bar (volume, position, speed): a track, its filled part and a handle that is whole at both ends.
-/// Returns where the handle is.
-pub fn mini_track(ui: &Ui, area: Rect, f: f32, hot: bool, fill: Color32) -> f32 {
-    let line = Rect::from_center_size(area.center(), Vec2::new(area.width(), 6.0));
-    ui.painter().rect_filled(line, CornerRadius::same(3), BACKGROUND5);
-    let x = area.left() + 5.0 + (area.width() - 10.0) * f.clamp(0.0, 1.0);
-    ui.painter().rect_filled(Rect::from_min_max(line.min, Pos2::new(x, line.bottom())), CornerRadius::same(3), fill);
-    ui.painter().rect_filled(Rect::from_center_size(Pos2::new(x, area.center().y), Vec2::new(10.0, 22.0)), CornerRadius::same(5), if hot { HIGHLIGHT1 } else { LIGHT1 });
+/// Compact sibling of the settings slider for the transport bar and animation scrub: a rounded track, purple fill clipped to the
+/// bar shape, and an internal slim off-white pill marker kept clear of both ends. Returns the marker's x position.
+pub fn mini_track(ui: &Ui, id: &str, area: Rect, f: f32, hot: bool) -> f32 {
+    let f = f.clamp(0.0, 1.0);
+    let h = ease(ui, ui.scope_id().with(("mt", id)), hot);
+    let bar_h = area.height().min(16.0).max(12.0);
+    let bar = Rect::from_center_size(area.center(), Vec2::new(area.width(), bar_h));
+    let rad = CornerRadius::same(6);
+    let track = lerp_c(BACKGROUND5, Color32::BLACK, 0.15);
+    ui.painter().rect_filled(bar, rad, track);
+    let mw = 6.0;
+    let margin = 3.0;
+    let room = mw + 2.0 * margin;
+    let travel = (bar.width() - room).max(1.0);
+    let x = bar.left() + room * 0.5 + travel * f;
+    let fill_col = lerp_c(Color32::from_rgb(0x5e, 0x45, 0xc4), Color32::from_rgb(0x74, 0x5a, 0xe4), h);
+    let full = ((f - 0.94) / 0.06).clamp(0.0, 1.0);
+    let fill_end = x + (bar.right() - x) * full;
+    let vis = ui.ctx().animate_bool_with_time(ui.scope_id().with(("mt-vis", id)), f > 1e-4, 0.10);
+    if vis > 0.01 {
+        let opacity = (0.75 + 0.25 * f) * vis;
+        let clip = Rect::from_min_max(bar.min, Pos2::new(fill_end, bar.bottom()));
+        ui.painter().with_clip_rect(clip).rect_filled(bar, rad, fill_col.gamma_multiply(opacity));
+    }
+    let marker = Rect::from_center_size(Pos2::new(x, bar.center().y), Vec2::new(mw, (bar_h - 6.0).max(6.0)));
+    let mcol = lerp_c(Color32::from_rgb(0xe8, 0xe4, 0xf6), Color32::WHITE, h);
+    ui.painter().rect_filled(marker, CornerRadius::same(3), mcol);
     x
 }
 
+/// Shared eased pill button for docks, toolbars, speed popups and canvas bars.
+pub fn pill_resp(ui: &mut Ui, r: Rect, id: &str, label: &str, on: bool, enabled: bool, tip: &str) -> Response {
+    let mut resp = ui.interact(r, ui.scope_id().with(("pill", id)), Sense::click());
+    if enabled {
+        resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    if !tip.is_empty() {
+        resp = resp.on_hover_text(tip);
+    }
+    let hov = ease(ui, resp.id.with("h"), resp.hovered() && enabled);
+    let act = ease(ui, resp.id.with("a"), on && enabled);
+    let idle_bg = lerp_c(BACKGROUND6, DARK3, hov);
+    let active_bg = lerp_c(COLOR3, lighten(COLOR3, 0.16), hov);
+    let bg = if !enabled { BACKGROUND4 } else { lerp_c(idle_bg, active_bg, act) };
+    let fg = if !enabled { BACKGROUND1 } else { lerp_c(lerp_c(LIGHT1, CONTENT1, hov), CONTENT1, act) };
+    ui.painter().rect_filled(r, CornerRadius::same(5), bg);
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::new(13.5, semibold()), fg);
+    resp
+}
+
+pub fn pill(ui: &mut Ui, r: Rect, id: &str, label: &str, on: bool, enabled: bool, tip: &str) -> bool {
+    pill_resp(ui, r, id, label, on, enabled, tip).clicked() && enabled
+}
+
+#[allow(dead_code)]
 pub fn slider_row_ex(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str, v: &mut f32, step: f32) -> (bool, Option<String>) {
+    slider_row_def(ui, id, caption_text, value_text, v, step, None)
+}
+
+pub fn slider_row_def(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str, v: &mut f32, step: f32, default_f: Option<f32>) -> (bool, Option<String>) {
     let rid = ui.scope_id().with(id);
     let width = ui.available_width() - 22.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 66.0 + ROW_GAP), Sense::hover());
@@ -503,31 +578,44 @@ pub fn slider_row_ex(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str
     let bar = Rect::from_min_max(Pos2::new(bar_left, rect.top() + 28.0), Pos2::new(rect.right() - PAD, rect.bottom() - 8.0));
     // the marker is a slim vertical pill: it stays 3 px clear of the ends of the bar, so it is whole at 0% and at 100%
     let room = 8.0 + 2.0 * 3.0;
-    let resp = ui.interact(bar, rid.with("bar"), Sense::click_and_drag());
+    let resp = ui.interact(bar, rid.with("bar"), Sense::click_and_drag()).on_hover_text("Drag · Shift for fine · Double-click to reset");
     let mut changed = false;
     let raw_id = rid.with("raw");
+    let init_id = rid.with("init");
+    let def_f = match default_f {
+        Some(d) => d.clamp(0.0, 1.0),
+        None => ui.memory_mut(|m| *m.data.get_temp_mut_or_insert_with(init_id, || *v)),
+    };
     let shift = ui.input(|i| i.modifiers.shift);
-    if resp.drag_started() || (resp.is_pointer_button_down_on() && !ui.memory(|m| m.data.get_temp::<f32>(raw_id).is_some())) {
-        ui.memory_mut(|m| m.data.insert_temp(raw_id, *v));
-    }
-    if resp.dragged() || resp.clicked() || resp.is_pointer_button_down_on() {
-        if let Some(p) = resp.interact_pointer_pos() {
-            let travel = bar.width() - room;
-            let mut raw = ui.memory(|m| m.data.get_temp::<f32>(raw_id)).unwrap_or(*v);
-            if shift && resp.dragged() {
-                // slow: ten times less than the pointer moves, from where the value is
-                raw = (raw + resp.drag_delta().x / travel * 0.1).clamp(0.0, 1.0);
-            } else {
-                raw = ((p.x - bar.left() - room / 2.0) / travel).clamp(0.0, 1.0);
-            }
-            ui.memory_mut(|m| m.data.insert_temp(raw_id, raw));
-            if (raw - *v).abs() > 1e-5 {
-                *v = raw;
-                changed = true;
-            }
+    if resp.double_clicked() {
+        ui.memory_mut(|m| m.data.remove::<f32>(raw_id));
+        if (def_f - *v).abs() > 1e-5 {
+            *v = def_f;
+            changed = true;
         }
     } else {
-        ui.memory_mut(|m| m.data.remove::<f32>(raw_id));
+        if resp.drag_started() || (resp.is_pointer_button_down_on() && !ui.memory(|m| m.data.get_temp::<f32>(raw_id).is_some())) {
+            ui.memory_mut(|m| m.data.insert_temp(raw_id, *v));
+        }
+        if resp.dragged() || resp.clicked() || resp.is_pointer_button_down_on() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let travel = bar.width() - room;
+                let mut raw = ui.memory(|m| m.data.get_temp::<f32>(raw_id)).unwrap_or(*v);
+                if shift && resp.dragged() {
+                    // slow: ten times less than the pointer moves, from where the value is
+                    raw = (raw + resp.drag_delta().x / travel * 0.1).clamp(0.0, 1.0);
+                } else {
+                    raw = ((p.x - bar.left() - room / 2.0) / travel).clamp(0.0, 1.0);
+                }
+                ui.memory_mut(|m| m.data.insert_temp(raw_id, raw));
+                if (raw - *v).abs() > 1e-5 {
+                    *v = raw;
+                    changed = true;
+                }
+            }
+        } else {
+            ui.memory_mut(|m| m.data.remove::<f32>(raw_id));
+        }
     }
     // the arrow keys, over the slider
     if resp.hovered() && !ui.memory(|m| m.focused().is_some()) {
@@ -602,16 +690,24 @@ pub fn slider_row_ex(ui: &mut Ui, id: &str, caption_text: &str, value_text: &str
 /// A slider over `min..max` that moves in whole `step`s (so every value it shows can be landed on) and can be typed into: a click on the
 /// number opens a box, and `per_unit` is how many of the shown units make 1 of the value (100 for a value shown in percent). Returns true
 /// when the value changed.
+#[allow(dead_code)]
 pub fn value_slider(ui: &mut Ui, id: &str, caption: &str, shown: &str, v: &mut f32, min: f32, max: f32, step: f32, per_unit: f32) -> bool {
     value_slider_ex(ui, id, caption, shown, v, (min, max), (min, max), step, per_unit)
 }
 
 /// `value_slider` whose typed values may go beyond the range of the bar (`hard`): the bar is as short as can be dragged without skipping a step.
+#[allow(dead_code)]
 pub fn value_slider_ex(ui: &mut Ui, id: &str, caption: &str, shown: &str, v: &mut f32, (min, max): (f32, f32), hard: (f32, f32), step: f32, per_unit: f32) -> bool {
+    value_slider_def(ui, id, caption, shown, v, (min, max), hard, step, per_unit, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn value_slider_def(ui: &mut Ui, id: &str, caption: &str, shown: &str, v: &mut f32, (min, max): (f32, f32), hard: (f32, f32), step: f32, per_unit: f32, default_v: Option<f32>) -> bool {
     let range = (max - min).max(1e-6);
     let snap = |x: f32| (((x / step).round() * step * 1e5).round() / 1e5).clamp(min, max);
     let mut f = ((*v - min) / range).clamp(0.0, 1.0);
-    let (moved, typed) = slider_row_ex(ui, id, caption, shown, &mut f, step / range);
+    let def_f = default_v.map(|d| ((d - min) / range).clamp(0.0, 1.0));
+    let (moved, typed) = slider_row_def(ui, id, caption, shown, &mut f, step / range, def_f);
     let mut changed = false;
     if moved {
         let x = snap(min + f * range);
@@ -650,7 +746,10 @@ pub enum Kind {
 /// A full-width settings button (RoundedButton: 5 px corner, lightened by 0.2 on hover).
 pub fn button_wide(ui: &mut Ui, label: &str, kind: Kind, enabled: bool) -> Response {
     let width = ui.available_width() - 22.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 40.0 + ROW_GAP), Sense::click());
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(width, 40.0 + ROW_GAP), Sense::click());
+    if enabled {
+        resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
     let rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 0.0), Vec2::new(rect.width(), rect.height() - ROW_GAP));
     paint_button(ui, rect, &resp, label, kind, enabled);
     resp
@@ -666,7 +765,7 @@ pub fn button_grid(ui: &mut Ui, labels: &[&str], cols: usize, kind: Kind) -> Opt
         let (area, _) = ui.allocate_exact_size(Vec2::new(total + 22.0, h + gap), Sense::hover());
         for (i, label) in chunk.iter().enumerate() {
             let rect = Rect::from_min_size(area.min + Vec2::new(12.0 + i as f32 * (w + gap), 0.0), Vec2::new(w, h));
-            let resp = ui.interact(rect, ui.make_persistent_id(("grid_button", row, i)), Sense::click());
+            let resp = ui.interact(rect, ui.make_persistent_id(("grid_button", row, i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
             paint_button(ui, rect, &resp, label, kind, true);
             if resp.clicked() {
                 clicked = Some(row * cols + i);
@@ -679,7 +778,15 @@ pub fn button_grid(ui: &mut Ui, labels: &[&str], cols: usize, kind: Kind) -> Opt
 /// A button sized to its text.
 pub fn button(ui: &mut Ui, label: &str, kind: Kind, enabled: bool) -> Response {
     let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::new(15.0, semibold()), CONTENT1);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 28.0, 32.0), Sense::click());
+    button_fixed(ui, galley.size().x + 28.0, label, kind, enabled)
+}
+
+/// A button with a fixed width (so toggling its label between e.g. "+ Add edit" and "Cancel" never shifts layout).
+pub fn button_fixed(ui: &mut Ui, width: f32, label: &str, kind: Kind, enabled: bool) -> Response {
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+    if enabled {
+        resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
     paint_button(ui, rect, &resp, label, kind, enabled);
     resp
 }
@@ -734,6 +841,7 @@ pub fn note(ui: &mut Ui, s: &str) {
 /// One entry of the sidebar: icon-less text with the 4 px selection bar on the left.
 pub fn sidebar_item(ui: &mut Ui, label: &str, icon: usize, selected: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let id = resp.id;
     let sel = ease(ui, id.with("sel"), selected);
     let hov = ease(ui, id.with("hov"), resp.hovered());

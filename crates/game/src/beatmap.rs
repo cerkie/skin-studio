@@ -317,6 +317,35 @@ impl Beatmap {
         self.objects = out;
     }
 
+    /// Override Circle Size, Approach Rate, and/or Hard Rock (1.3x CS, 1.4x AR capped at 10, vertical flip) for live preview testing.
+    pub fn override_difficulty(&mut self, cs: Option<f32>, ar: Option<f32>, hard_rock: bool) {
+        if cs.is_none() && ar.is_none() && !hard_rock {
+            return;
+        }
+        if hard_rock {
+            self.cs = (self.cs * 1.3).min(10.0);
+            self.ar = (self.ar * 1.4).min(10.0);
+            for o in &mut self.objects {
+                o.pos[1] = 384.0 - o.pos[1];
+                if let Kind::Slider(s) = &mut o.kind {
+                    for pt in &mut s.path.pts {
+                        pt[1] = -pt[1];
+                    }
+                }
+            }
+        }
+        if let Some(v) = cs {
+            self.cs = v.clamp(0.0, 10.0);
+        }
+        if let Some(v) = ar {
+            self.ar = v.clamp(0.0, 11.0);
+        }
+        for o in &mut self.objects {
+            o.stack = 0;
+        }
+        self.apply_stacking();
+    }
+
     fn apply_stacking(&mut self) {
         let n = self.objects.len();
         if n < 2 {

@@ -7,12 +7,12 @@
 //! which changes the colours as little as possible, and the alpha. Every one can be limited by an edge mask ([`Mask`]).
 use rayon::prelude::*;
 
-use crate::edit::{resize, Resample};
+use crate::edit::Resample;
 use crate::img::Img;
 
 // ------------------------------------------------------------------------------------------------------------------------ options
 /// Which planes of the picture a filter works on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Target {
     /// The brightness of the colour (the hue is kept).
     Colour,
@@ -24,15 +24,15 @@ impl Target {
     pub const ALL: [Target; 3] = [Target::Both, Target::Colour, Target::Alpha];
     pub fn name(self) -> &'static str {
         match self {
-            Target::Both => "Colour and alpha",
-            Target::Colour => "Colour",
+            Target::Both => "Color and alpha",
+            Target::Colour => "Color",
             Target::Alpha => "Alpha (transparency)",
         }
     }
 }
 
 /// An edge detector (vsmasktools).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Edge {
     Sobel,
     Prewitt,
@@ -59,7 +59,7 @@ impl Edge {
 /// Luma scaling, after adaptivegrain (used by vodesfunc's `adaptive_grain`): how much of a filter is applied depends on the brightness of the
 /// pixel. The weight is `(1 - f(luma))^e`, with the polynomial `f` of adaptivegrain: 1 in the dark, falling to 0 in the light. Banding and
 /// noise show in the dark parts, where there is less to work with, so a positive value applies the filter there and barely at all in the light.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LumaScale {
     /// The exponent `e` (adaptivegrain's `luma_scaling`): larger = the weight falls off faster towards the light. 0 = off (the filter is applied
     /// everywhere equally). Negative: the same for the bright parts instead (vodesfunc inverts the picture first).
@@ -108,8 +108,8 @@ pub fn mask_weights(src: &Img, m: &Mask) -> Vec<f32> {
         return vec![1.0; src.px.len()];
     }
     let (w, h) = (src.w, src.h);
-    let y = Plane { w, h, v: src.px.iter().map(|p| (p[0] * LUMA[0] + p[1] * LUMA[1] + p[2] * LUMA[2]) * 255.0).collect() };
-    let a = Plane { w, h, v: src.px.iter().map(|p| p[3] * 255.0).collect() };
+    let y = Plane { w, h, v: src.px.par_iter().map(|p| (p[0] * LUMA[0] + p[1] * LUMA[1] + p[2] * LUMA[2]) * 255.0).collect() };
+    let a = Plane { w, h, v: src.px.par_iter().map(|p| p[3] * 255.0).collect() };
     build_mask(&[&y, &a], m).v.iter().map(|v| v / 255.0).collect()
 }
 
@@ -132,7 +132,7 @@ pub fn merge_weighted(src: &Img, filtered: &Img, w: &[f32]) -> Img {
 }
 
 /// Limits a filter to where it is wanted: near edges (halos, aliasing) or, inverted, away from them (noise).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Mask {
     pub enabled: bool,
     pub edge: Edge,
@@ -156,7 +156,7 @@ impl Mask {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Dehalo {
     /// `fine_dehalo` (with its own mask that spares lines and details) instead of plain `dehalo_alpha`.
     pub fine: bool,
@@ -191,7 +191,7 @@ impl Default for Dehalo {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DenoiseKind {
     /// Non-local means: pixels are averaged with the ones in the neighbourhood whose surroundings look alike.
     NlMeans,
@@ -209,7 +209,7 @@ impl DenoiseKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Denoise {
     pub kind: DenoiseKind,
     /// Strength (non-local means) in 8-bit levels: about the spread of the noise that is to go.
@@ -230,7 +230,7 @@ impl Default for Denoise {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AntiAlias {
     /// How much larger the picture is made while the edges are smoothed (it is shrunk again after).
     pub rfactor: f32,
@@ -261,30 +261,156 @@ impl Plane {
     fn new(w: usize, h: usize) -> Plane {
         Plane { w, h, v: vec![0.0; w * h] }
     }
-    #[inline]
-    fn at(&self, x: i64, y: i64) -> f32 {
-        self.v[y.clamp(0, self.h as i64 - 1) as usize * self.w + x.clamp(0, self.w as i64 - 1) as usize]
-    }
-    fn from_fn(w: usize, h: usize, f: impl Fn(usize, usize) -> f32 + Sync) -> Plane {
-        let mut v = vec![0.0f32; w * h];
-        v.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
-            for (x, o) in row.iter_mut().enumerate() {
-                *o = f(x, y);
-            }
-        });
-        Plane { w, h, v }
-    }
-    fn to_img(&self) -> Img {
-        Img { w: self.w, h: self.h, px: self.v.iter().map(|&p| [p / 255.0; 4]).collect() }
-    }
-    fn from_img(im: &Img) -> Plane {
-        Plane { w: im.w, h: im.h, v: im.px.iter().map(|p| p[0] * 255.0).collect() }
-    }
+    /// Direct single-channel resize (area-average for shrinking, Catmull-Rom clamped or bilinear for growing).
     fn resized(&self, w: usize, h: usize, mode: Resample) -> Plane {
-        if (w, h) == (self.w, self.h) {
+        let (w, h) = (w.clamp(1, 16384), h.clamp(1, 16384));
+        if (w, h) == (self.w, self.h) || self.w == 0 || self.h == 0 {
             return self.clone();
         }
-        Plane::from_img(&resize(&self.to_img(), w, h, mode))
+        let area_weights = |src_n: usize, dst_n: usize| -> Vec<Vec<(usize, f32)>> {
+            let scale = src_n as f32 / dst_n as f32;
+            (0..dst_n)
+                .map(|o| {
+                    let (a, b) = (o as f32 * scale, (o + 1) as f32 * scale);
+                    let mut ws = Vec::new();
+                    let (i0, i1) = (a.floor() as usize, (b.ceil() as usize).min(src_n));
+                    for i in i0..i1 {
+                        let lo = a.max(i as f32);
+                        let hi = b.min((i + 1) as f32);
+                        if hi > lo {
+                            ws.push((i, (hi - lo) / scale));
+                        }
+                    }
+                    ws
+                })
+                .collect()
+        };
+        let shrink = |p: &Plane, dw: usize, dh: usize| -> Plane {
+            let tmp_owned: Plane;
+            let mid: &Plane = if dw != p.w {
+                let wx = area_weights(p.w, dw);
+                let mut tmp = Plane::new(dw, p.h);
+                tmp.v.par_chunks_mut(dw).enumerate().for_each(|(y, row_out)| {
+                    let row_in = &p.v[y * p.w..(y + 1) * p.w];
+                    for (x, ws) in wx.iter().enumerate() {
+                        let mut acc = 0.0f32;
+                        for &(i, k) in ws {
+                            acc += row_in[i] * k;
+                        }
+                        row_out[x] = acc;
+                    }
+                });
+                if dh == p.h {
+                    return tmp;
+                }
+                tmp_owned = tmp;
+                &tmp_owned
+            } else {
+                p
+            };
+            let wy = area_weights(mid.h, dh);
+            let mut out = Plane::new(dw, dh);
+            out.v.par_chunks_mut(dw).enumerate().for_each(|(y, row_out)| {
+                for &(j, k) in &wy[y] {
+                    let row_in = &mid.v[j * dw..(j + 1) * dw];
+                    for (dst, &v) in row_out.iter_mut().zip(row_in) {
+                        *dst += v * k;
+                    }
+                }
+            });
+            out
+        };
+        let (dw, dh) = (w.min(self.w), h.min(self.h));
+        let shrunk_owned: Plane;
+        let src: &Plane = if (dw, dh) == (w, h) {
+            return shrink(self, dw, dh);
+        } else if (dw, dh) != (self.w, self.h) {
+            shrunk_owned = shrink(self, dw, dh);
+            &shrunk_owned
+        } else {
+            self
+        };
+        let (kx, ky) = (src.w as f32 / w as f32, src.h as f32 / h as f32);
+        let (sw_i, sh_i) = (src.w as i64 - 1, src.h as i64 - 1);
+        let mut out = Plane::new(w, h);
+        if mode == Resample::Crisp {
+            let catmull = |t: f32| -> [f32; 4] {
+                let (t2, t3) = (t * t, t * t * t);
+                [0.5 * (-t3 + 2.0 * t2 - t), 0.5 * (3.0 * t3 - 5.0 * t2 + 2.0), 0.5 * (-3.0 * t3 + 4.0 * t2 + t), 0.5 * (t3 - t2)]
+            };
+            let x_taps: Vec<([usize; 4], [f32; 4])> = (0..w)
+                .map(|x| {
+                    let u = (x as f32 + 0.5) * kx - 0.5;
+                    let ix = u.floor();
+                    let tx = u - ix;
+                    let ix = ix as i64;
+                    (
+                        [
+                            (ix - 1).clamp(0, sw_i) as usize,
+                            ix.clamp(0, sw_i) as usize,
+                            (ix + 1).clamp(0, sw_i) as usize,
+                            (ix + 2).clamp(0, sw_i) as usize,
+                        ],
+                        catmull(tx),
+                    )
+                })
+                .collect();
+            out.v.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+                let v = (y as f32 + 0.5) * ky - 0.5;
+                let iy = v.floor();
+                let ty = v - iy;
+                let iy = iy as i64;
+                let wy = catmull(ty);
+                let y0 = (iy - 1).clamp(0, sh_i) as usize;
+                let y1 = iy.clamp(0, sh_i) as usize;
+                let y2 = (iy + 1).clamp(0, sh_i) as usize;
+                let y3 = (iy + 2).clamp(0, sh_i) as usize;
+                let r0 = &src.v[y0 * src.w..(y0 + 1) * src.w];
+                let r1 = &src.v[y1 * src.w..(y1 + 1) * src.w];
+                let r2 = &src.v[y2 * src.w..(y2 + 1) * src.w];
+                let r3 = &src.v[y3 * src.w..(y3 + 1) * src.w];
+                for (dst, &(cols, wx)) in row_out.iter_mut().zip(&x_taps) {
+                    let s0 = r0[cols[0]] * wx[0] + r0[cols[1]] * wx[1] + r0[cols[2]] * wx[2] + r0[cols[3]] * wx[3];
+                    let p11 = r1[cols[1]];
+                    let p12 = r1[cols[2]];
+                    let s1 = r1[cols[0]] * wx[0] + p11 * wx[1] + p12 * wx[2] + r1[cols[3]] * wx[3];
+                    let p21 = r2[cols[1]];
+                    let p22 = r2[cols[2]];
+                    let s2 = r2[cols[0]] * wx[0] + p21 * wx[1] + p22 * wx[2] + r2[cols[3]] * wx[3];
+                    let s3 = r3[cols[0]] * wx[0] + r3[cols[1]] * wx[1] + r3[cols[2]] * wx[2] + r3[cols[3]] * wx[3];
+                    let val = s0 * wy[0] + s1 * wy[1] + s2 * wy[2] + s3 * wy[3];
+                    let lo = p11.min(p12).min(p21).min(p22);
+                    let hi = p11.max(p12).max(p21).max(p22);
+                    *dst = val.clamp(lo, hi);
+                }
+            });
+        } else {
+            let x_taps: Vec<(usize, usize, f32)> = (0..w)
+                .map(|x| {
+                    let u = (x as f32 + 0.5) * kx - 0.5;
+                    let ix = u.floor();
+                    let tx = u - ix;
+                    let ix = ix as i64;
+                    (ix.clamp(0, sw_i) as usize, (ix + 1).clamp(0, sw_i) as usize, tx)
+                })
+                .collect();
+            out.v.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+                let v = (y as f32 + 0.5) * ky - 0.5;
+                let iy = v.floor();
+                let ty = v - iy;
+                let iy = iy as i64;
+                let y0 = iy.clamp(0, sh_i) as usize;
+                let y1 = (iy + 1).clamp(0, sh_i) as usize;
+                let r0 = &src.v[y0 * src.w..(y0 + 1) * src.w];
+                let r1 = &src.v[y1 * src.w..(y1 + 1) * src.w];
+                let ity = 1.0 - ty;
+                for (dst, &(x0, x1, tx)) in row_out.iter_mut().zip(&x_taps) {
+                    let itx = 1.0 - tx;
+                    *dst = (r0[x0] * itx + r0[x1] * tx) * ity + (r1[x0] * itx + r1[x1] * tx) * ty;
+                }
+            });
+        }
+        out
     }
     fn zip(&self, o: &Plane, f: impl Fn(f32, f32) -> f32 + Sync) -> Plane {
         Plane { w: self.w, h: self.h, v: self.v.par_iter().zip(o.v.par_iter()).map(|(&a, &b)| f(a, b)).collect() }
@@ -295,51 +421,209 @@ impl Plane {
 }
 
 pub fn gauss_blur(p: &Plane, sigma: f32) -> Plane {
-    if sigma <= 0.05 {
+    if sigma <= 0.05 || p.w == 0 || p.h == 0 {
         return p.clone();
     }
-    let r = (sigma * 3.0).ceil().max(1.0) as i64;
-    let k: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let r = (sigma * 3.0).ceil().max(1.0) as usize;
+    let ri = r as i64;
+    let k: Vec<f32> = (-ri..=ri).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
     let sum: f32 = k.iter().sum();
     let k: Vec<f32> = k.iter().map(|v| v / sum).collect();
-    let tmp = Plane::from_fn(p.w, p.h, |x, y| (-r..=r).map(|i| p.at(x as i64 + i, y as i64) * k[(i + r) as usize]).sum());
-    Plane::from_fn(p.w, p.h, |x, y| (-r..=r).map(|i| tmp.at(x as i64, y as i64 + i) * k[(i + r) as usize]).sum())
+    let (w, h) = (p.w, p.h);
+    let (wi, hi) = (w as i64 - 1, h as i64 - 1);
+
+    let mut tmp = vec![0.0f32; w * h];
+    tmp.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+        let row_in = &p.v[y * w..(y + 1) * w];
+        let left_end = r.min(w);
+        let right_start = w.saturating_sub(r).max(left_end);
+        for x in 0..left_end {
+            let mut acc = 0.0f32;
+            for (ki, &wk) in k.iter().enumerate() {
+                let xx = (x as i64 + ki as i64 - ri).clamp(0, wi) as usize;
+                acc += row_in[xx] * wk;
+            }
+            row_out[x] = acc;
+        }
+        for x in left_end..right_start {
+            let mut acc = 0.0f32;
+            for (&v, &wk) in row_in[x - r..x + r + 1].iter().zip(&k) {
+                acc += v * wk;
+            }
+            row_out[x] = acc;
+        }
+        for x in right_start..w {
+            let mut acc = 0.0f32;
+            for (ki, &wk) in k.iter().enumerate() {
+                let xx = (x as i64 + ki as i64 - ri).clamp(0, wi) as usize;
+                acc += row_in[xx] * wk;
+            }
+            row_out[x] = acc;
+        }
+    });
+
+    let mut out = vec![0.0f32; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+        for (ki, &wk) in k.iter().enumerate() {
+            let yy = (y as i64 + ki as i64 - ri).clamp(0, hi) as usize;
+            let row_in = &tmp[yy * w..(yy + 1) * w];
+            for (dst, &v) in row_out.iter_mut().zip(row_in) {
+                *dst += v * wk;
+            }
+        }
+    });
+    Plane { w, h, v: out }
 }
 
-/// 3 x 3 box blur, `passes` times.
+/// 3 x 3 box blur, `passes` times (separable 1D passes).
 fn box3(p: &Plane, passes: usize) -> Plane {
-    let mut cur = p.clone();
+    if passes == 0 || p.w == 0 || p.h == 0 {
+        return p.clone();
+    }
+    let (w, h) = (p.w, p.h);
+    let mut cur = p.v.clone();
+    let mut tmp = vec![0.0f32; w * h];
+    const INV3: f32 = 1.0 / 3.0;
     for _ in 0..passes {
-        let c = &cur;
-        cur = Plane::from_fn(p.w, p.h, |x, y| {
-            let mut s = 0.0;
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    s += c.at(x as i64 + dx, y as i64 + dy);
-                }
+        let src = &cur;
+        tmp.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+            let row_in = &src[y * w..(y + 1) * w];
+            if w == 1 {
+                row_out[0] = row_in[0];
+                return;
             }
-            s / 9.0
+            row_out[0] = (row_in[0] + row_in[0] + row_in[1]) * INV3;
+            for x in 1..w - 1 {
+                row_out[x] = (row_in[x - 1] + row_in[x] + row_in[x + 1]) * INV3;
+            }
+            row_out[w - 1] = (row_in[w - 2] + row_in[w - 1] + row_in[w - 1]) * INV3;
+        });
+        let mid = &tmp;
+        cur.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+            let r0 = &mid[y.saturating_sub(1) * w..(y.saturating_sub(1) + 1) * w];
+            let r1 = &mid[y * w..(y + 1) * w];
+            let y2 = (y + 1).min(h - 1);
+            let r2 = &mid[y2 * w..(y2 + 1) * w];
+            for x in 0..w {
+                row_out[x] = (r0[x] + r1[x] + r2[x]) * INV3;
+            }
         });
     }
-    cur
+    Plane { w, h, v: cur }
 }
 
 /// Grows (`max`) or shrinks the bright parts by `rx` and `ry` pixels, with a rectangle or an ellipse.
 fn morph(p: &Plane, rx: usize, ry: usize, max: bool, ellipse: bool) -> Plane {
-    if rx == 0 && ry == 0 {
+    if (rx == 0 && ry == 0) || p.w == 0 || p.h == 0 {
         return p.clone();
     }
+    let (w, h) = (p.w, p.h);
     let (rxi, ryi) = (rx as i64, ry as i64);
-    let pick = move |a: f32, b: f32| if max { a.max(b) } else { a.min(b) };
+    let (wi, hi) = (w as i64 - 1, h as i64 - 1);
     if !ellipse {
-        let tmp = Plane::from_fn(p.w, p.h, |x, y| (-rxi..=rxi).map(|i| p.at(x as i64 + i, y as i64)).reduce(pick).unwrap());
-        return Plane::from_fn(p.w, p.h, |x, y| (-ryi..=ryi).map(|i| tmp.at(x as i64, y as i64 + i)).reduce(pick).unwrap());
+        let mut tmp = vec![0.0f32; w * h];
+        if rx > 0 {
+            tmp.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+                let row_in = &p.v[y * w..(y + 1) * w];
+                let left_end = rx.min(w);
+                let right_start = w.saturating_sub(rx).max(left_end);
+                for x in 0..left_end {
+                    let mut acc = row_in[0];
+                    for dx in -rxi..=rxi {
+                        let v = row_in[(x as i64 + dx).clamp(0, wi) as usize];
+                        acc = if max { acc.max(v) } else { acc.min(v) };
+                    }
+                    row_out[x] = acc;
+                }
+                for x in left_end..right_start {
+                    let s = &row_in[x - rx..=x + rx];
+                    let mut acc = s[0];
+                    for &v in &s[1..] {
+                        acc = if max { acc.max(v) } else { acc.min(v) };
+                    }
+                    row_out[x] = acc;
+                }
+                for x in right_start..w {
+                    let mut acc = row_in[w - 1];
+                    for dx in -rxi..=rxi {
+                        let v = row_in[(x as i64 + dx).clamp(0, wi) as usize];
+                        acc = if max { acc.max(v) } else { acc.min(v) };
+                    }
+                    row_out[x] = acc;
+                }
+            });
+        } else {
+            tmp.copy_from_slice(&p.v);
+        }
+        if ry == 0 {
+            return Plane { w, h, v: tmp };
+        }
+        let mut out = vec![0.0f32; w * h];
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+            let y0 = (y as i64 - ryi).clamp(0, hi) as usize;
+            row_out.copy_from_slice(&tmp[y0 * w..(y0 + 1) * w]);
+            for dy in -ryi + 1..=ryi {
+                let yy = (y as i64 + dy).clamp(0, hi) as usize;
+                let row_in = &tmp[yy * w..(yy + 1) * w];
+                if max {
+                    for (dst, &v) in row_out.iter_mut().zip(row_in) {
+                        *dst = dst.max(v);
+                    }
+                } else {
+                    for (dst, &v) in row_out.iter_mut().zip(row_in) {
+                        *dst = dst.min(v);
+                    }
+                }
+            }
+        });
+        return Plane { w, h, v: out };
     }
     let offs: Vec<(i64, i64)> = (-ryi..=ryi)
         .flat_map(|dy| (-rxi..=rxi).map(move |dx| (dx, dy)))
         .filter(|&(dx, dy)| (dx * dx) as f32 / ((rx * rx).max(1)) as f32 + (dy * dy) as f32 / ((ry * ry).max(1)) as f32 <= 1.0 + 1e-3)
         .collect();
-    Plane::from_fn(p.w, p.h, |x, y| offs.iter().map(|&(dx, dy)| p.at(x as i64 + dx, y as i64 + dy)).reduce(pick).unwrap())
+    let wi_is = w as isize;
+    let offs_delta: Vec<isize> = offs.iter().map(|&(dx, dy)| dy as isize * wi_is + dx as isize).collect();
+    let mut out = vec![0.0f32; w * h];
+    let x_safe_end = w.saturating_sub(rx);
+    let y_safe_end = h.saturating_sub(ry);
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+        let yi = y as i64;
+        let row_base = y * w;
+        let y_int = y >= ry && y < y_safe_end;
+        for (x, dst) in row_out.iter_mut().enumerate() {
+            if y_int && x >= rx && x < x_safe_end {
+                let ii = (row_base + x) as isize;
+                let mut acc = p.v[(ii + offs_delta[0]) as usize];
+                if max {
+                    for &d in &offs_delta[1..] {
+                        acc = acc.max(p.v[(ii + d) as usize]);
+                    }
+                } else {
+                    for &d in &offs_delta[1..] {
+                        acc = acc.min(p.v[(ii + d) as usize]);
+                    }
+                }
+                *dst = acc;
+            } else {
+                let xi = x as i64;
+                let mut acc = p.v[(yi + offs[0].1).clamp(0, hi) as usize * w + (xi + offs[0].0).clamp(0, wi) as usize];
+                if max {
+                    for &(dx, dy) in &offs[1..] {
+                        let v = p.v[(yi + dy).clamp(0, hi) as usize * w + (xi + dx).clamp(0, wi) as usize];
+                        acc = acc.max(v);
+                    }
+                } else {
+                    for &(dx, dy) in &offs[1..] {
+                        let v = p.v[(yi + dy).clamp(0, hi) as usize * w + (xi + dx).clamp(0, wi) as usize];
+                        acc = acc.min(v);
+                    }
+                }
+                *dst = acc;
+            }
+        }
+    });
+    Plane { w, h, v: out }
 }
 
 fn binarize(p: &Plane, thr: f32) -> Plane {
@@ -364,23 +648,50 @@ const KIRSCH: [[f32; 9]; 8] = [
     [-3., 5., 5., -3., 0., 5., -3., -3., -3.],
 ];
 
-fn conv3(p: &Plane, k: &[f32; 9], x: i64, y: i64) -> f32 {
-    let mut s = 0.0;
-    for j in 0..3 {
-        for i in 0..3 {
-            s += k[j * 3 + i] * p.at(x + i as i64 - 1, y + j as i64 - 1);
-        }
-    }
-    s
+#[inline(always)]
+fn dot9(n: &[f32; 9], k: &[f32; 9]) -> f32 {
+    n[0] * k[0] + n[1] * k[1] + n[2] * k[2] + n[3] * k[3] + n[4] * k[4] + n[5] * k[5] + n[6] * k[6] + n[7] * k[7] + n[8] * k[8]
 }
 
 /// The edges of a plane, 0 to 255 (strong edges saturate).
 pub fn edge_mask(p: &Plane, kind: Edge) -> Plane {
-    let pair = |gx: [f32; 9], gy: [f32; 9], div: f32| Plane::from_fn(p.w, p.h, |x, y| {
-        let (a, b) = (conv3(p, &gx, x as i64, y as i64) / div, conv3(p, &gy, x as i64, y as i64) / div);
-        (a * a + b * b).sqrt().min(255.0)
-    });
-    let compass = |ks: &[[f32; 9]]| Plane::from_fn(p.w, p.h, |x, y| ks.iter().map(|k| conv3(p, k, x as i64, y as i64).abs()).fold(0.0, f32::max).min(255.0));
+    let (w, h) = (p.w, p.h);
+    if w == 0 || h == 0 {
+        return Plane::new(w, h);
+    }
+    let run_3x3 = |eval: &(dyn Fn([f32; 9]) -> f32 + Sync)| -> Plane {
+        let mut out = vec![0.0f32; w * h];
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+            let ym = y.saturating_sub(1);
+            let yp = (y + 1).min(h - 1);
+            let r0 = &p.v[ym * w..(ym + 1) * w];
+            let r1 = &p.v[y * w..(y + 1) * w];
+            let r2 = &p.v[yp * w..(yp + 1) * w];
+            for (x, dst) in row_out.iter_mut().enumerate() {
+                let xm = x.saturating_sub(1);
+                let xp = (x + 1).min(w - 1);
+                *dst = eval([r0[xm], r0[x], r0[xp], r1[xm], r1[x], r1[xp], r2[xm], r2[x], r2[xp]]);
+            }
+        });
+        Plane { w, h, v: out }
+    };
+    let pair = |gx: [f32; 9], gy: [f32; 9], div: f32| {
+        let inv = 1.0 / div;
+        run_3x3(&|n| {
+            let a = dot9(&n, &gx) * inv;
+            let b = dot9(&n, &gy) * inv;
+            (a * a + b * b).sqrt().min(255.0)
+        })
+    };
+    let compass = |ks: &[[f32; 9]]| {
+        run_3x3(&|n| {
+            let mut m = 0.0f32;
+            for k in ks {
+                m = m.max(dot9(&n, k).abs());
+            }
+            m.min(255.0)
+        })
+    };
     match kind {
         Edge::Sobel => pair([1., 0., -1., 2., 0., -2., 1., 0., -1.], [1., 2., 1., 0., 0., 0., -1., -2., -1.], 1.0),
         Edge::Prewitt => pair([1., 0., -1., 1., 0., -1., 1., 0., -1.], [1., 1., 1., 0., 0., 0., -1., -1., -1.], 1.0),
@@ -426,7 +737,7 @@ fn dehalo_alpha(src: &Plane, o: &Dehalo, rounds: usize) -> Plane {
                 let m = (ratio - low) * ((x + 256.0) / 512.0 + high);
                 m.clamp(0.0, 255.0) / 255.0
             });
-            let blurred = gauss_blur(&work, o.blur);
+            let blurred = &dehalo;
             dehalo = Plane { w: work.w, h: work.h, v: (0..work.v.len()).into_par_iter().map(|i| blurred.v[i] + (work.v[i] - blurred.v[i]) * mask.v[i]).collect() };
         }
         // keep it between the extremes of the dehaloed picture, at a larger size to avoid aliasing
@@ -499,62 +810,179 @@ impl Plane {
 /// accumulated.
 fn nl_means(p: &Plane, h: f32, a: usize, s: usize) -> Plane {
     let (w, hh) = (p.w, p.h);
-    let h2 = (2.0 * h * h).max(1e-3); // h is about the spread of the noise to be taken away
+    if w == 0 || hh == 0 {
+        return p.clone();
+    }
+    let exp_lut = neg_exp_lut();
+    let inv_h2 = 1.0 / (2.0 * h * h).max(1e-3); // h is about the spread of the noise to be taken away
     let n = w * hh;
+    let (wi, hi) = (w as i64 - 1, hh as i64 - 1);
     let mut acc = vec![0.0f32; n];
     let mut wsum = vec![0.0f32; n];
     let mut wmax = vec![0.0f32; n];
-    let patch = (2 * s + 1) as f32;
+    // Reuse scratch buffers across all search shifts instead of reallocating 3 planes per shift.
+    let mut diff = vec![0.0f32; n];
+    let mut tmp = vec![0.0f32; n];
+    let mut dist = vec![0.0f32; n];
     for dy in -(a as i64)..=a as i64 {
         for dx in -(a as i64)..=a as i64 {
             if dx == 0 && dy == 0 {
                 continue;
             }
-            let diff = Plane::from_fn(w, hh, |x, y| {
-                let d = p.at(x as i64, y as i64) - p.at(x as i64 + dx, y as i64 + dy);
-                d * d
+            diff.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+                let sy = (y as i64 + dy).clamp(0, hi) as usize;
+                let r_cur = &p.v[y * w..(y + 1) * w];
+                let r_sh = &p.v[sy * w..(sy + 1) * w];
+                for (x, dst) in row_out.iter_mut().enumerate() {
+                    let sx = (x as i64 + dx).clamp(0, wi) as usize;
+                    let d = r_cur[x] - r_sh[sx];
+                    *dst = d * d;
+                }
             });
-            let dist = box_blur_r(&diff, s);
-            acc.par_iter_mut().zip(wsum.par_iter_mut()).zip(wmax.par_iter_mut()).enumerate().for_each(|(i, ((ac, ws), wm))| {
-                let (x, y) = ((i % w) as i64, (i / w) as i64);
-                let wgt = (-dist.v[i] / h2).exp();
-                *ac += wgt * p.at(x + dx, y + dy);
-                *ws += wgt;
-                *wm = wm.max(wgt);
-            });
+            box_blur_r_into(&diff, &mut tmp, &mut dist, w, hh, s);
+            let dist_slice = if s == 0 { &diff } else { &dist };
+            acc.par_chunks_mut(w)
+                .zip(wsum.par_chunks_mut(w))
+                .zip(wmax.par_chunks_mut(w))
+                .enumerate()
+                .for_each(|(y, ((ac_row, ws_row), wm_row))| {
+                    let sy = (y as i64 + dy).clamp(0, hi) as usize;
+                    let r_sh = &p.v[sy * w..(sy + 1) * w];
+                    let r_dist = &dist_slice[y * w..(y + 1) * w];
+                    for x in 0..w {
+                        let sx = (x as i64 + dx).clamp(0, wi) as usize;
+                        let wgt = fast_neg_exp(r_dist[x] * inv_h2, exp_lut);
+                        ac_row[x] += wgt * r_sh[sx];
+                        ws_row[x] += wgt;
+                        wm_row[x] = wm_row[x].max(wgt);
+                    }
+                });
         }
     }
-    let _ = patch;
-    Plane { w, h: hh, v: (0..n).into_par_iter().map(|i| (acc[i] + wmax[i].max(1e-3) * p.v[i]) / (wsum[i] + wmax[i].max(1e-3))).collect() }
+    Plane {
+        w,
+        h: hh,
+        v: (0..n).into_par_iter().map(|i| (acc[i] + wmax[i].max(1e-3) * p.v[i]) / (wsum[i] + wmax[i].max(1e-3))).collect(),
+    }
 }
 
-/// A box blur of radius `r` (edges repeat).
-fn box_blur_r(p: &Plane, r: usize) -> Plane {
-    if r == 0 {
-        return p.clone();
+/// Separable box blur of radius `r` (edges repeat) writing into `out` via `tmp`, using an O(w) sliding sum horizontally
+/// and sequential row-major accumulation vertically.
+fn box_blur_r_into(src: &[f32], tmp: &mut [f32], out: &mut [f32], w: usize, h: usize, r: usize) {
+    if r == 0 || w == 0 || h == 0 {
+        return;
     }
     let ri = r as i64;
-    let n = (2 * r + 1) as f32;
-    let tmp = Plane::from_fn(p.w, p.h, |x, y| (-ri..=ri).map(|i| p.at(x as i64 + i, y as i64)).sum::<f32>() / n);
-    Plane::from_fn(p.w, p.h, |x, y| (-ri..=ri).map(|i| tmp.at(x as i64, y as i64 + i)).sum::<f32>() / n)
+    let inv_n = 1.0 / (2 * r + 1) as f32;
+    let (wi, hi) = (w as i64 - 1, h as i64 - 1);
+    tmp.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+        let row_in = &src[y * w..(y + 1) * w];
+        let mut s = 0.0f32;
+        for i in -ri..=ri {
+            s += row_in[i.clamp(0, wi) as usize];
+        }
+        row_out[0] = s * inv_n;
+        for x in 1..w {
+            let sub = row_in[(x as i64 - ri - 1).clamp(0, wi) as usize];
+            let add = row_in[(x as i64 + ri).clamp(0, wi) as usize];
+            s += add - sub;
+            row_out[x] = s * inv_n;
+        }
+    });
+    let mid: &[f32] = tmp;
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+        let y0 = (y as i64 - ri).clamp(0, hi) as usize;
+        row_out.copy_from_slice(&mid[y0 * w..(y0 + 1) * w]);
+        for dy in -ri + 1..=ri {
+            let yy = (y as i64 + dy).clamp(0, hi) as usize;
+            let row_in = &mid[yy * w..(yy + 1) * w];
+            for (dst, &v) in row_out.iter_mut().zip(row_in) {
+                *dst += v;
+            }
+        }
+        for dst in row_out.iter_mut() {
+            *dst *= inv_n;
+        }
+    });
+}
+
+/// Precomputed 2048-entry table for `exp(-t)` over `t in [0, 12]` (max error < 5e-4, zero libm `expf` calls).
+const EXP_LUT_MAX: f32 = 12.0;
+const EXP_LUT_SIZE: usize = 2048;
+const EXP_LUT_SCALE: f32 = (EXP_LUT_SIZE - 1) as f32 / EXP_LUT_MAX;
+
+fn neg_exp_lut() -> &'static [f32; EXP_LUT_SIZE] {
+    static LUT: std::sync::OnceLock<Box<[f32; EXP_LUT_SIZE]>> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let t: Box<[f32]> = (0..EXP_LUT_SIZE).map(|i| (-(i as f32) / EXP_LUT_SCALE).exp()).collect();
+        t.try_into().unwrap()
+    })
+}
+
+#[inline(always)]
+fn fast_neg_exp(t: f32, lut: &[f32; EXP_LUT_SIZE]) -> f32 {
+    if t >= EXP_LUT_MAX {
+        0.0
+    } else {
+        lut[(t * EXP_LUT_SCALE) as usize]
+    }
 }
 
 fn bilateral(p: &Plane, sigma_s: f32, sigma_r: f32, reference: &Plane) -> Plane {
-    let r = ((sigma_s * 2.0).ceil() as i64).clamp(1, 12);
-    let (s2, r2) = (2.0 * sigma_s * sigma_s, 2.0 * sigma_r.max(0.05) * sigma_r.max(0.05));
-    Plane::from_fn(p.w, p.h, |x, y| {
-        let c = reference.at(x as i64, y as i64);
-        let (mut sum, mut ws) = (0.0, 0.0);
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let q = reference.at(x as i64 + dx, y as i64 + dy);
-                let wgt = (-((dx * dx + dy * dy) as f32) / s2 - (q - c) * (q - c) / r2).exp();
-                sum += wgt * p.at(x as i64 + dx, y as i64 + dy);
-                ws += wgt;
+    let (w, h) = (p.w, p.h);
+    if w == 0 || h == 0 {
+        return p.clone();
+    }
+    let exp_lut = neg_exp_lut();
+    let r = ((sigma_s * 2.0).ceil() as usize).clamp(1, 12);
+    let ri = r as i64;
+    let inv_s2 = 1.0 / (2.0 * sigma_s * sigma_s);
+    let inv_r2 = 1.0 / (2.0 * sigma_r.max(0.05) * sigma_r.max(0.05));
+    let wi_is = w as isize;
+    let sp_w: Vec<(i64, i64, isize, f32)> = (-ri..=ri)
+        .flat_map(|dy| {
+            (-ri..=ri).map(move |dx| {
+                let sw = (-((dx * dx + dy * dy) as f32) * inv_s2).exp();
+                (dx, dy, dy as isize * wi_is + dx as isize, sw)
+            })
+        })
+        .collect();
+    let (wi, hi) = (w as i64 - 1, h as i64 - 1);
+    let mut out = vec![0.0f32; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+        let yi = y as i64;
+        let row_base = y * w;
+        let y_int = y >= r && y + r < h;
+        let x_safe_end = w.saturating_sub(r);
+        let row_ref = &reference.v[row_base..row_base + w];
+        for (x, dst) in row_out.iter_mut().enumerate() {
+            let xi = x as i64;
+            let c = row_ref[x];
+            let (mut sum, mut ws) = (0.0f32, 0.0f32);
+            if y_int && x >= r && x < x_safe_end {
+                let ii = (row_base + x) as isize;
+                for &(_, _, delta, sw) in &sp_w {
+                    let idx = (ii + delta) as usize;
+                    let d = reference.v[idx] - c;
+                    let rw = fast_neg_exp(d * d * inv_r2, exp_lut);
+                    let wgt = sw * rw;
+                    sum += wgt * p.v[idx];
+                    ws += wgt;
+                }
+            } else {
+                for &(dx, dy, _, sw) in &sp_w {
+                    let idx = (yi + dy).clamp(0, hi) as usize * w + (xi + dx).clamp(0, wi) as usize;
+                    let d = reference.v[idx] - c;
+                    let rw = fast_neg_exp(d * d * inv_r2, exp_lut);
+                    let wgt = sw * rw;
+                    sum += wgt * p.v[idx];
+                    ws += wgt;
+                }
             }
+            *dst = sum / ws;
         }
-        sum / ws
-    })
+    });
+    Plane { w, h, v: out }
 }
 
 fn denoise_plane(p: &Plane, o: &Denoise) -> Plane {
@@ -568,39 +996,84 @@ fn denoise_plane(p: &Plane, o: &Denoise) -> Plane {
 /// Smooths along the direction of every edge: the stair-steps of an aliased edge lie along it, so averaging there takes them out while the
 /// edge keeps its place. (An edge-directed interpolation in the spirit of EEDI2/SangNom.)
 fn smooth_along_edges(p: &Plane, reach: f32, passes: usize) -> Plane {
-    let mut cur = p.clone();
+    let (w, h) = (p.w, p.h);
+    if w == 0 || h == 0 {
+        return p.clone();
+    }
+    let mut cur = p.v.clone();
+    let mut next = vec![0.0f32; w * h];
     let sigma = (reach / 2.0).max(0.5);
     let taps = reach.ceil().max(1.0) as i64;
+    let tap_weights: Vec<(f32, f32)> = (-taps..=taps)
+        .map(|t| (t as f32, (-((t * t) as f32) / (2.0 * sigma * sigma)).exp()))
+        .collect();
+    let inv_ws: f32 = 1.0 / tap_weights.iter().map(|&(_, wgt)| wgt).sum::<f32>();
+    let (wi, hi) = (w as i64 - 1, h as i64 - 1);
+    let max_x = (w as f32 - 2.0).max(0.0);
+    let max_y = (h as f32 - 2.0).max(0.0);
     for _ in 0..passes {
         let c = &cur;
-        let bil = |x: f32, y: f32| -> f32 {
-            let (x0, y0) = (x.floor(), y.floor());
-            let (fx, fy) = (x - x0, y - y0);
-            let (xi, yi) = (x0 as i64, y0 as i64);
-            c.at(xi, yi) * (1.0 - fx) * (1.0 - fy) + c.at(xi + 1, yi) * fx * (1.0 - fy) + c.at(xi, yi + 1) * (1.0 - fx) * fy + c.at(xi + 1, yi + 1) * fx * fy
-        };
-        cur = Plane::from_fn(p.w, p.h, |x, y| {
-            let (xi, yi) = (x as i64, y as i64);
-            // the direction of the edge from the gradient (Sobel)
-            let gx = conv3(c, &[-1., 0., 1., -2., 0., 2., -1., 0., 1.], xi, yi);
-            let gy = conv3(c, &[-1., -2., -1., 0., 0., 0., 1., 2., 1.], xi, yi);
-            let mag = (gx * gx + gy * gy).sqrt();
-            let centre = c.at(xi, yi);
-            if mag < 8.0 {
-                return centre;
+        next.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+            let ym = y.saturating_sub(1);
+            let yp = (y + 1).min(h - 1);
+            let r0 = &c[ym * w..(ym + 1) * w];
+            let r1 = &c[y * w..(y + 1) * w];
+            let r2 = &c[yp * w..(yp + 1) * w];
+            let yf = y as f32;
+            for (x, dst) in row_out.iter_mut().enumerate() {
+                let xm = x.saturating_sub(1);
+                let xp = (x + 1).min(w - 1);
+                let centre = r1[x];
+                // Sobel gradient from the 8 neighbours loaded once
+                let gx = (r0[xp] + 2.0 * r1[xp] + r2[xp]) - (r0[xm] + 2.0 * r1[xm] + r2[xm]);
+                let gy = (r2[xm] + 2.0 * r2[x] + r2[xp]) - (r0[xm] + 2.0 * r0[x] + r0[xp]);
+                let mag2 = gx * gx + gy * gy;
+                if mag2 < 64.0 {
+                    *dst = centre;
+                    continue;
+                }
+                let mag = mag2.sqrt();
+                let inv_mag = 1.0 / mag;
+                let (tx, ty) = (-gy * inv_mag, gx * inv_mag);
+                let xf = x as f32;
+                let mut sum = 0.0f32;
+                for &(tf, wgt) in &tap_weights {
+                    let sx = xf + tx * tf;
+                    let sy = yf + ty * tf;
+                    let val = if sx >= 0.0 && sx <= max_x && sy >= 0.0 && sy <= max_y {
+                        let x0 = sx as usize;
+                        let y0 = sy as usize;
+                        let fx = sx - x0 as f32;
+                        let fy = sy - y0 as f32;
+                        let b0 = y0 * w + x0;
+                        let b1 = b0 + w;
+                        let a = c[b0] + (c[b0 + 1] - c[b0]) * fx;
+                        let b = c[b1] + (c[b1 + 1] - c[b1]) * fx;
+                        a + (b - a) * fy
+                    } else {
+                        let x0 = sx.floor();
+                        let y0 = sy.floor();
+                        let fx = sx - x0;
+                        let fy = sy - y0;
+                        let xi = x0 as i64;
+                        let yi = y0 as i64;
+                        let x_a = xi.clamp(0, wi) as usize;
+                        let x_b = (xi + 1).clamp(0, wi) as usize;
+                        let y_a = yi.clamp(0, hi) as usize * w;
+                        let y_b = (yi + 1).clamp(0, hi) as usize * w;
+                        let a = c[y_a + x_a] + (c[y_a + x_b] - c[y_a + x_a]) * fx;
+                        let b = c[y_b + x_a] + (c[y_b + x_b] - c[y_b + x_a]) * fx;
+                        a + (b - a) * fy
+                    };
+                    sum += wgt * val;
+                }
+                let k = (mag * (1.0 / 48.0)).min(1.0);
+                *dst = centre + (sum * inv_ws - centre) * k;
             }
-            let (tx, ty) = (-gy / mag, gx / mag);
-            let (mut sum, mut ws) = (0.0, 0.0);
-            for t in -taps..=taps {
-                let wgt = (-((t * t) as f32) / (2.0 * sigma * sigma)).exp();
-                sum += wgt * bil(x as f32 + tx * t as f32, y as f32 + ty * t as f32);
-                ws += wgt;
-            }
-            let k = (mag / 48.0).min(1.0);
-            centre + (sum / ws - centre) * k
         });
+        std::mem::swap(&mut cur, &mut next);
     }
-    cur
+    Plane { w, h, v: cur }
 }
 
 fn antialias_plane(p: &Plane, o: &AntiAlias) -> Plane {
@@ -627,8 +1100,8 @@ fn run(src: &Img, target: Target, mask: &Mask, f: &(dyn Fn(&Plane) -> Plane + Sy
     if w == 0 || h == 0 {
         return src.clone();
     }
-    let y = Plane { w, h, v: src.px.iter().map(|p| (p[0] * LUMA[0] + p[1] * LUMA[1] + p[2] * LUMA[2]) * 255.0).collect() };
-    let a = Plane { w, h, v: src.px.iter().map(|p| p[3] * 255.0).collect() };
+    let y = Plane { w, h, v: src.px.par_iter().map(|p| (p[0] * LUMA[0] + p[1] * LUMA[1] + p[2] * LUMA[2]) * 255.0).collect() };
+    let a = Plane { w, h, v: src.px.par_iter().map(|p| p[3] * 255.0).collect() };
     let y2 = if target != Target::Alpha { f(&y) } else { y.clone() };
     let a2 = if target != Target::Colour { f(&a) } else { a.clone() };
     let m = if mask.enabled {

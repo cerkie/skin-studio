@@ -33,12 +33,24 @@ impl Scene {
         }
         let ac = self.accent(o);
         let dark4 = argon::darken(ac, 4.0);
-        let a_in = frac(t, appear, appear + self.fade_in);
+        let dt = t - hit_at;
+        if self.hidden && dt >= 0.0 {
+            return;
+        }
+        let a_in = if self.hidden {
+            let fi = self.preempt * 0.4;
+            let fo = self.preempt * 0.3;
+            frac(t, appear, appear + fi) * (1.0 - frac(t, appear + fi, appear + fi + fo))
+        } else {
+            frac(t, appear, appear + self.fade_in)
+        };
+        if a_in <= 0.0 {
+            return;
+        }
         let (mut whole, mut num_a, mut fill_a) = (1.0, 1.0, 1.0);
         let (mut border_k, mut grad_k, mut flash_a, mut grad_a) = (1.0, 1.0, 0.0, 1.0);
         let mut grad_tint = ac;
         let mut border_fade = 0.0;
-        let dt = t - hit_at;
         if dt >= 0.0 {
             // lazer fades the whole piece over 800 ms with hit lighting, 640 ms without
             whole = 1.0 - ease_out_quad(frac(dt, 0.0, if self.hit_lighting { 800.0 } else { 640.0 }));

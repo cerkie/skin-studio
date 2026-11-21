@@ -2,6 +2,7 @@
 //! front end can use it.
 pub mod analyze;
 pub mod atlas;
+pub mod create;
 pub mod deband;
 pub mod edit;
 pub mod gen;
@@ -10,5 +11,6 @@ pub mod keys;
 pub mod lazer;
 pub mod presets;
 pub mod restore;
+pub mod scan;
 pub mod settings;
 pub mod sources;

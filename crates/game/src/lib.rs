@@ -2,6 +2,7 @@
 pub mod argon;
 pub mod beatmap;
 pub mod hitsound;
+pub mod lazer_legacy;
 pub mod library;
 pub mod path;
 pub mod realm;

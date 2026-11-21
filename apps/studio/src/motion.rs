@@ -17,7 +17,7 @@ use crate::studio::Studio;
 use crate::theme::pal::*;
 
 /// The lanes of the editor: the properties of the animation, and the colour of its tint.
-const LANES: [(&str, &str); 8] = [PROPS[0], PROPS[1], PROPS[2], PROPS[3], PROPS[4], PROPS[5], PROPS[6], ("color", "Colour")];
+const LANES: [(&str, &str); 8] = [PROPS[0], PROPS[1], PROPS[2], PROPS[3], PROPS[4], PROPS[5], PROPS[6], ("color", "Color")];
 const COLOR_LANE: usize = 7;
 
 /// A colour as the number the editor keeps in a key's value (red, green and blue in one).
@@ -112,6 +112,7 @@ struct Drag {
     orig: Vec<(usize, Vec<EKey>)>,
     start: Pos2,
     moved: bool,
+    last_delta: (f32, f64),
 }
 
 /// What the dock remembers between frames.
@@ -136,6 +137,7 @@ pub struct MotionState {
     vrange: Option<(f32, f32)>,
     undo: Vec<Value>,
     redo: Vec<Value>,
+    last_snap: Option<std::time::Instant>,
     clip: Vec<EKey>,
     drag: Option<Drag>,
     boxsel: Option<Pos2>,
@@ -144,7 +146,7 @@ pub struct MotionState {
 
 impl Default for MotionState {
     fn default() -> Self {
-        MotionState { prop: 0, curves: true, open: true, height: 360.0, pinned: None, snap_ms: 10.0, last_tau: 0.0, sel: vec![], view: None, vrange: None, undo: vec![], redo: vec![], clip: vec![], drag: None, boxsel: None, scrub_resume: None }
+        MotionState { prop: 0, curves: true, open: true, height: 360.0, pinned: None, snap_ms: 10.0, last_tau: 0.0, sel: vec![], view: None, vrange: None, undo: vec![], redo: vec![], last_snap: None, clip: vec![], drag: None, boxsel: None, scrub_resume: None }
     }
 }
 
@@ -153,12 +155,40 @@ impl MotionState {
         MotionState { open: c.0, height: c.1, ..Default::default() }
     }
 
-    fn remember(&mut self, settings: &Value) {
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    pub(crate) fn clear_history(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.last_snap = None;
+    }
+
+    pub(crate) fn remember(&mut self, settings: &Value) {
+        self.last_snap = None;
         let snap = snapshot(settings);
         if self.undo.last() != Some(&snap) {
             self.undo.push(snap);
             if self.undo.len() > 120 {
                 self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+    }
+
+    /// Like `remember`, but coalesces rapid continuous edits (slider/colour drags) within 600 ms into one undo step.
+    pub(crate) fn remember_coalesced(&mut self, settings: &Value) {
+        let now = std::time::Instant::now();
+        let fresh = self.last_snap.is_none_or(|t| now.duration_since(t).as_millis() > 600);
+        self.last_snap = Some(now);
+        if fresh {
+            let snap = snapshot(settings);
+            if self.undo.last() != Some(&snap) {
+                self.undo.push(snap);
+                if self.undo.len() > 120 {
+                    self.undo.remove(0);
+                }
             }
         }
         self.redo.clear();
@@ -282,7 +312,12 @@ pub fn dock(root: &mut Ui, st: &mut Studio) {
             let full = ui.max_rect();
             ui.painter().line_segment([full.left_top(), full.right_top()], Stroke::new(1.0, Color32::from_white_alpha(14)));
             ui.painter().text(Pos2::new(full.left() + 16.0, full.center().y), Align2::LEFT_CENTER, "Motion", FontId::new(17.0, crate::theme::bold()), CONTENT1);
-            ui.painter().text(Pos2::new(full.left() + 100.0, full.center().y), Align2::LEFT_CENTER, "curves, keys and the animation preview", font(12.5), LIGHT3);
+            let sub_font = font(12.5);
+            let sub_w = (full.right() - 56.0 - (full.left() + 100.0)).max(0.0);
+            if sub_w > 40.0 {
+                let sub = crate::theme::fit_text(ui.painter(), "curves, keys and the animation preview", &sub_font, sub_w);
+                ui.painter().text(Pos2::new(full.left() + 100.0, full.center().y), Align2::LEFT_CENTER, sub, sub_font, LIGHT3);
+            }
             if fold_button(ui, Rect::from_center_size(Pos2::new(full.right() - 28.0, full.center().y), Vec2::new(34.0, 28.0)), false) && !too_short {
                 st.motion.open = true;
                 st.cfg.dock_open = true;
@@ -310,9 +345,10 @@ pub fn dock(root: &mut Ui, st: &mut Studio) {
                 st.cfg.dock_height = st.motion.height;
                 st.cfg.save();
             }
-            // nothing is drawn until the pointer is on the edge: then a thin line shows that it can be dragged
-            if hresp.hovered() || hresp.dragged() {
-                ui.painter().line_segment([full.left_top() + Vec2::new(0.0, 1.0), full.right_top() + Vec2::new(0.0, 1.0)], Stroke::new(2.0, Color32::from_rgba_unmultiplied(0x8c, 0x66, 0xff, 200)));
+            // nothing is drawn until the pointer is on the edge: then a thin line eases in to show that it can be dragged
+            let hh = crate::theme::ease(ui, hresp.id.with("h"), hresp.hovered() || hresp.dragged());
+            if hh > 0.01 {
+                ui.painter().line_segment([full.left_top() + Vec2::new(0.0, 1.0), full.right_top() + Vec2::new(0.0, 1.0)], Stroke::new(2.0, Color32::from_rgba_unmultiplied(0x8c, 0x66, 0xff, (hh * 200.0) as u8)));
             }
             editor(ui, st, full);
         });
@@ -321,11 +357,12 @@ pub fn dock(root: &mut Ui, st: &mut Studio) {
 /// The arrow that folds the dock away (pointing down) or brings it back (pointing up).
 fn fold_button(ui: &mut Ui, r: Rect, open: bool) -> bool {
     let resp = ui.interact(r, ui.scope_id().with(("mfold", open)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if open { "Fold the motion editor away" } else { "Open the motion editor" });
-    if resp.hovered() {
-        ui.painter().rect_filled(r, CornerRadius::same(6), DARK2);
+    let h = crate::theme::ease(ui, resp.id.with("h"), resp.hovered());
+    if h > 0.01 {
+        ui.painter().rect_filled(r, CornerRadius::same(5), Color32::from_rgba_unmultiplied(DARK2.r(), DARK2.g(), DARK2.b(), (h * 255.0) as u8));
     }
     let (c, d) = (r.center(), if open { 1.0 } else { -1.0 });
-    ui.painter().add(Shape::line(vec![c + Vec2::new(-6.0, -3.0 * d), c + Vec2::new(0.0, 3.0 * d), c + Vec2::new(6.0, -3.0 * d)], Stroke::new(2.2, if resp.hovered() { CONTENT1 } else { LIGHT1 })));
+    ui.painter().add(Shape::line(vec![c + Vec2::new(-6.0, -3.0 * d), c + Vec2::new(0.0, 3.0 * d), c + Vec2::new(6.0, -3.0 * d)], Stroke::new(2.2, crate::theme::lerp_c(LIGHT1, CONTENT1, h))));
     resp.clicked()
 }
 
@@ -522,7 +559,7 @@ fn stamp(p: &egui::Painter, ruler: Rect, x: f32, text: &str, fg: Color32, bg: Co
 }
 
 /// Under the graph: time, value and easing of the selected key to type or pick, a delete button, and the tools for the property.
-fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, total: f32) {
+fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, _total: f32) {
     let p = ui.painter().clone();
     p.rect_filled(strip, CornerRadius::same(8), BACKGROUND6);
     let prop = st.motion.prop.min(LANES.len() - 1);
@@ -540,7 +577,7 @@ fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, total: f32) {
             // five fits, from everything to the least that works: full labels / short labels / no title / the easing as a picture only /
             // and Delete only in the Tools menu
             let tier = if avail >= 650.0 { 0 } else if avail >= 460.0 { 1 } else if avail >= 368.0 { 2 } else if avail >= 308.0 { 3 } else { 4 };
-            let (full, compact) = (tier == 0, tier > 0);
+            let full = tier == 0;
             let title = tier <= 1;
             if title {
                 p.text(Pos2::new(x, cy), Align2::LEFT_CENTER, format!("{} · key {}", LANES[tp].1.split(' ').next().unwrap_or(""), ti + 1), FontId::new(12.5, crate::theme::semibold()), PROP_COLORS[tp]);
@@ -548,7 +585,7 @@ fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, total: f32) {
             }
             let cur = [k.t.map(|t| nice(t as f32)).unwrap_or_else(|| "end".to_string()), value_text(pid, k.v)];
             let is_colour = tp == COLOR_LANE;
-            let labels = if full { [("Time (ms)", 64.0f32, 66.0f32), (if is_colour { "Colour" } else { "Value" }, 44.0, if is_colour { 84.0 } else { 76.0 })] } else { [("Time", 34.0, 56.0), (if is_colour { "Hex" } else { "Value" }, 38.0, if is_colour { 72.0 } else { 60.0 })] };
+            let labels = if full { [("Time (ms)", 64.0f32, 66.0f32), (if is_colour { "Color" } else { "Value" }, 44.0, if is_colour { 84.0 } else { 76.0 })] } else { [("Time", 34.0, 56.0), (if is_colour { "Hex" } else { "Value" }, 38.0, if is_colour { 72.0 } else { 60.0 })] };
             let gap = if full { 14.0 } else { 8.0 };
             for (f, (label, lw, w)) in labels.into_iter().enumerate() {
                 p.text(Pos2::new(x, cy), Align2::LEFT_CENTER, label, font(12.0), LIGHT3);
@@ -558,7 +595,7 @@ fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, total: f32) {
                     // the colour, to pick from a palette; the field after it takes the hex code
                     let rgb = unpack_rgb(k.v);
                     if let Some(c) = crate::ui::swatch_picker(ui, &format!("mstrip{ti}"), Rect::from_min_size(Pos2::new(x, cy - 11.0), Vec2::new(26.0, 22.0)), rgb) {
-                        st.motion.remember(&st.settings);
+                        st.motion.remember_coalesced(&st.settings);
                         edit_lane_key(&mut st.settings, pid, ti, 1, &hex_of(c));
                         st.bufs.insert(key.clone(), hex_of(c));
                         st.edited();
@@ -570,8 +607,41 @@ fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, total: f32) {
                 p.rect_filled(field, CornerRadius::same(5), CONTROL);
                 let resp = crate::theme::put_free(ui, field.shrink2(Vec2::new(6.0, 2.0)), egui::TextEdit::singleline(buf).id(ui.scope_id().with(("mkeyedit", tp, ti, f))).frame(egui::Frame::NONE).desired_width(w - 12.0).font(font(14.0)).text_color(CONTENT1).margin(egui::Margin::ZERO));
                 let text = buf.clone();
-                if resp.changed() {
-                    st.motion.remember(&st.settings);
+                if f == 0 {
+                    // Time: commit on Enter or blur (not Escape) so typing multi-digit numbers never puts keys out of order mid-edit.
+                    let esc = ui.input(|i| i.key_pressed(Key::Escape));
+                    let enter = resp.has_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    if esc && resp.lost_focus() {
+                        st.bufs.insert(key, cur[0].clone());
+                    } else if (enter || resp.lost_focus()) && text != cur[0] {
+                        let trimmed = text.trim();
+                        let parsed = if trimmed.eq_ignore_ascii_case("end") {
+                            Some(None)
+                        } else {
+                            trimmed.parse::<f64>().ok().filter(|v| v.is_finite()).map(|v| Some(v.max(0.0)))
+                        };
+                        if let Some(new_t) = parsed {
+                            let mut keys2 = read(&st.settings, pid);
+                            if ti < keys2.len() && keys2[ti].t != new_t {
+                                st.motion.remember(&st.settings);
+                                keys2[ti].t = new_t;
+                                let edited = keys2[ti].clone();
+                                sort(&mut keys2);
+                                let new_idx = keys2.iter().position(|k| *k == edited).unwrap_or(ti.min(keys2.len().saturating_sub(1)));
+                                write(&mut st.settings, pid, &keys2);
+                                st.motion.sel = vec![(tp, new_idx)];
+                                commit(st);
+                            } else {
+                                st.bufs.insert(key, cur[0].clone());
+                            }
+                        } else {
+                            st.bufs.insert(key, cur[0].clone());
+                        }
+                    } else if !resp.has_focus() && text != cur[0] {
+                        st.bufs.insert(key, cur[0].clone());
+                    }
+                } else if resp.changed() {
+                    st.motion.remember_coalesced(&st.settings);
                     edit_lane_key(&mut st.settings, pid, ti, f as i32, &text);
                     st.edited();
                 } else if !resp.has_focus() && text != cur[f] {
@@ -590,7 +660,8 @@ fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, total: f32) {
             let er = Rect::from_min_size(Pos2::new(x, cy - 13.0), Vec2::new(ew, 26.0));
             if er.right() <= room_end {
             let eresp = ui.interact(er, ui.scope_id().with("mstrip-ease"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("The easing of the step from this key to the next");
-            p.rect_filled(er, CornerRadius::same(5), if eresp.hovered() { DARK3 } else { CONTROL });
+            let eh = crate::theme::ease(ui, eresp.id.with("h"), eresp.hovered());
+            p.rect_filled(er, CornerRadius::same(5), crate::theme::lerp_c(CONTROL, DARK3, eh));
             ease_thumb(&p, Rect::from_min_size(er.min + Vec2::new(8.0, 6.0), Vec2::new(22.0, 14.0)), &k.e, CONTENT1);
             if tier <= 2 {
                 // (the name is cut to what is left of the box after the picture)
@@ -615,7 +686,6 @@ fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, total: f32) {
                     delete_selected(st);
                 }
             }
-            let _ = compact;
         }
         _ => {
             let hint = crate::theme::fit_text(&p, "Select a key to type its time and value or to change its easing", &font(13.0), (strip.right() - 100.0 - x).max(20.0));
@@ -624,21 +694,40 @@ fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, total: f32) {
     }
     // the tools of the property, on the right
     let tr = Rect::from_min_size(Pos2::new(strip.right() - 90.0, cy - 13.0), Vec2::new(80.0, 26.0));
-    let tresp = pill_resp(ui, tr, "Tools", false, "Reverse, flip, smooth or reset the property being shown");
+    let tresp = ui.interact(tr, ui.scope_id().with("mpill-Tools"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Reverse, flip, smooth or reset the active lane");
     {
-        let c = Pos2::new(tr.right() - 14.0, tr.center().y + 0.5);
-        p.add(Shape::line(vec![c + Vec2::new(-4.0, -2.0), c + Vec2::new(0.0, 2.0), c + Vec2::new(4.0, -2.0)], Stroke::new(1.8, LIGHT1)));
+        let th = crate::theme::ease(ui, tresp.id.with("h"), tresp.hovered());
+        p.rect_filled(tr, CornerRadius::same(5), crate::theme::lerp_c(BACKGROUND6, DARK3, th));
+        let fg = crate::theme::lerp_c(LIGHT1, CONTENT1, th);
+        p.text(Pos2::new(tr.center().x - 6.0, tr.center().y), Align2::CENTER_CENTER, "Tools", FontId::new(13.5, crate::theme::semibold()), fg);
+        let c = Pos2::new(tr.right() - 13.0, tr.center().y + 0.5);
+        p.add(Shape::line(vec![c + Vec2::new(-4.0, -2.0), c + Vec2::new(0.0, 2.0), c + Vec2::new(4.0, -2.0)], Stroke::new(1.8, fg)));
     }
+    let lane_name = LANES[st.motion.prop].1;
+    let is_colour_lane = st.motion.prop == COLOR_LANE;
+    let has_shift = Settings::from_json(&st.settings).shift.abs() >= 0.5;
+    let has_sel = !st.motion.sel.is_empty();
     egui::Popup::menu(&tresp).gap(4.0).show(|ui| {
-        ui.set_min_width(190.0);
-        let items: [(&str, u8); 7] = [("Reverse in time", 0), ("Flip the values", 1), ("Smooth every step", 2), ("Make every step linear", 3), ("Reset to a plain line", 4), ("Make the time shift the base", 5), ("Delete the selected keys", 6)];
-        for (name, id) in items {
-            let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(180.0), 30.0), Sense::click());
-            if resp.hovered() {
+        ui.set_min_width(220.0);
+        let items: [(String, u8, bool); 7] = [
+            (format!("Reverse {lane_name} in time"), 0, true),
+            (format!("Flip {lane_name} values"), 1, !is_colour_lane),
+            (format!("Smooth every {lane_name} step"), 2, true),
+            (format!("Linearize every {lane_name} step"), 3, true),
+            (format!("Reset {lane_name} to a plain line"), 4, true),
+            ("Make the time shift the base".into(), 5, has_shift),
+            ("Delete the selected keys".into(), 6, has_sel),
+        ];
+        for (name, id, enabled) in items {
+            let (r, mut resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(210.0), 30.0), Sense::click());
+            if enabled {
+                resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
+            if resp.hovered() && enabled {
                 ui.painter().rect_filled(r, CornerRadius::same(4), DARK3);
             }
-            ui.painter().text(r.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, name, font(14.5), CONTENT1);
-            if resp.clicked() {
+            ui.painter().text(r.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, &name, font(14.0), if enabled { CONTENT1 } else { LIGHT3 });
+            if resp.clicked() && enabled {
                 match id {
                     0 => reverse(st),
                     1 => flip(st),
@@ -654,7 +743,6 @@ fn key_strip(ui: &mut Ui, st: &mut Studio, strip: Rect, total: f32) {
             }
         }
     });
-    let _ = total;
 }
 
 struct Ctx<'a> {
@@ -678,19 +766,15 @@ impl Ctx<'_> {
 // ----------------------------------------------------------------------------------------------------------- header
 
 fn pill(ui: &mut Ui, r: Rect, label: &str, on: bool, tip: &str) -> bool {
-    pill_resp(ui, r, label, on, tip).clicked()
+    crate::theme::pill(ui, r, label, label, on, true, tip)
+}
+
+fn pill_en(ui: &mut Ui, r: Rect, label: &str, on: bool, enabled: bool, tip: &str) -> bool {
+    crate::theme::pill(ui, r, label, label, on, enabled, tip)
 }
 
 fn pill_resp(ui: &mut Ui, r: Rect, label: &str, on: bool, tip: &str) -> egui::Response {
-    let resp = ui.interact(r, ui.scope_id().with(("mpill", label)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
-    let fill = if on { th_purple() } else if resp.hovered() { DARK3 } else { BACKGROUND6 };
-    ui.painter().rect_filled(r, CornerRadius::same(6), fill);
-    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::new(13.5, crate::theme::semibold()), if on || resp.hovered() { CONTENT1 } else { LIGHT1 });
-    resp
-}
-
-fn th_purple() -> Color32 {
-    Color32::from_rgb(0x66, 0x3d, 0xd4)
+    crate::theme::pill_resp(ui, r, label, label, on, true, tip)
 }
 
 fn header(ui: &mut Ui, st: &mut Studio, head: Rect, total: f32, view: (f32, f32)) {
@@ -770,12 +854,12 @@ fn header(ui: &mut Ui, st: &mut Studio, head: Rect, total: f32, view: (f32, f32)
                 }
             }
             5 => {
-                if pill(ui, r, label, false, "Undo (Ctrl+Z)") {
+                if pill_en(ui, r, label, false, !st.motion.undo.is_empty(), "Undo (Ctrl+Z)") {
                     action = Some(5);
                 }
             }
             _ => {
-                if pill(ui, r, label, false, "Redo (Ctrl+Y)") {
+                if pill_en(ui, r, label, false, !st.motion.redo.is_empty(), "Redo (Ctrl+Y)") {
                     action = Some(6);
                 }
             }
@@ -785,19 +869,29 @@ fn header(ui: &mut Ui, st: &mut Studio, head: Rect, total: f32, view: (f32, f32)
         let r = Rect::from_min_size(Pos2::new(x, head.top() + 6.0), Vec2::new(more_w, 28.0));
         x += more_w + 6.0;
         let mresp = pill_resp(ui, r, "...", false, "The rest of the buttons");
+        let can_undo = !st.motion.undo.is_empty();
+        let can_redo = !st.motion.redo.is_empty();
         egui::Popup::menu(&mresp).gap(4.0).show(|ui| {
             ui.set_min_width(150.0);
             for (k, (label, _, _)) in buttons.iter().enumerate() {
                 if shown[k] {
                     continue;
                 }
+                let enabled = match k {
+                    5 => can_undo,
+                    6 => can_redo,
+                    _ => true,
+                };
                 let name = if k == 2 { "Snap resolution..." } else { *label };
-                let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(140.0), 30.0), Sense::click());
-                if resp.hovered() {
+                let (r, mut resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(140.0), 30.0), Sense::click());
+                if enabled {
+                    resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                }
+                if resp.hovered() && enabled {
                     ui.painter().rect_filled(r, CornerRadius::same(4), DARK3);
                 }
-                ui.painter().text(r.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, name, font(14.5), CONTENT1);
-                if resp.clicked() {
+                ui.painter().text(r.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, name, font(14.5), if enabled { CONTENT1 } else { LIGHT3 });
+                if resp.clicked() && enabled {
                     if k == 2 {
                         // cycles through the resolutions (the menu of the button itself is not there)
                         let steps = [0.0, 5.0, 10.0, 25.0, 50.0, 100.0];
@@ -865,20 +959,26 @@ fn property_list(ui: &mut Ui, st: &mut Studio, list: Rect, tau: f32) {
         let r = Rect::from_min_size(list.min + Vec2::new(6.0, 6.0 + i as f32 * row_h), Vec2::new(list.width() - 12.0, row_h - 2.0));
         let resp = ui.interact(r, ui.scope_id().with(("mprop", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
         let on = st.motion.prop == i;
+        let hov = crate::theme::ease(ui, resp.id.with("h"), resp.hovered() && !on);
         if on {
             ui.painter().rect_filled(r, CornerRadius::same(6), Color32::from_rgba_unmultiplied(0x8c, 0x66, 0xff, 46));
             ui.painter().rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0, r.height())), CornerRadius::same(2), PROP_COLORS[i]);
-        } else if resp.hovered() {
-            ui.painter().rect_filled(r, CornerRadius::same(6), DARK2);
+        } else if hov > 0.01 {
+            ui.painter().rect_filled(r, CornerRadius::same(6), Color32::from_rgba_unmultiplied(DARK2.r(), DARK2.g(), DARK2.b(), (hov * 255.0) as u8));
         }
         ui.painter().circle_filled(Pos2::new(r.left() + 16.0, r.center().y), 4.5, PROP_COLORS[i]);
         ui.painter().text(Pos2::new(r.left() + 30.0, r.center().y), Align2::LEFT_CENTER, label, font(13.5), if on { CONTENT1 } else { CONTENT2 });
         if i == COLOR_LANE {
-            let parsed = Settings::from_json(&st.settings);
-            let c = keys::eval_color(&parsed.color_keys, tau.clamp(0.0, parsed.design_length()), parsed.design_length());
-            let sw = Rect::from_center_size(Pos2::new(r.right() - 20.0, r.center().y), Vec2::new(22.0, 14.0));
-            ui.painter().rect_filled(sw, CornerRadius::same(3), Color32::from_rgb(c[0].round().clamp(0.0, 255.0) as u8, c[1].round().clamp(0.0, 255.0) as u8, c[2].round().clamp(0.0, 255.0) as u8));
-            ui.painter().rect_stroke(sw, CornerRadius::same(3), Stroke::new(1.0, if on { LIGHT3 } else { DARK3 }), StrokeKind::Inside);
+            let color_on = st.settings["color_on"].as_bool().unwrap_or(false);
+            if color_on {
+                let parsed = Settings::from_json(&st.settings);
+                let c = keys::eval_color(&parsed.color_keys, tau.clamp(0.0, parsed.design_length()), parsed.design_length());
+                let sw = Rect::from_center_size(Pos2::new(r.right() - 20.0, r.center().y), Vec2::new(22.0, 14.0));
+                ui.painter().rect_filled(sw, CornerRadius::same(3), Color32::from_rgb(c[0].round().clamp(0.0, 255.0) as u8, c[1].round().clamp(0.0, 255.0) as u8, c[2].round().clamp(0.0, 255.0) as u8));
+                ui.painter().rect_stroke(sw, CornerRadius::same(3), Stroke::new(1.0, if on { LIGHT3 } else { DARK3 }), StrokeKind::Inside);
+            } else {
+                ui.painter().text(Pos2::new(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, "off", font(12.5), LIGHT3);
+            }
         } else {
             let v = val_at(st, pid, tau);
             ui.painter().text(Pos2::new(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, nice(v), font(12.5), if on { LIGHT1 } else { LIGHT3 });
@@ -906,27 +1006,18 @@ fn commit(st: &mut Studio) {
     st.edited();
 }
 
-/// What undo keeps: the motion of every property, the colour keys and the time shift.
+/// What undo keeps: the full settings JSON so New, Apply effect, Load history, Import, and motion edits all undo cleanly.
 fn snapshot(settings: &Value) -> Value {
-    json!({ "props": settings["props"].clone(), "color_keys": settings["color_keys"].clone(), "shift": settings["shift"].clone() })
+    settings.clone()
 }
 
 fn restore(settings: &mut Value, snap: Value) {
-    settings["props"] = snap["props"].clone();
-    if snap["color_keys"].is_null() {
-        if let Some(o) = settings.as_object_mut() {
-            o.remove("color_keys");
-        }
-    } else {
-        settings["color_keys"] = snap["color_keys"].clone();
-    }
-    if !snap["shift"].is_null() {
-        settings["shift"] = snap["shift"].clone();
-    }
+    *settings = snap;
 }
 
 pub fn undo(st: &mut Studio) {
     if let Some(prev) = st.motion.undo.pop() {
+        st.motion.last_snap = None;
         st.motion.redo.push(snapshot(&st.settings));
         restore(&mut st.settings, prev);
         st.motion.sel.clear();
@@ -936,6 +1027,7 @@ pub fn undo(st: &mut Studio) {
 
 pub fn redo(st: &mut Studio) {
     if let Some(next) = st.motion.redo.pop() {
+        st.motion.last_snap = None;
         st.motion.undo.push(snapshot(&st.settings));
         restore(&mut st.settings, next);
         st.motion.sel.clear();
@@ -1044,15 +1136,20 @@ fn apply_move(st: &mut Studio, orig: Option<&Vec<(usize, Vec<EKey>)>>, mut dt: f
     }
 }
 
-fn keyboard(ui: &mut Ui, st: &mut Studio, total: f32, step: f32, loop_ms: f32) {
+fn keyboard(ui: &mut Ui, st: &mut Studio, total: f32, step: f32, _loop_ms: f32) {
     let tau = playhead(st).unwrap_or(st.motion.last_tau);
     let (cmd, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
     let pressed = |k: Key| ui.input(|i| i.key_pressed(k));
     let consume = |k: Key| ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, k));
-    if cmd && pressed(Key::Z) && !shift {
-        undo(st);
-    } else if cmd && (pressed(Key::Y) || (pressed(Key::Z) && shift)) {
+    let (redo_k, undo_k) = ui.input_mut(|i| {
+        let m = egui::Modifiers::COMMAND;
+        let ms = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        (i.consume_key(ms, Key::Z) || i.consume_key(m, Key::Y), i.consume_key(m, Key::Z))
+    });
+    if redo_k {
         redo(st);
+    } else if undo_k {
+        undo(st);
     }
     if consume(Key::Delete) || consume(Key::Backspace) {
         delete_selected(st);
@@ -1103,9 +1200,8 @@ fn keyboard(ui: &mut Ui, st: &mut Studio, total: f32, step: f32, loop_ms: f32) {
         st.motion.view = None;
         st.motion.vrange = None;
     }
-    if !cmd && pressed(Key::Space) {
+    if consume(Key::Space) {
         st.anim_playing = !st.anim_playing;
-        let _ = loop_ms;
     }
     let k = if shift { 10.0 } else { 1.0 };
     if consume_with(ui, Key::ArrowLeft) {
@@ -1130,8 +1226,7 @@ fn consume_with(ui: &mut Ui, k: Key) -> bool {
     ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, k) || i.consume_key(egui::Modifiers::SHIFT, k))
 }
 
-fn zoom_and_pan(ui: &mut Ui, st: &mut Studio, bg: &egui::Response, plot: Rect, view: (f32, f32), total: f32, to_x: impl Fn(f32) -> f32) {
-    let _ = to_x;
+fn zoom_and_pan(ui: &mut Ui, st: &mut Studio, bg: &egui::Response, plot: Rect, view: (f32, f32), total: f32, _to_x: impl Fn(f32) -> f32) {
     let (t0, t1) = view;
     if bg.hovered() {
         let (scroll, shift, ptr) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.shift, i.pointer.hover_pos()));
@@ -1188,10 +1283,18 @@ fn value_range(st: &Studio, pid: &str, total: f32) -> (f32, f32) {
 
 // ------------------------------------------------------------------------------------------------- shared gestures
 
-/// Begin, continue and end a key drag; `curves` lets the value move too. Returns true while a drag is going on.
+/// Begin, continue and end a key drag; `curves` lets the value move too. Returns true when a key moved on this frame.
 fn key_drag(ui: &mut Ui, c: &mut Ctx, r: &egui::Response, prop: usize, idx: usize, value_per_px: Option<f64>) -> bool {
     let additive = ui.input(|i| i.modifiers.shift || i.modifiers.command);
-    if r.clicked() || r.drag_started() {
+    let down_on = r.is_pointer_button_down_on();
+    let press_origin = ui.input(|i| i.pointer.press_origin());
+    let cur_pos = r.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos()));
+    let early_drag = down_on
+        && c.st.motion.drag.is_none()
+        && press_origin.zip(cur_pos).is_some_and(|(a, b)| (b - a).length() >= 2.0);
+    let starting = r.drag_started() || early_drag;
+
+    if r.clicked() || starting {
         let here = (prop, idx);
         let on = c.st.motion.sel.contains(&here);
         if additive && r.clicked() {
@@ -1208,18 +1311,18 @@ fn key_drag(ui: &mut Ui, c: &mut Ctx, r: &egui::Response, prop: usize, idx: usiz
             c.st.motion.prop = prop;
         }
     }
-    if r.drag_started() {
+    if starting && c.st.motion.drag.is_none() {
         c.st.motion.remember(&c.st.settings);
         let props: Vec<usize> = (0..LANES.len()).filter(|p| !c.st.motion.selected_in(*p).is_empty()).collect();
         let orig = props.iter().map(|p| (*p, read(&c.st.settings, LANES[*p].0))).collect();
         // measured from where the button went down, so the key does not lag behind the pointer by the drag threshold
-        let start = ui.input(|i| i.pointer.press_origin()).or(r.interact_pointer_pos()).unwrap_or_default();
-        c.st.motion.drag = Some(Drag { orig, start, moved: false });
+        let start = press_origin.or(cur_pos).unwrap_or_default();
+        c.st.motion.drag = Some(Drag { orig, start, moved: false, last_delta: (0.0, 0.0) });
     }
-    let mut active = false;
-    if r.dragged() {
-        active = true;
-        if let (Some(d), Some(m)) = (c.st.motion.drag.as_ref(), r.interact_pointer_pos()) {
+    let mut moved_now = false;
+    let is_dragging = r.dragged() || (down_on && c.st.motion.drag.is_some());
+    if is_dragging {
+        if let (Some(d), Some(m)) = (c.st.motion.drag.as_ref(), cur_pos) {
             let (shift, alt, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt, i.modifiers.command));
             let mut dx = m.x - d.start.x;
             let mut dy = m.y - d.start.y;
@@ -1246,17 +1349,26 @@ fn key_drag(ui: &mut Ui, c: &mut Ctx, r: &egui::Response, prop: usize, idx: usiz
                     dv = ((keys[idx].v + dv) / step).round() * step - keys[idx].v;
                 }
             }
+            let changed = (dt - d.last_delta.0).abs() > 1e-4 || (dv - d.last_delta.1).abs() > 1e-6;
             if let Some(d) = c.st.motion.drag.as_mut() {
-                d.moved = dx.abs() + dy.abs() > 1.0;
+                d.moved |= dx.abs() + dy.abs() > 1.0;
+                d.last_delta = (dt, dv);
             }
-            apply_move(c.st, Some(&orig), dt, dv, c.total);
-            commit(c.st);
+            if changed {
+                apply_move(c.st, Some(&orig), dt, dv, c.total);
+                commit(c.st);
+                moved_now = true;
+            }
         }
     }
-    if r.drag_stopped() {
-        c.st.motion.drag = None;
+    if r.drag_stopped() || (c.st.motion.drag.is_some() && !ui.input(|i| i.pointer.primary_down())) {
+        if let Some(d) = c.st.motion.drag.take() {
+            if d.moved {
+                commit(c.st);
+            }
+        }
     }
-    active
+    moved_now
 }
 
 /// Drag on empty space to box-select; click on empty space to clear; double-click to add. Returns the box while it is being drawn.
@@ -1344,17 +1456,34 @@ fn curves(ui: &mut Ui, c: &mut Ctx, bg: &egui::Response, tau: f32) {
     }
     p.text(Pos2::new(plot.right() - 8.0, plot.top() + 12.0), Align2::RIGHT_CENTER, label, FontId::new(13.0, crate::theme::semibold()), Color32::from_white_alpha(70));
 
-    // the curve, filled underneath
+    // Interact with keys BEFORE painting the curve and dots so both follow the pointer with zero 1-frame lag.
+    let vpp = ((hi - lo) / plot.height()) as f64;
+    let mut key_resps: Vec<(usize, bool)> = Vec::with_capacity(ekeys.len());
+    let mut any_moved = false;
+    for (i, k) in ekeys.iter().enumerate() {
+        let t = k.at(total);
+        let pos = Pos2::new(c.to_x(t), to_y(k.v as f32));
+        if pos.x < plot.left() - 10.0 || pos.x > plot.right() + 10.0 {
+            continue;
+        }
+        let r = ui.interact(Rect::from_center_size(pos, Vec2::splat(26.0)), ui.scope_id().with(("mkey", prop, i)), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::Grab);
+        any_moved |= key_drag(ui, c, &r, prop, i, Some(vpp));
+        key_resps.push((i, r.hovered() || r.dragged() || r.is_pointer_button_down_on()));
+    }
+    let (ekeys, nk) = if any_moved {
+        let p2 = Settings::from_json(&c.st.settings);
+        (read(&c.st.settings, pid), p2.prop(pid).clone())
+    } else {
+        (ekeys, nk)
+    };
+
+    // the curve
     let steps = (plot.width() / 3.0) as usize;
     let pts: Vec<Pos2> = (0..=steps).map(|i| {
         let t = c.t0 + i as f32 / steps as f32 * (c.t1 - c.t0);
         Pos2::new(plot.left() + i as f32 / steps as f32 * plot.width(), to_y(keys::eval(&nk, t.clamp(0.0, total), total)).clamp(plot.top() - 40.0, plot.bottom() + 40.0))
     }).collect();
-    let mut fill = pts.clone();
-    fill.push(Pos2::new(plot.right(), plot.bottom()));
-    fill.push(Pos2::new(plot.left(), plot.bottom()));
     let clipped = p.with_clip_rect(plot);
-    let _ = fill;
     clipped.add(Shape::line(pts, Stroke::new(2.6, col)));
 
     // box select
@@ -1395,8 +1524,9 @@ fn curves(ui: &mut Ui, c: &mut Ctx, bg: &egui::Response, tau: f32) {
         }
         let r = Rect::from_center_size(pos, Vec2::new(34.0, 22.0));
         let resp = ui.interact(r, ui.scope_id().with(("mseg", prop, i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("Easing: {} (click to change)", a.e));
-        p.rect_filled(r, CornerRadius::same(5), if resp.hovered() { DARK3 } else { BACKGROUND5 });
-        p.rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, if resp.hovered() { col } else { Color32::from_white_alpha(28) }), StrokeKind::Inside);
+        let eh = crate::theme::ease(ui, resp.id.with("h"), resp.hovered());
+        p.rect_filled(r, CornerRadius::same(5), crate::theme::lerp_c(BACKGROUND5, DARK3, eh));
+        p.rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, crate::theme::lerp_c(Color32::from_white_alpha(28), col, eh)), StrokeKind::Inside);
         ease_thumb(&p, Rect::from_min_max(r.min + Vec2::new(8.0, 5.0), r.max - Vec2::new(8.0, 5.0)), &a.e, CONTENT1);
         let cur = a.e.clone();
         let mut picked = None;
@@ -1422,24 +1552,24 @@ fn curves(ui: &mut Ui, c: &mut Ctx, bg: &egui::Response, tau: f32) {
 
     // the playhead's value
     if tau >= c.t0 && tau <= c.t1 {
-        let y = to_y(keys::eval(&nk, tau, total));
+        let val = keys::eval(&nk, tau, total);
+        let y = to_y(val);
         let x = c.to_x(tau);
         p.circle_filled(Pos2::new(x, y), 4.0, Color32::from_rgb(0xff, 0x66, 0x9d));
-        p.text(Pos2::new(x + 8.0, y - 10.0), Align2::LEFT_CENTER, nice(keys::eval(&nk, tau, total)), font(12.0), Color32::from_rgb(0xff, 0xa8, 0xc6));
+        let (lx, al) = if x + 64.0 > plot.right() { (x - 8.0, Align2::RIGHT_CENTER) } else { (x + 8.0, Align2::LEFT_CENTER) };
+        let ly = (y - 10.0).clamp(plot.top() + 10.0, plot.bottom() - 10.0);
+        p.text(Pos2::new(lx, ly), al, nice(val), font(12.0), Color32::from_rgb(0xff, 0xa8, 0xc6));
     }
 
-    // the keys
-    let vpp = ((hi - lo) / plot.height()) as f64;
+    // paint the key dots at their live updated positions
     for (i, k) in ekeys.iter().enumerate() {
         let t = k.at(total);
         let pos = Pos2::new(c.to_x(t), to_y(k.v as f32));
         if pos.x < plot.left() - 10.0 || pos.x > plot.right() + 10.0 {
             continue;
         }
-        let r = ui.interact(Rect::from_center_size(pos, Vec2::splat(22.0)), ui.scope_id().with(("mkey", prop, i)), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::Grab);
-        key_drag(ui, c, &r, prop, i, Some(vpp));
         let selected = c.st.motion.sel.contains(&(prop, i));
-        let active = r.hovered() || r.dragged();
+        let active = key_resps.iter().find(|(ki, _)| *ki == i).is_some_and(|(_, a)| *a);
         if active || selected {
             p.circle_filled(pos, 12.0, Color32::from_rgba_unmultiplied(0x8c, 0x66, 0xff, if selected { 64 } else { 40 }));
         }
@@ -1462,7 +1592,8 @@ fn colour_track(ui: &mut Ui, c: &mut Ctx, bg: &egui::Response, tau: f32) {
     let p = ui.painter().clone();
     let plot = c.plot;
     let clipped = p.with_clip_rect(plot);
-    let bar = Rect::from_center_size(plot.center(), Vec2::new(plot.width(), (plot.height() * 0.4).clamp(26.0, 70.0)));
+    let bar_y = (plot.center().y + 4.0).min(plot.bottom() - 34.0);
+    let bar = Rect::from_center_size(Pos2::new(plot.center().x, bar_y), Vec2::new(plot.width(), (plot.height() * 0.36).clamp(24.0, 66.0)));
     let rgb_at = |t: f32| {
         let col = keys::eval_color(&parsed.color_keys, t.clamp(0.0, total), total);
         Color32::from_rgb(col[0].round().clamp(0.0, 255.0) as u8, col[1].round().clamp(0.0, 255.0) as u8, col[2].round().clamp(0.0, 255.0) as u8)
@@ -1475,7 +1606,7 @@ fn colour_track(ui: &mut Ui, c: &mut Ctx, bg: &egui::Response, tau: f32) {
         clipped.rect_filled(Rect::from_min_max(Pos2::new(x0, bar.top()), Pos2::new((x0 + 3.0).min(plot.right()), bar.bottom())), CornerRadius::ZERO, col);
     }
     p.rect_stroke(bar, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_white_alpha(24)), StrokeKind::Inside);
-    p.text(Pos2::new(plot.right() - 8.0, plot.top() + 12.0), Align2::RIGHT_CENTER, if on { "Colour" } else { "Colour (the tint is off: editing a key turns it on)" }, FontId::new(13.0, crate::theme::semibold()), Color32::from_white_alpha(70));
+    p.text(Pos2::new(plot.right() - 8.0, plot.top() + 12.0), Align2::RIGHT_CENTER, if on { "Color" } else { "Color (the tint is off: editing a key turns it on)" }, FontId::new(13.0, crate::theme::semibold()), Color32::from_white_alpha(70));
 
     let (t0, t1) = (c.t0, c.t1);
     background(ui, c, bg, |r| ekeys.iter().enumerate().filter(|(_, k)| r.contains(Pos2::new(plot.left() + (k.at(total) - t0) / (t1 - t0) * plot.width(), bar.center().y))).map(|(i, _)| (prop, i)).collect());
@@ -1505,13 +1636,15 @@ fn colour_track(ui: &mut Ui, c: &mut Ctx, bg: &egui::Response, tau: f32) {
         if (tb - ta) / (c.t1 - c.t0) * plot.width() < 66.0 {
             continue;
         }
-        let pos = Pos2::new(c.to_x((ta + tb) * 0.5), bar.top() - 16.0);
+        let pill_y = (bar.top() - 16.0).max(plot.top() + 34.0);
+        let pos = Pos2::new(c.to_x((ta + tb) * 0.5), pill_y);
         if !plot.contains(pos) {
             continue;
         }
         let r = Rect::from_center_size(pos, Vec2::new(34.0, 22.0));
         let resp = ui.interact(r, ui.scope_id().with(("mseg", prop, i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("Easing: {} (click to change)", a.e));
-        p.rect_filled(r, CornerRadius::same(5), if resp.hovered() { DARK3 } else { BACKGROUND5 });
+        let eh = crate::theme::ease(ui, resp.id.with("h"), resp.hovered());
+        p.rect_filled(r, CornerRadius::same(5), crate::theme::lerp_c(BACKGROUND5, DARK3, eh));
         p.rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, Color32::from_white_alpha(28)), StrokeKind::Inside);
         ease_thumb(&p, Rect::from_min_max(r.min + Vec2::new(8.0, 5.0), r.max - Vec2::new(8.0, 5.0)), &a.e, CONTENT1);
         let cur = a.e.clone();
@@ -2052,6 +2185,7 @@ mod tests {
     fn dragging_the_top_edge_resizes_the_dock_and_it_stays() {
         let ctx = egui::Context::default();
         let mut st = studio();
+        st.motion.height = 360.0;
         let run = |ctx: &egui::Context, st: &mut Studio, events: Vec<egui::Event>| {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0)));

@@ -7,9 +7,8 @@ use egui::ViewportId;
 use preview_window::session::{Prepared, Session};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
+use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::studio::Studio;
@@ -137,13 +136,21 @@ impl ApplicationHandler for App {
             return;
         }
         let mut attrs = Window::default_attributes().with_title("skin studio").with_inner_size(LogicalSize::new(1600.0, 940.0)).with_min_inner_size(LogicalSize::new(1280.0, 720.0));
-        if let Some(icon) = app_icon() {
-            attrs = attrs.with_window_icon(Some(icon.clone()));
-            #[cfg(windows)]
-            {
-                use winit::platform::windows::WindowAttributesExtWindows;
-                attrs = attrs.with_taskbar_icon(Some(icon));
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+            let small = winit::window::Icon::from_resource(1, Some(winit::dpi::PhysicalSize::new(32, 32))).ok().or_else(app_icon);
+            let big = winit::window::Icon::from_resource(1, None).ok().or_else(|| small.clone());
+            if let Some(ic) = small {
+                attrs = attrs.with_window_icon(Some(ic));
             }
+            if let Some(ic) = big {
+                attrs = attrs.with_taskbar_icon(Some(ic));
+            }
+        }
+        #[cfg(not(windows))]
+        if let Some(icon) = app_icon() {
+            attrs = attrs.with_window_icon(Some(icon));
         }
         let window = Arc::new(el.create_window(attrs).expect("window"));
         let instance = wgpu::Instance::default();
@@ -191,22 +198,6 @@ impl ApplicationHandler for App {
                     s.resize((sz.width, sz.height));
                 }
                 l.last_resize = Instant::now();
-            }
-            WindowEvent::KeyboardInput { event: KeyEvent { logical_key, state: ElementState::Pressed, repeat: false, .. }, .. } if !resp.consumed && !l.ctx.egui_wants_keyboard_input() => {
-                if let Some(s) = &mut l.session {
-                    match logical_key {
-                        Key::Named(NamedKey::Space) => s.toggle_play(),
-                        Key::Named(k @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) => {
-                            let v = (l.studio.cfg.volume + if k == NamedKey::ArrowUp { 0.05 } else { -0.05 }).clamp(0.0, 1.0);
-                            l.studio.cfg.volume = v;
-                            l.studio.cfg.muted = v <= 0.0;
-                            l.studio.cfg.save();
-                            s.set_volume(l.studio.effective_volume());
-                        }
-                        Key::Named(k @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)) => s.seek_by(if k == NamedKey::ArrowLeft { -5000.0 } else { 5000.0 }),
-                        _ => {}
-                    }
-                }
             }
             WindowEvent::RedrawRequested => self.frame(el),
             _ => {}
@@ -261,8 +252,8 @@ impl App {
         l.studio.ui_now = ppp / l.window.scale_factor() as f32;
         l.ctx.set_pixels_per_point(ppp);
         let mut raw = l.egui_state.take_egui_input(&l.window);
-        // acceleration for the wheel over the panel on the left (not for a touchpad, which has its own, and not for zooming)
-        let over_panel = l.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| p.x < 470.0);
+        // acceleration for the wheel over the scrollable panel on the left (not the sidebar, not a touchpad, and not for zooming)
+        let over_panel = l.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| p.x >= 152.0 && p.x < PANEL_W && p.y > 56.0);
         for ev in raw.events.iter_mut() {
             if let egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta, modifiers, .. } = ev {
                 if over_panel && !modifiers.any() && delta.y != 0.0 {
@@ -281,7 +272,72 @@ impl App {
         let t_prep = t0.elapsed();
         let mut out = UiOut::default();
         let studio = &mut l.studio;
-        let full = l.ctx.run_ui(raw, |ui| ui::draw(ui, studio, &sv, &mut out));
+        let full = l.ctx.run_ui(raw, |ui| {
+            ui::draw(ui, studio, &sv, &mut out);
+            // Global shortcuts run AFTER ui::draw so focused text boxes, sliders, and the motion dock win automatically.
+            if !ui.ctx().memory(|m| m.focused().is_some()) {
+                let (save_as, save, redo, undo) = ui.input_mut(|i| {
+                    let cmd = egui::Modifiers::COMMAND;
+                    let cmd_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+                    // Check Shift combinations first: egui's consume_key ignores extra Shift on plain Command shortcuts.
+                    (
+                        i.consume_key(cmd_shift, egui::Key::S),
+                        i.consume_key(cmd, egui::Key::S),
+                        i.consume_key(cmd_shift, egui::Key::Z) || i.consume_key(cmd, egui::Key::Y),
+                        i.consume_key(cmd, egui::Key::Z),
+                    )
+                });
+                if studio.mode == crate::studio::Mode::Skin {
+                    if save_as && studio.skin_ed.current.is_some() {
+                        studio.pick(crate::studio::PickKind::SkinEditSaveAs);
+                    } else if save {
+                        if studio.skin_ed.page == crate::skin_editor::SkinPage::Ini && studio.skin_ed.dir.is_some() {
+                            crate::skin_editor::do_save_ini(studio);
+                        } else if studio.skin_ed.page == crate::skin_editor::SkinPage::Create && studio.skin_ed.dir.is_some() {
+                            crate::skin_editor::do_save_creator(studio);
+                        } else if studio.skin_ed.current.is_some() {
+                            crate::skin_editor::do_save(studio);
+                        } else if studio.skin_ed.ini.dirty && studio.skin_ed.dir.is_some() {
+                            crate::skin_editor::do_save_ini(studio);
+                        }
+                    }
+                } else {
+                    if save {
+                        studio.save();
+                    }
+                    if undo {
+                        crate::motion::undo(studio);
+                    } else if redo {
+                        crate::motion::redo(studio);
+                    }
+                    let (space, up, down, left, right) = ui.input_mut(|i| {
+                        let none = egui::Modifiers::NONE;
+                        (
+                            i.consume_key(none, egui::Key::Space),
+                            i.consume_key(none, egui::Key::ArrowUp),
+                            i.consume_key(none, egui::Key::ArrowDown),
+                            i.consume_key(none, egui::Key::ArrowLeft),
+                            i.consume_key(none, egui::Key::ArrowRight),
+                        )
+                    });
+                    if space {
+                        out.toggle_play = true;
+                    }
+                    if up || down {
+                        let v = (studio.cfg.volume + if up { 0.05 } else { -0.05 }).clamp(0.0, 1.0);
+                        studio.cfg.volume = v;
+                        studio.cfg.muted = v <= 0.0;
+                        studio.cfg.save();
+                        out.volume = Some(studio.effective_volume());
+                    }
+                    if left {
+                        out.seek_by = Some(-5000.0);
+                    } else if right {
+                        out.seek_by = Some(5000.0);
+                    }
+                }
+            }
+        });
         let t_ui = t0.elapsed();
         l.egui_state.handle_platform_output(&l.window, full.platform_output);
 
@@ -292,6 +348,9 @@ impl App {
             }
             if let Some(f) = out.seek {
                 s.seek_to(s.start_ms + (s.end_ms - s.start_ms) * f);
+            }
+            if let Some(ms) = out.seek_by {
+                s.seek_by(ms);
             }
             if let Some(v) = out.volume {
                 s.set_volume(v);
@@ -310,6 +369,13 @@ impl App {
             }
             if let Some((a, b)) = out.snaking {
                 s.set_snaking(a, b);
+            }
+            if let Some(hd) = out.hidden {
+                s.set_hidden(hd);
+            }
+            if let Some((cs, ar, hr)) = out.difficulty {
+                s.set_difficulty(cs, ar, hr);
+                l.cs_ar_seen = (0.0, 0.0);
             }
         }
         let size_px = (l.config.width as f32, l.config.height as f32);

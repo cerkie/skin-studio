@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use crate::img::Img;
 
 /// What the grain that fills the steps in is like. `Params::grain` is its strength: the spread of the noise in 8-bit levels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Grain {
     /// Nothing but the dither that rounding to 8 bits needs.
     None,
@@ -34,7 +34,7 @@ impl Grain {
 }
 
 /// How a pixel is compared with its reference pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     /// Opposite pairs of references, each taken in by how close both are to the pixel (this program's own).
     Pairs,
@@ -57,7 +57,7 @@ impl Mode {
 }
 
 /// The settings that vszip's Deband has beyond neo_f3kdb's.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Advanced {
     pub mode: Mode,
     /// `thr1`: how different a reference may be from the pixel (levels; 0 = the same as the threshold). `Smooth` and `Angle` only.
@@ -116,34 +116,117 @@ fn limit_value(flt: f32, src: f32, thr: f32, elast: f32) -> f32 {
     }
 }
 
+/// Precomputed 4096-entry (cos, sin) table and exact unit-normal quantile table (mean 0, variance 1).
+const LUT_BITS: u32 = 12;
+const LUT_SIZE: usize = 1 << LUT_BITS;
+const LUT_SHIFT: u32 = 64 - LUT_BITS;
+
+fn trig_lut() -> &'static [(f32, f32); LUT_SIZE] {
+    static LUT: std::sync::OnceLock<Box<[(f32, f32); LUT_SIZE]>> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = vec![(0.0f32, 0.0f32); LUT_SIZE].into_boxed_slice();
+        for (i, slot) in t.iter_mut().enumerate() {
+            let a = (i as f32) * (std::f32::consts::TAU / LUT_SIZE as f32);
+            *slot = (a.cos(), a.sin());
+        }
+        t.try_into().unwrap()
+    })
+}
+
+/// Acklam's rational approximation to the inverse standard normal CDF (accurate to ~1e-7).
+fn inv_norm_cdf(p: f64) -> f64 {
+    const A: [f64; 6] = [
+        -3.969683028665376e1,
+        2.209460984245205e2,
+        -2.759285104469687e2,
+        1.383577518672690e2,
+        -3.066479806614716e1,
+        2.506628277459239e0,
+    ];
+    const B: [f64; 5] = [
+        -5.447609879822406e1,
+        1.615858368580409e2,
+        -1.556989798598866e2,
+        6.680131188771972e1,
+        -1.328068155288572e1,
+    ];
+    const C: [f64; 6] = [
+        -7.784894002430293e-3,
+        -3.223964580411365e-1,
+        -2.400758277161838e0,
+        -2.549732539343734e0,
+        4.374664141464968e0,
+        2.938163982698783e0,
+    ];
+    const D: [f64; 4] = [7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996e0, 3.754408661907416e0];
+    const PLOW: f64 = 0.02425;
+    const PHIGH: f64 = 1.0 - PLOW;
+    if p < PLOW {
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if p <= PHIGH {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
+}
+
+fn gauss_lut() -> &'static [f32; LUT_SIZE] {
+    static LUT: std::sync::OnceLock<Box<[f32; LUT_SIZE]>> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut raw = vec![0.0f64; LUT_SIZE];
+        for (i, slot) in raw.iter_mut().enumerate() {
+            *slot = inv_norm_cdf((i as f64 + 0.5) / LUT_SIZE as f64);
+        }
+        let mean = raw.iter().sum::<f64>() / LUT_SIZE as f64;
+        let var = raw.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / LUT_SIZE as f64;
+        let inv_sd = 1.0 / var.sqrt();
+        let t: Box<[f32]> = raw.into_iter().map(|v| ((v - mean) * inv_sd) as f32).collect();
+        t.try_into().unwrap()
+    })
+}
+
 /// A white noise value for a pixel and channel with an average of 0 and a spread of 1, the same every time.
-fn white(kind: Grain, x: i64, y: i64, ch: u64) -> f32 {
+#[inline(always)]
+fn white_with_lut(kind: Grain, x: i64, y: i64, ch: u64, g_lut: &[f32; LUT_SIZE]) -> f32 {
     let h = hash(((y as u64) << 32) ^ (x as u64 & 0xffff_ffff) ^ (ch.wrapping_mul(0x9e3779b97f4a7c15)) ^ 0x5851f42d4c957f2d);
     match kind {
-        Grain::Uniform => (unit(h) - 0.5) * 12.0f32.sqrt(),
-        _ => {
-            // Box-Muller
-            let u1 = unit(h).max(1e-7);
-            let u2 = unit(hash(h ^ 0xa0761d6478bd642f));
-            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-        }
+        Grain::Uniform => (unit(h) - 0.5) * 3.464_101_6, // sqrt(12)
+        _ => g_lut[(h >> LUT_SHIFT) as usize],
     }
 }
 
 /// The grain at a pixel, spread 1 (`level` is how bright the pixel is, 0 to 255, for the kind that depends on it).
-fn grain_at(kind: Grain, x: usize, y: usize, ch: u64, level: f32) -> f32 {
+#[inline(always)]
+fn grain_at_with_lut(kind: Grain, x: usize, y: usize, ch: u64, level: f32, g_lut: &[f32; LUT_SIZE]) -> f32 {
     let (xi, yi) = (x as i64, y as i64);
     match kind {
         Grain::None => 0.0,
-        Grain::Uniform | Grain::Gaussian => white(kind, xi, yi, ch),
-        Grain::Poisson => white(Grain::Gaussian, xi, yi, ch) * (level / 255.0).clamp(0.0, 1.0).sqrt(),
+        Grain::Uniform | Grain::Gaussian => white_with_lut(kind, xi, yi, ch, g_lut),
+        Grain::Poisson => white_with_lut(Grain::Gaussian, xi, yi, ch, g_lut) * (level * (1.0 / 255.0)).clamp(0.0, 1.0).sqrt(),
         Grain::Blue => {
-            let g = |dx: i64, dy: i64| white(Grain::Gaussian, xi + dx, yi + dy, ch);
-            (g(0, 0) - 0.25 * (g(-1, 0) + g(1, 0) + g(0, -1) + g(0, 1))) / 1.25f32.sqrt()
+            // 8-neighbor high-pass blue-noise kernel: crisp high-frequency spectrum with minimal low-frequency clumping.
+            const INV_NORM: f32 = 0.940_720_86; // 1 / sqrt(1.13)
+            let g = |dx: i64, dy: i64| white_with_lut(Grain::Gaussian, xi + dx, yi + dy, ch, g_lut);
+            let nbr = 0.15 * (g(-1, 0) + g(1, 0) + g(0, -1) + g(0, 1))
+                + 0.10 * (g(-1, -1) + g(1, -1) + g(-1, 1) + g(1, 1));
+            (g(0, 0) - nbr) * INV_NORM
         }
     }
 }
 
+#[cfg(test)]
+fn grain_at(kind: Grain, x: usize, y: usize, ch: u64, level: f32) -> f32 {
+    grain_at_with_lut(kind, x, y, ch, level, gauss_lut())
+}
+
+#[inline(always)]
 fn hash(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58476d1ce4e5b9);
@@ -152,39 +235,71 @@ fn hash(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+#[inline(always)]
 fn unit(h: u64) -> f32 {
-    (h >> 40) as f32 / (1u64 << 24) as f32
+    (h >> 40) as f32 * (1.0 / (1u64 << 24) as f32)
 }
 
-/// Interleaved-gradient noise in [0, 1).
+/// Interleaved-gradient noise in [0, 1) without libm `truncf` calls (arguments are always >= 0).
+#[inline(always)]
+fn fast_fract_pos(v: f32) -> f32 {
+    v - (v as u32) as f32
+}
+
+#[inline(always)]
 fn ign(x: usize, y: usize, ox: f32, oy: f32) -> f32 {
-    let t = (0.06711056 * (x as f32 + ox) + 0.00583715 * (y as f32 + oy)).fract();
-    (52.9829189 * t).fract()
+    let t = fast_fract_pos(0.06711056 * (x as f32 + ox) + 0.00583715 * (y as f32 + oy));
+    fast_fract_pos(52.9829189 * t)
+}
+
+/// Fast round-to-nearest integer using pure SSE2 conversion (avoids libm `rintf` calls).
+#[inline(always)]
+fn fast_round_isize(v: f32) -> isize {
+    (v + 0.5f32.copysign(v)) as isize
+}
+
+#[inline(always)]
+fn fast_floor_0_255(v: f32) -> f32 {
+    if v <= 0.0 {
+        0.0
+    } else if v >= 255.0 {
+        255.0
+    } else {
+        (v as u32) as f32
+    }
 }
 
 /// The normalised gradient direction (0 to 1, vszip's `deband_angle`) of every pixel: a Sobel kernel whose taps are 20 pixels apart, so that
 /// the direction is that of the slope around the pixel and not of the noise on it.
 fn angle_plane(v: &[f32], w: usize, h: usize) -> Vec<f32> {
     const RD: i64 = 20;
-    let at = |x: i64, y: i64| v[y.clamp(0, h as i64 - 1) as usize * w + x.clamp(0, w as i64 - 1) as usize];
-    (0..w * h)
-        .into_par_iter()
-        .map(|i| {
-            let (x, y) = ((i % w) as i64, (i / w) as i64);
-            let (p00, p10, p20) = (at(x - RD, y - RD), at(x, y - RD), at(x + RD, y - RD));
-            let (p01, p21) = (at(x - RD, y), at(x + RD, y));
-            let (p02, p12, p22) = (at(x - RD, y + RD), at(x, y + RD), at(x + RD, y + RD));
+    let (wi, hi) = (w as i64, h as i64);
+    let mut out = vec![0.0f32; w * h];
+    out.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
+        let yi = y as i64;
+        let ym = (yi - RD).clamp(0, hi - 1) as usize * w;
+        let y0 = y * w;
+        let yp = (yi + RD).clamp(0, hi - 1) as usize * w;
+        for (x, dst) in row.iter_mut().enumerate() {
+            let xi = x as i64;
+            let xm = (xi - RD).clamp(0, wi - 1) as usize;
+            let xp = (xi + RD).clamp(0, wi - 1) as usize;
+            let (p00, p10, p20) = (v[ym + xm], v[ym + x], v[ym + xp]);
+            let (p01, p21) = (v[y0 + xm], v[y0 + xp]);
+            let (p02, p12, p22) = (v[yp + xm], v[yp + x], v[yp + xp]);
             let gx = (p20 + 2.0 * p21 + p22) - (p00 + 2.0 * p01 + p02);
             let gy = (p00 + 2.0 * p10 + p20) - (p02 + 2.0 * p12 + p22);
-            if gx.abs() < 0.03 { 1.0 } else { (gy / gx).atan() / std::f32::consts::PI + 0.5 }
-        })
-        .collect()
+            *dst = if gx.abs() < 0.03 { 1.0 } else { (gy / gx).atan() * std::f32::consts::FRAC_1_PI + 0.5 };
+        }
+    });
+    out
 }
 
 /// One evaluation of vszip's mode 6 on four references (`p[0]`, `p[2]` opposite each other, `p[1]`, `p[3]` too): how far the pixel moves towards
-/// their average. `cur` and the references hold `n` channels that share one weight. `t` = (average, largest, line) limits.
-fn soft_delta<const N: usize>(cur: [f32; N], p: [[f32; N]; 4], t: [f32; 3]) -> [f32; N] {
-    let comp = |d: f32, t: f32| (3.0 * (1.0 - d / t.max(1e-5))).clamp(0.0, 1.0);
+/// their average. `cur` and the references hold `n` channels that share one weight. `inv_t` = reciprocals of (average, largest, line) limits.
+#[inline(always)]
+fn soft_delta<const N: usize>(cur: [f32; N], p: [[f32; N]; 4], inv_t: [f32; 3]) -> [f32; N] {
+    let comp = |d: f32, inv: f32| (3.0 * (1.0 - d * inv)).clamp(0.0, 1.0);
     let mut avg = [0.0f32; N];
     let (mut avg_dif, mut max_dif, mut mid_v, mut mid_h) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for k in 0..N {
@@ -196,7 +311,13 @@ fn soft_delta<const N: usize>(cur: [f32; N], p: [[f32; N]; 4], t: [f32; 3]) -> [
         mid_v = mid_v.max((p[0][k] + p[2][k] - 2.0 * cur[k]).abs());
         mid_h = mid_h.max((p[1][k] + p[3][k] - 2.0 * cur[k]).abs());
     }
-    let product = comp(avg_dif, t[0]) * comp(max_dif, t[1]) * comp(mid_v, t[2]) * comp(mid_h, t[2]);
+    let product = comp(avg_dif, inv_t[0]) * comp(max_dif, inv_t[1]) * comp(mid_v, inv_t[2]) * comp(mid_h, inv_t[2]);
+    if product <= 0.0 {
+        return [0.0f32; N];
+    }
+    if product >= 1.0 {
+        return avg;
+    }
     let factor = product.powf(0.1);
     let mut out = [0.0f32; N];
     for k in 0..N {
@@ -207,158 +328,430 @@ fn soft_delta<const N: usize>(cur: [f32; N], p: [[f32; N]; 4], t: [f32; 3]) -> [
 
 pub fn deband(src: &Img, p: &Params) -> Img {
     let (w, h) = (src.w, src.h);
-    // premultiplied color and alpha, 0..255
-    let mut c: Vec<[f32; 4]> = src.px.iter().map(|q| [q[0] * 255.0, q[1] * 255.0, q[2] * 255.0, q[3] * 255.0]).collect();
-    let at = |c: &Vec<[f32; 4]>, x: i64, y: i64| c[(y.clamp(0, h as i64 - 1) as usize) * w + x.clamp(0, w as i64 - 1) as usize];
+    if w == 0 || h == 0 {
+        return src.clone();
+    }
+    // Premultiplied color and alpha in Q8.8 fixed point (0..=65280, where 256 = 1.0 of an 8-bit level).
+    // Half the size of [f32; 4] (8 bytes/pixel vs 16), doubling L2/L3 cache residency for scattered taps while
+    // retaining 16-bit (1/256th level) precision.
+    const SCALE_U16: f32 = 255.0 * 256.0;
+    const INV_Q8: f32 = 1.0 / 256.0;
+    let mut c: Vec<[u16; 4]> = src
+        .px
+        .par_iter()
+        .map(|q| {
+            [
+                (q[0].clamp(0.0, 1.0) * SCALE_U16 + 0.5) as u16,
+                (q[1].clamp(0.0, 1.0) * SCALE_U16 + 0.5) as u16,
+                (q[2].clamp(0.0, 1.0) * SCALE_U16 + 0.5) as u16,
+                (q[3].clamp(0.0, 1.0) * SCALE_U16 + 0.5) as u16,
+            ]
+        })
+        .collect();
+    let uniform_alpha = c.par_iter().all(|q| q[3] == c[0][3]);
+    let trig = trig_lut();
+    let g_lut = gauss_lut();
+    let (wi, hi) = (w as isize, h as isize);
+    let run_passes = p.thr_rgb > 0.0 || p.thr_a > 0.0;
     let iterations = p.iterations.max(1);
-    // (vszip mode 7) the direction of the slope, from the brightness and from the alpha, once for the picture
-    let angles = if p.adv.mode == Mode::Angle {
-        let y: Vec<f32> = c.iter().map(|q| q[0] * 0.2126 + q[1] * 0.7152 + q[2] * 0.0722).collect();
-        let a: Vec<f32> = c.iter().map(|q| q[3]).collect();
-        Some((angle_plane(&y, w, h), angle_plane(&a, w, h)))
-    } else {
-        None
-    };
-    for it in 0..iterations {
-        // (mdb_bilateral: 4/3, 2/3 and 1/3 of the radius in three stages, the first with half the threshold)
-        let (r, thr_rgb, thr_a) = if p.narrowing && iterations > 1 {
-            let t = it as f32 / (iterations - 1) as f32;
-            let k = 4.0 / 3.0 + (1.0 / 3.0 - 4.0 / 3.0) * t;
-            let half = if it == 0 { 0.5 } else { 1.0 };
-            (((p.radius * k).round().max(1.0)) as i64, p.thr_rgb * half, p.thr_a * half)
+    if run_passes {
+        // (vszip mode 7) the direction of the slope, from the brightness and from the alpha, once for the picture
+        let angles = if p.adv.mode == Mode::Angle {
+            let y: Vec<f32> = c.par_iter().map(|q| (q[0] as f32 * 0.2126 + q[1] as f32 * 0.7152 + q[2] as f32 * 0.0722) * INV_Q8).collect();
+            let a: Vec<f32> = c.par_iter().map(|q| q[3] as f32 * INV_Q8).collect();
+            Some((angle_plane(&y, w, h), angle_plane(&a, w, h)))
         } else {
-            (p.radius.round().max(1.0) as i64, p.thr_rgb, p.thr_a)
+            None
         };
-        let next: Vec<[f32; 4]> = (0..w * h)
-            .into_par_iter()
-            .map(|i| {
-                let (x, y) = ((i % w) as i64, (i / w) as i64);
-                let hs = hash(((i as u64) << 8) ^ (it as u64) ^ 0x9e3779b97f4a7c15);
-                // how far away a reference is: evenly over the radius, or (vszip's gaussian) mostly near the pixel
-                let reach = |h1: u64| -> i64 {
-                    let f = if p.adv.dist_sigma > 0.0 {
-                        // polar Box-Muller until the value lies inside (-1, 1)
-                        let mut hh = h1;
-                        loop {
-                            let (a, b) = (unit(hh) * 2.0 - 1.0, unit(hash(hh)) * 2.0 - 1.0);
-                            let r2 = a * a + b * b;
-                            hh = hash(hh ^ 0x2545f4914f6cdd1d);
-                            if r2 > 0.0 && r2 <= 1.0 {
-                                let v = p.adv.dist_sigma * b * (-2.0 * r2.ln() / r2).sqrt();
-                                if v > -1.0 && v < 1.0 {
-                                    break v.abs();
+        let mut next: Vec<[u16; 4]> = vec![[0; 4]; w * h];
+        // cos(GOLDEN) and sin(GOLDEN) for GOLDEN = 2.3999631 rad
+        const CG: f32 = -0.737_368_8;
+        const SG: f32 = 0.675_490_3;
+        // Scale rings per pass by iteration count so multi-pass runs always gather 16–32+ stratified taps total
+        // without doing redundant 64-tap scattered reads on 4+ iterations.
+        let rings: usize = match iterations {
+            1 => 4,
+            2 => 3,
+            _ => 2,
+        };
+        let inv_rings = 1.0 / rings as f32;
+
+        for it in 0..iterations {
+            // (mdb_bilateral: 4/3, 2/3 and 1/3 of the radius in three stages, the first with half the threshold)
+            let (r, thr_rgb, thr_a) = if p.narrowing && iterations > 1 {
+                let t = it as f32 / (iterations - 1) as f32;
+                let k = 4.0 / 3.0 + (1.0 / 3.0 - 4.0 / 3.0) * t;
+                let half = if it == 0 { 0.5 } else { 1.0 };
+                (((p.radius * k).round().max(1.0)) as isize, p.thr_rgb * half, p.thr_a * half)
+            } else {
+                (p.radius.round().max(1.0) as isize, p.thr_rgb, p.thr_a)
+            };
+            let it_seed = (it as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x517c_c1b7_2722_0a95;
+            let src_c = &c;
+
+            if p.adv.mode == Mode::Pairs {
+                let thr_rgb_q = (thr_rgb * 256.0).clamp(0.0, 65535.0) as u16;
+                let thr_a_q = (thr_a * 256.0).clamp(0.0, 65535.0) as u16;
+                let inv_thr_rgb_q = 1.0 / (thr_rgb * 256.0).max(0.256);
+                let inv_thr_a_q = 1.0 / (thr_a * 256.0).max(0.256);
+                let do_rgb = thr_rgb > 0.0;
+                // When alpha is uniform across the entire image (e.g., opaque backgrounds), alpha taps are a no-op.
+                let do_a = thr_a > 0.0 && !uniform_alpha;
+                let r_f = r as f32;
+                let r_pad = (r + 2) as usize;
+                let y_safe_end = h.saturating_sub(r_pad);
+                let x_safe_end = w.saturating_sub(r_pad);
+
+                const TILE_H: usize = 64;
+                const TILE_W: usize = 128;
+                next.par_chunks_mut(w * TILE_H).enumerate().for_each(|(band_idx, band)| {
+                    let y0 = band_idx * TILE_H;
+                    let rows = band.len() / w;
+                    let mut x0 = 0;
+                    while x0 < w {
+                        let x1 = (x0 + TILE_W).min(w);
+                        for ly in 0..rows {
+                            let y = y0 + ly;
+                            let yi = y as isize;
+                            let row_base = y * w;
+                            let out_row = &mut band[ly * w..(ly + 1) * w];
+                            let y_interior = y >= r_pad && y < y_safe_end;
+
+                            #[inline(always)]
+                            fn accum_pair(
+                                cur: [u16; 4],
+                                q1: [u16; 4],
+                                q2: [u16; 4],
+                                do_rgb: bool,
+                                do_a: bool,
+                                thr_rgb_q: u16,
+                                thr_a_q: u16,
+                                inv_thr_rgb_q: f32,
+                                inv_thr_a_q: f32,
+                                sum0: &mut f32,
+                                sum1: &mut f32,
+                                sum2: &mut f32,
+                                wsum: &mut f32,
+                                sum_a: &mut f32,
+                                wsum_a: &mut f32,
+                            ) {
+                                if do_rgb {
+                                    let d_rgb = q1[0]
+                                        .abs_diff(cur[0])
+                                        .max(q1[1].abs_diff(cur[1]))
+                                        .max(q1[2].abs_diff(cur[2]))
+                                        .max(q2[0].abs_diff(cur[0]))
+                                        .max(q2[1].abs_diff(cur[1]))
+                                        .max(q2[2].abs_diff(cur[2]));
+                                    if d_rgb < thr_rgb_q {
+                                        let u = d_rgb as f32 * inv_thr_rgb_q;
+                                        let wr = 1.0 - u * u;
+                                        *sum0 += wr * (q1[0] as u32 + q2[0] as u32) as f32;
+                                        *sum1 += wr * (q1[1] as u32 + q2[1] as u32) as f32;
+                                        *sum2 += wr * (q1[2] as u32 + q2[2] as u32) as f32;
+                                        *wsum += 2.0 * wr;
+                                    }
+                                }
+                                if do_a {
+                                    let d_a = q1[3].abs_diff(cur[3]).max(q2[3].abs_diff(cur[3]));
+                                    if d_a < thr_a_q {
+                                        let u = d_a as f32 * inv_thr_a_q;
+                                        let wa = 1.0 - u * u;
+                                        *sum_a += wa * (q1[3] as u32 + q2[3] as u32) as f32;
+                                        *wsum_a += 2.0 * wa;
+                                    }
+                                }
+                            }
+
+                            let eval_border = |x: usize| -> [u16; 4] {
+                                let i = row_base + x;
+                                let cur = src_c[i];
+                                let hs = hash(((i as u64) << 8) ^ it_seed);
+                                let (mut ca, mut sa) = trig[(hs >> LUT_SHIFT) as usize];
+                                let (mut sum0, mut sum1, mut sum2, mut wsum) = (cur[0] as f32, cur[1] as f32, cur[2] as f32, 1.0f32);
+                                let (mut sum_a, mut wsum_a) = (cur[3] as f32, 1.0f32);
+                                let xi = x as isize;
+                                for ring in 0..rings {
+                                    let j = ((hs >> (ring * 12)) & 0xfff) as f32 * (1.0 / 4096.0);
+                                    let dist_r = 1.0 + ((ring as f32 + j) * inv_rings) * r_f;
+                                    let ox0 = fast_round_isize(dist_r * ca);
+                                    let oy0 = fast_round_isize(dist_r * sa);
+                                    let nca = ca * CG - sa * SG;
+                                    let nsa = sa * CG + ca * SG;
+                                    ca = nca;
+                                    sa = nsa;
+                                    for (ox, oy) in [(ox0, oy0), (-oy0, ox0)] {
+                                        let i1 = (yi + oy).clamp(0, hi - 1) as usize * w + (xi + ox).clamp(0, wi - 1) as usize;
+                                        let i2 = (yi - oy).clamp(0, hi - 1) as usize * w + (xi - ox).clamp(0, wi - 1) as usize;
+                                        accum_pair(
+                                            cur, src_c[i1], src_c[i2], do_rgb, do_a, thr_rgb_q, thr_a_q, inv_thr_rgb_q, inv_thr_a_q,
+                                            &mut sum0, &mut sum1, &mut sum2, &mut wsum, &mut sum_a, &mut wsum_a,
+                                        );
+                                    }
+                                }
+                                let inv_w = 1.0 / wsum;
+                                [
+                                    (sum0 * inv_w + 0.5) as u16,
+                                    (sum1 * inv_w + 0.5) as u16,
+                                    (sum2 * inv_w + 0.5) as u16,
+                                    if do_a { (sum_a / wsum_a + 0.5) as u16 } else { cur[3] },
+                                ]
+                            };
+
+                            if y_interior && r_pad < x_safe_end {
+                                let int_a = x0.max(r_pad).min(x1);
+                                let int_b = x1.min(x_safe_end).max(int_a);
+                                for x in x0..int_a {
+                                    out_row[x] = eval_border(x);
+                                }
+                                for x in int_a..int_b {
+                                    let i = row_base + x;
+                                    let cur = src_c[i];
+                                    let hs = hash(((i as u64) << 8) ^ it_seed);
+                                    let (mut ca, mut sa) = trig[(hs >> LUT_SHIFT) as usize];
+                                    let (mut sum0, mut sum1, mut sum2, mut wsum) = (cur[0] as f32, cur[1] as f32, cur[2] as f32, 1.0f32);
+                                    let (mut sum_a, mut wsum_a) = (cur[3] as f32, 1.0f32);
+                                    let ii = i as isize;
+                                    for ring in 0..rings {
+                                        let j = ((hs >> (ring * 12)) & 0xfff) as f32 * (1.0 / 4096.0);
+                                        let dist_r = 1.0 + ((ring as f32 + j) * inv_rings) * r_f;
+                                        let ox0 = fast_round_isize(dist_r * ca);
+                                        let oy0 = fast_round_isize(dist_r * sa);
+                                        let nca = ca * CG - sa * SG;
+                                        let nsa = sa * CG + ca * SG;
+                                        ca = nca;
+                                        sa = nsa;
+                                        let d0 = oy0 * wi + ox0;
+                                        let d1 = ox0 * wi - oy0;
+                                        accum_pair(
+                                            cur, src_c[(ii + d0) as usize], src_c[(ii - d0) as usize], do_rgb, do_a,
+                                            thr_rgb_q, thr_a_q, inv_thr_rgb_q, inv_thr_a_q,
+                                            &mut sum0, &mut sum1, &mut sum2, &mut wsum, &mut sum_a, &mut wsum_a,
+                                        );
+                                        accum_pair(
+                                            cur, src_c[(ii + d1) as usize], src_c[(ii - d1) as usize], do_rgb, do_a,
+                                            thr_rgb_q, thr_a_q, inv_thr_rgb_q, inv_thr_a_q,
+                                            &mut sum0, &mut sum1, &mut sum2, &mut wsum, &mut sum_a, &mut wsum_a,
+                                        );
+                                    }
+                                    let inv_w = 1.0 / wsum;
+                                    out_row[x] = [
+                                        (sum0 * inv_w + 0.5) as u16,
+                                        (sum1 * inv_w + 0.5) as u16,
+                                        (sum2 * inv_w + 0.5) as u16,
+                                        if do_a { (sum_a / wsum_a + 0.5) as u16 } else { cur[3] },
+                                    ];
+                                }
+                                for x in int_b..x1 {
+                                    out_row[x] = eval_border(x);
+                                }
+                            } else {
+                                for x in x0..x1 {
+                                    out_row[x] = eval_border(x);
                                 }
                             }
                         }
-                    } else {
-                        unit(h1)
-                    };
-                    1 + (f * r as f32) as i64
-                };
-                let dist = reach(hs);
-                let ang = unit(hash(hs)) * std::f32::consts::TAU;
-                let dx = (dist as f32 * ang.cos()).round_ties_even() as i64;
-                let dy = (dist as f32 * ang.sin()).round_ties_even() as i64;
-                let cur = c[i];
-                // eight neighbours at two random distances and angles
-                let hs2 = hash(hs ^ 0xa5a5a5a5);
-                let dist2 = reach(hs2);
-                let ang2 = unit(hash(hs2)) * std::f32::consts::TAU;
-                let dx2 = (dist2 as f32 * ang2.cos()).round_ties_even() as i64;
-                let dy2 = (dist2 as f32 * ang2.sin()).round_ties_even() as i64;
-                let offs = [(dx, dy), (-dx, -dy), (-dy, dx), (dy, -dx), (dx2, dy2), (-dx2, -dy2), (-dy2, dx2), (dy2, -dx2)];
-                let refs: [[f32; 4]; 8] = std::array::from_fn(|k| at(&c, x + offs[k].0, y + offs[k].1));
-                if p.adv.mode != Mode::Pairs {
-                    // vszip's mode 6 / 7 on two sets of four references (opposite ones are 0 and 1, 2 and 3), the results averaged
-                    let (t1_rgb, t2_rgb) = (if p.adv.thr1 > 0.0 { p.adv.thr1 } else { p.thr_rgb }, if p.adv.thr2 > 0.0 { p.adv.thr2 } else { p.thr_rgb });
-                    let (t1_a, t2_a) = (if p.adv.thr1 > 0.0 { p.adv.thr1 } else { p.thr_a }, if p.adv.thr2 > 0.0 { p.adv.thr2 } else { p.thr_a });
-                    let half = if p.narrowing && iterations > 1 && it == 0 { 0.5 } else { 1.0 };
-                    let (mut b_rgb, mut b_a) = (1.0f32, 1.0f32);
-                    if let Some((ang_y, ang_a)) = &angles {
-                        // wider limits where the slope runs the same way at the pixel and at all four references (one set)
-                        let idx = |k: usize| (y + offs[k].1).clamp(0, h as i64 - 1) as usize * w + (x + offs[k].0).clamp(0, w as i64 - 1) as usize;
-                        let same = |a: &Vec<f32>| (0..4).all(|k| (a[idx(k)] - a[i]).abs() <= p.adv.max_angle);
-                        if same(ang_y) {
-                            b_rgb = p.adv.angle_boost;
-                        }
-                        if same(ang_a) {
-                            b_a = p.adv.angle_boost;
-                        }
+                        x0 = x1;
                     }
-                    let t_rgb = [thr_rgb * b_rgb, t1_rgb * half * b_rgb, t2_rgb * half * b_rgb];
-                    let t_a = [thr_a * b_a, t1_a * half * b_a, t2_a * half * b_a];
-                    let rgb = |q: &[f32; 4]| [q[0], q[1], q[2]];
-                    let cur_rgb = rgb(&cur);
-                    let set = |s: usize| -> ([f32; 3], [f32; 1]) {
-                        let pr = [rgb(&refs[s]), rgb(&refs[s + 2]), rgb(&refs[s + 1]), rgb(&refs[s + 3])];
-                        let pa = [[refs[s][3]], [refs[s + 2][3]], [refs[s + 1][3]], [refs[s + 3][3]]];
-                        (soft_delta(cur_rgb, pr, t_rgb), soft_delta([cur[3]], pa, t_a))
-                    };
-                    let (d1, a1) = set(0);
-                    let (d2, a2) = set(4);
-                    return [cur[0] + (d1[0] + d2[0]) * 0.5, cur[1] + (d1[1] + d2[1]) * 0.5, cur[2] + (d1[2] + d2[2]) * 0.5, cur[3] + (a1[0] + a2[0]) * 0.5];
-                }
-                // the neighbours come in opposite pairs, taken in together by how close both are to the pixel: a straight ramp is its own
-                // average (it stays as it is), a staircase becomes the ramp it was cut from, and an edge keeps its side
-                let (mut sum, mut wsum) = ([cur[0], cur[1], cur[2]], 1.0f32);
-                let (mut sum_a, mut wsum_a) = (cur[3], 1.0f32);
-                for pair in refs.chunks(2) {
-                    let (q1, q2) = (&pair[0], &pair[1]);
-                    let dd = |q: &[f32; 4]| (q[0] - cur[0]).abs().max((q[1] - cur[1]).abs()).max((q[2] - cur[2]).abs());
-                    let wr = ((thr_rgb - dd(q1).max(dd(q2))) / (0.5 * thr_rgb.max(1e-3))).clamp(0.0, 1.0);
-                    let da = (q1[3] - cur[3]).abs().max((q2[3] - cur[3]).abs());
-                    let wa = ((thr_a - da) / (0.5 * thr_a.max(1e-3))).clamp(0.0, 1.0);
-                    for k in 0..3 {
-                        sum[k] += wr * (q1[k] + q2[k]);
-                    }
-                    wsum += 2.0 * wr;
-                    sum_a += wa * (q1[3] + q2[3]);
-                    wsum_a += 2.0 * wa;
-                }
-                [sum[0] / wsum, sum[1] / wsum, sum[2] / wsum, sum_a / wsum_a]
-            })
-            .collect();
-        c = next;
-    }
-    if p.limit > 0.0 {
-        c = c
-            .par_iter()
-            .zip(src.px.par_iter())
-            .map(|(q, s)| {
-                let mut o = *q;
-                for k in 0..4 {
-                    o[k] = limit_value(q[k], s[k] * 255.0, p.limit, p.elast);
-                }
-                o
-            })
-            .collect();
-    }
-    let px = c
-        .par_iter()
-        .enumerate()
-        .map(|(i, q)| {
-            let (x, y) = (i % w, i / w);
-            let al = q[3];
-            let n_a = p.grain * grain_at(p.kind, x, y, 3, al);
-            let out_a = if !p.quantize {
-                (al + n_a).clamp(0.0, 255.0)
-            } else if al < 0.25 {
-                0.0
-            } else if al > 254.75 {
-                255.0
+                });
             } else {
-                (al + ign(x, y, 0.0, 0.0) + n_a).floor().clamp(0.0, 255.0)
-            };
-            let mut rgb = [0.0f32; 3];
-            for k in 0..3 {
-                let straight = if al > 0.5 { q[k] * 255.0 / al } else { 0.0 };
-                let n = p.grain * grain_at(p.kind, x, y, if p.mono { 0 } else { k as u64 }, straight);
-                rgb[k] = if p.quantize { (straight + ign(x, y, 41.0 * k as f32 + 5.0, 13.0 * k as f32 + 3.0) + n).floor().clamp(0.0, 255.0) } else { (straight + n).clamp(0.0, 255.0) };
+                // vszip's mode 6 / 7 on two sets of four references (opposite ones are 0 and 1, 2 and 3), the results averaged
+                let (t1_rgb, t2_rgb) = (if p.adv.thr1 > 0.0 { p.adv.thr1 } else { p.thr_rgb }, if p.adv.thr2 > 0.0 { p.adv.thr2 } else { p.thr_rgb });
+                let (t1_a, t2_a) = (if p.adv.thr1 > 0.0 { p.adv.thr1 } else { p.thr_a }, if p.adv.thr2 > 0.0 { p.adv.thr2 } else { p.thr_a });
+                let half = if p.narrowing && iterations > 1 && it == 0 { 0.5 } else { 1.0 };
+                let base_inv_rgb = [1.0 / thr_rgb.max(1e-5), 1.0 / (t1_rgb * half).max(1e-5), 1.0 / (t2_rgb * half).max(1e-5)];
+                let base_inv_a = [1.0 / thr_a.max(1e-5), 1.0 / (t1_a * half).max(1e-5), 1.0 / (t2_a * half).max(1e-5)];
+                let inv_boost = 1.0 / p.adv.angle_boost.max(1e-5);
+                let r_f = r as f32;
+
+                next.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+                    let yi = y as isize;
+                    let row_base = y * w;
+                    let reach = |h1: u64| -> isize {
+                        let f = if p.adv.dist_sigma > 0.0 {
+                            let mut hh = h1;
+                            loop {
+                                let (a, b) = (unit(hh) * 2.0 - 1.0, unit(hash(hh)) * 2.0 - 1.0);
+                                let r2 = a * a + b * b;
+                                hh = hash(hh ^ 0x2545f4914f6cdd1d);
+                                if r2 > 0.0 && r2 <= 1.0 {
+                                    let v = p.adv.dist_sigma * b * (-2.0 * r2.ln() / r2).sqrt();
+                                    if v > -1.0 && v < 1.0 {
+                                        break v.abs();
+                                    }
+                                }
+                            }
+                        } else {
+                            unit(h1)
+                        };
+                        1 + (f * r_f) as isize
+                    };
+                    let to_f = |q: [u16; 4]| [q[0] as f32 * INV_Q8, q[1] as f32 * INV_Q8, q[2] as f32 * INV_Q8, q[3] as f32 * INV_Q8];
+                    for (x, dst) in out_row.iter_mut().enumerate() {
+                        let i = row_base + x;
+                        let xi = x as isize;
+                        let cur = to_f(src_c[i]);
+                        let hs = hash(((i as u64) << 8) ^ it_seed);
+                        let dist = reach(hs) as f32;
+                        let (c1, s1) = trig[(hash(hs) >> LUT_SHIFT) as usize];
+                        let dx = fast_round_isize(dist * c1);
+                        let dy = fast_round_isize(dist * s1);
+                        let hs2 = hash(hs ^ 0xa5a5a5a5);
+                        let dist2 = reach(hs2) as f32;
+                        let (c2, s2) = trig[(hash(hs2) >> LUT_SHIFT) as usize];
+                        let dx2 = fast_round_isize(dist2 * c2);
+                        let dy2 = fast_round_isize(dist2 * s2);
+                        let offs = [(dx, dy), (-dx, -dy), (-dy, dx), (dy, -dx), (dx2, dy2), (-dx2, -dy2), (-dy2, dx2), (dy2, -dx2)];
+                        let idxs: [usize; 8] = std::array::from_fn(|k| {
+                            (yi + offs[k].1).clamp(0, hi - 1) as usize * w + (xi + offs[k].0).clamp(0, wi - 1) as usize
+                        });
+                        let refs: [[f32; 4]; 8] = std::array::from_fn(|k| to_f(src_c[idxs[k]]));
+                        let (mut inv_rgb, mut inv_a) = (base_inv_rgb, base_inv_a);
+                        if let Some((ang_y, ang_a)) = &angles {
+                            if (0..4).all(|k| (ang_y[idxs[k]] - ang_y[i]).abs() <= p.adv.max_angle) {
+                                for v in &mut inv_rgb {
+                                    *v *= inv_boost;
+                                }
+                            }
+                            if (0..4).all(|k| (ang_a[idxs[k]] - ang_a[i]).abs() <= p.adv.max_angle) {
+                                for v in &mut inv_a {
+                                    *v *= inv_boost;
+                                }
+                            }
+                        }
+                        let rgb = |q: &[f32; 4]| [q[0], q[1], q[2]];
+                        let cur_rgb = rgb(&cur);
+                        let set = |s: usize| -> ([f32; 3], [f32; 1]) {
+                            let pr = [rgb(&refs[s]), rgb(&refs[s + 2]), rgb(&refs[s + 1]), rgb(&refs[s + 3])];
+                            let pa = [[refs[s][3]], [refs[s + 2][3]], [refs[s + 1][3]], [refs[s + 3][3]]];
+                            (soft_delta(cur_rgb, pr, inv_rgb), soft_delta([cur[3]], pa, inv_a))
+                        };
+                        let (d1, a1) = set(0);
+                        let (d2, a2) = set(4);
+                        *dst = [
+                            ((cur[0] + (d1[0] + d2[0]) * 0.5).clamp(0.0, 255.0) * 256.0 + 0.5) as u16,
+                            ((cur[1] + (d1[1] + d2[1]) * 0.5).clamp(0.0, 255.0) * 256.0 + 0.5) as u16,
+                            ((cur[2] + (d1[2] + d2[2]) * 0.5).clamp(0.0, 255.0) * 256.0 + 0.5) as u16,
+                            ((cur[3] + (a1[0] + a2[0]) * 0.5).clamp(0.0, 255.0) * 256.0 + 0.5) as u16,
+                        ];
+                    }
+                });
             }
-            let a = out_a / 255.0;
-            [rgb[0] / 255.0 * a, rgb[1] / 255.0 * a, rgb[2] / 255.0 * a, a]
-        })
-        .collect();
+            std::mem::swap(&mut c, &mut next);
+        }
+    }
+
+    let do_rgb = p.thr_rgb > 0.0 || p.thr_a <= 0.0;
+    let do_a = p.thr_a > 0.0 || p.thr_rgb <= 0.0;
+    let do_limit = p.limit > 0.0;
+    let do_grain = p.grain > 0.0 && p.kind != Grain::None;
+    // Fast path when no grain or quantization is needed (typical Op::Deband pipeline with grain == 0):
+    // avoids computing pixel coordinates, IGN, or pre-zeroing a 64 MB buffer.
+    let px: Vec<[f32; 4]> = if !do_grain && !p.quantize && do_rgb && do_a {
+        c.par_iter()
+            .zip(src.px.par_iter())
+            .map(|(cq, orig)| {
+                let mut q = [cq[0] as f32 * INV_Q8, cq[1] as f32 * INV_Q8, cq[2] as f32 * INV_Q8, cq[3] as f32 * INV_Q8];
+                if do_limit {
+                    for k in 0..4 {
+                        q[k] = limit_value(q[k], orig[k] * 255.0, p.limit, p.elast);
+                    }
+                }
+                let a = q[3].clamp(0.0, 255.0) * (1.0 / 255.0);
+                if q[3] > 0.5 {
+                    let s = a / q[3];
+                    [(q[0] * s).clamp(0.0, a), (q[1] * s).clamp(0.0, a), (q[2] * s).clamp(0.0, a), a]
+                } else {
+                    [0.0, 0.0, 0.0, a]
+                }
+            })
+            .collect()
+    } else {
+        c.par_iter()
+            .zip(src.px.par_iter())
+            .enumerate()
+            .map(|(i, (cq, orig))| {
+                let (x, y) = (i % w, i / w);
+                let mut q = [cq[0] as f32 * INV_Q8, cq[1] as f32 * INV_Q8, cq[2] as f32 * INV_Q8, cq[3] as f32 * INV_Q8];
+                if do_limit {
+                    for k in 0..4 {
+                        q[k] = limit_value(q[k], orig[k] * 255.0, p.limit, p.elast);
+                    }
+                }
+                let al = if do_a { q[3] } else { orig[3] * 255.0 };
+                let n_a = if do_a && do_grain { p.grain * grain_at_with_lut(p.kind, x, y, 3, al, g_lut) } else { 0.0 };
+                let mut out_a = if !do_a {
+                    al.clamp(0.0, 255.0)
+                } else if !p.quantize {
+                    (al + n_a).clamp(0.0, 255.0)
+                } else if al < 0.25 {
+                    0.0
+                } else if al > 254.75 {
+                    255.0
+                } else {
+                    fast_floor_0_255(al + ign(x, y, 0.0, 0.0) + n_a)
+                };
+                if !do_rgb {
+                    // Alpha-only deband: preserve original straight RGB untouched.
+                    let oa = orig[3];
+                    let a = out_a * (1.0 / 255.0);
+                    return if oa > 1e-4 {
+                        let inv_oa = 1.0 / oa;
+                        [(orig[0] * inv_oa).clamp(0.0, 1.0) * a, (orig[1] * inv_oa).clamp(0.0, 1.0) * a, (orig[2] * inv_oa).clamp(0.0, 1.0) * a, a]
+                    } else {
+                        [0.0, 0.0, 0.0, a]
+                    };
+                }
+                if !p.mono && do_grain && al > 0.5 {
+                    let taper = ((al - 0.5) * (1.0 / 7.5)).clamp(0.0, 1.0);
+                    let mut pr = [0.0f32; 3];
+                    let scale_a = out_a / al;
+                    let g_mul = p.grain * taper;
+                    for k in 0..3 {
+                        let base_k = (q[k] * scale_a).clamp(0.0, 255.0);
+                        let n = g_mul * grain_at_with_lut(p.kind, x, y, k as u64, base_k, g_lut);
+                        pr[k] = if p.quantize {
+                            fast_floor_0_255(base_k + ign(x, y, 41.0 * k as f32 + 5.0, 13.0 * k as f32 + 3.0) + n)
+                        } else {
+                            (base_k + n).clamp(0.0, 255.0)
+                        };
+                    }
+                    if do_a {
+                        out_a = out_a.max(pr[0]).max(pr[1]).max(pr[2]).clamp(0.0, 255.0);
+                    } else {
+                        for v in &mut pr {
+                            *v = v.min(out_a);
+                        }
+                    }
+                    return [pr[0] * (1.0 / 255.0), pr[1] * (1.0 / 255.0), pr[2] * (1.0 / 255.0), out_a * (1.0 / 255.0)];
+                }
+                let mut rgb = [0.0f32; 3];
+                let inv_q3 = if q[3] > 0.5 { 255.0 / q[3] } else { 0.0 };
+                let mono_n = if !do_grain {
+                    Some(0.0)
+                } else if p.mono && p.kind != Grain::Poisson {
+                    Some(p.grain * grain_at_with_lut(p.kind, x, y, 0, 0.0, g_lut))
+                } else {
+                    None
+                };
+                for k in 0..3 {
+                    let straight = q[k] * inv_q3;
+                    let n = match mono_n {
+                        Some(v) => v,
+                        None => p.grain * grain_at_with_lut(p.kind, x, y, if p.mono { 0 } else { k as u64 }, straight, g_lut),
+                    };
+                    rgb[k] = if p.quantize {
+                        fast_floor_0_255(straight + ign(x, y, 41.0 * k as f32 + 5.0, 13.0 * k as f32 + 3.0) + n)
+                    } else {
+                        (straight + n).clamp(0.0, 255.0)
+                    };
+                }
+                let a = out_a * (1.0 / 255.0);
+                let a_div = a * (1.0 / 255.0);
+                [rgb[0] * a_div, rgb[1] * a_div, rgb[2] * a_div, a]
+            })
+            .collect()
+    };
     Img { w, h, px }
 }
 

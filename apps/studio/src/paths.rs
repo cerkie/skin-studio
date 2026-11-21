@@ -201,6 +201,13 @@ pub struct Config {
     pub dock_height: f32,
     /// How big the interface is, as a factor of the system's scaling: 0 = automatic (grows a little with the window's height).
     pub ui_scale: f32,
+    /// Optional CS/AR overrides and HR/HD mod previews for the live gameplay preview.
+    pub cs_override_on: bool,
+    pub cs_override: f32,
+    pub ar_override_on: bool,
+    pub ar_override: f32,
+    pub mod_hr: bool,
+    pub mod_hd: bool,
 }
 
 impl Default for Config {
@@ -223,6 +230,12 @@ impl Default for Config {
             dock_open: true,
             dock_height: 360.0,
             ui_scale: 0.0,
+            cs_override_on: false,
+            cs_override: 4.0,
+            ar_override_on: false,
+            ar_override: 9.0,
+            mod_hr: false,
+            mod_hd: false,
         }
     }
 }
@@ -276,6 +289,24 @@ impl Config {
         if let Some(x) = v.get("ui_scale").and_then(|x| x.as_f64()) {
             c.ui_scale = if x >= 0.5 { (x as f32).clamp(0.5, 2.5) } else { 0.0 };
         }
+        if let Some(b) = v.get("cs_override_on").and_then(|x| x.as_bool()) {
+            c.cs_override_on = b;
+        }
+        if let Some(x) = v.get("cs_override").and_then(|x| x.as_f64()) {
+            c.cs_override = (x as f32).clamp(0.0, 10.0);
+        }
+        if let Some(b) = v.get("ar_override_on").and_then(|x| x.as_bool()) {
+            c.ar_override_on = b;
+        }
+        if let Some(x) = v.get("ar_override").and_then(|x| x.as_f64()) {
+            c.ar_override = (x as f32).clamp(0.0, 11.0);
+        }
+        if let Some(b) = v.get("mod_hr").and_then(|x| x.as_bool()) {
+            c.mod_hr = b;
+        }
+        if let Some(b) = v.get("mod_hd").and_then(|x| x.as_bool()) {
+            c.mod_hd = b;
+        }
         c
     }
 
@@ -288,7 +319,7 @@ impl Config {
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let v = serde_json::json!({ "settings": self.settings, "skin": self.skin, "sound_skin": self.sound_skin, "map": self.map, "songs": self.songs, "volume": self.volume, "muted": self.muted, "offset_ms": self.offset_ms, "cursor_scale": self.cursor_scale, "hit_lighting": self.hit_lighting, "snake_in": self.snake_in, "snake_out": self.snake_out, "speed": self.speed, "library": self.library, "dock_open": self.dock_open, "dock_height": self.dock_height, "ui_scale": self.ui_scale });
+        let v = serde_json::json!({ "settings": self.settings, "skin": self.skin, "sound_skin": self.sound_skin, "map": self.map, "songs": self.songs, "volume": self.volume, "muted": self.muted, "offset_ms": self.offset_ms, "cursor_scale": self.cursor_scale, "hit_lighting": self.hit_lighting, "snake_in": self.snake_in, "snake_out": self.snake_out, "speed": self.speed, "library": self.library, "dock_open": self.dock_open, "dock_height": self.dock_height, "ui_scale": self.ui_scale, "cs_override_on": self.cs_override_on, "cs_override": self.cs_override, "ar_override_on": self.ar_override_on, "ar_override": self.ar_override, "mod_hr": self.mod_hr, "mod_hd": self.mod_hd });
         let _ = std::fs::write(f, serde_json::to_string_pretty(&v).unwrap_or_default());
     }
 }

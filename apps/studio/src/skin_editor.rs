@@ -26,13 +26,17 @@ pub enum Bg {
     Grey,
     Dark,
     Light,
+    Check,
 }
 
 /// The pages of the panel on the left (as the Followpoints tab has its own), so that nothing needs a long scroll.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SkinPage {
     Pictures,
+    Create,
     Edits,
+    Scan,
+    Ini,
     Output,
 }
 
@@ -51,7 +55,18 @@ pub fn thumbnail(img: &Img, side: usize) -> ([usize; 2], Vec<u8>) {
     ([w, h], small.to_premult_u8())
 }
 
-/// A picture ready for the screen: premultiplied RGBA bytes, shrunk to what a graphics card takes. It is made on the worker.
+fn boost_rgba(raw_rgba: &[u8]) -> Vec<u8> {
+    let lut: [u8; 256] = std::array::from_fn(|i| ((i as f32 / 255.0).powf(0.32) * 255.0).round() as u8);
+    let mut out = vec![0u8; raw_rgba.len()];
+    for (dst, c) in out.chunks_exact_mut(4).zip(raw_rgba.chunks_exact(4)) {
+        let a = lut[c[3] as usize];
+        dst[0] = lut[c[0] as usize].min(a);
+        dst[1] = lut[c[1] as usize].min(a);
+        dst[2] = lut[c[2] as usize].min(a);
+        dst[3] = a;
+    }
+    out
+}
 pub struct Display {
     pub size: [usize; 2],
     pub rgba: Vec<u8>,
@@ -67,12 +82,7 @@ pub fn make_display(img: &Img, output: edit::Output) -> Display {
         img
     };
     // rounded as the saved file is (with the same dither), so that what is seen is what is saved; premultiplied for the screen
-    let straight = edit::to_rgba8_with(src, output.dither && output.depth == edit::Depth::Bits8);
-    let mut rgba = Vec::with_capacity(straight.len());
-    for c in straight.chunks_exact(4) {
-        let a = c[3] as u32;
-        rgba.extend_from_slice(&[((c[0] as u32 * a + 127) / 255) as u8, ((c[1] as u32 * a + 127) / 255) as u8, ((c[2] as u32 * a + 127) / 255) as u8, c[3]]);
-    }
+    let rgba = edit::to_display_rgba8_with(src, output.dither && output.depth == edit::Depth::Bits8);
     Display { size: [src.w, src.h], rgba }
 }
 
@@ -81,6 +91,7 @@ struct Job {
     gen: u64,
     src: Arc<Img>,
     ops: Vec<Op>,
+    disabled: std::collections::HashSet<usize>,
     output: edit::Output,
 }
 
@@ -120,18 +131,44 @@ pub struct SkinEditor {
     pub split: f32,
     pub keep_aspect: bool,
     bufs: HashMap<String, String>,
-    /// The edit list as it was before each change, and what undo took off: Ctrl+Z and Ctrl+Y.
-    undo: Vec<Vec<Op>>,
-    redo: Vec<Vec<Op>>,
+    /// The edit list (and hidden/disabled set) as it was before each change: Ctrl+Z and Ctrl+Y.
+    undo: Vec<(Vec<Op>, std::collections::HashSet<usize>)>,
+    redo: Vec<(Vec<Op>, std::collections::HashSet<usize>)>,
     last_edit: Option<std::time::Instant>,
     /// Small pictures of the files in the list, and which list they are for (a thumbnail of an older list is thrown away).
     thumbs: HashMap<PathBuf, (TextureHandle, [usize; 2])>,
     thumb_gen: u64,
+    /// Cached 2×2 repeating checkerboard texture for `Bg::Check` (drawn as 1 quad instead of thousands of rects).
+    check_tex: Option<TextureHandle>,
+    /// Cached list of backed-up originals `(display_name, backup_path, dest_path)` refreshed on disk events (never per-frame).
+    pub backups: Vec<(String, PathBuf, PathBuf)>,
+    /// Indices of edits temporarily hidden (bypassed) via the eye toggle on each edit card.
+    pub disabled: std::collections::HashSet<usize>,
+    /// When true, opening a clean picture carries over the current edit stack instead of clearing it.
+    pub keep_edits: bool,
+    /// Display-only dark-tone / banding amplifier on the canvas (never affects saved files).
+    pub boost: bool,
+    /// Resample mode used when generating missing `@2x` files from `1x` across a skin.
+    pub scale_up_mode: Resample,
+    /// Skin-wide artifact scanner state.
+    pub scan_running: bool,
+    pub scan_report: Option<engine::scan::ScanReport>,
+    /// Loaded `skin.ini` editor document for the open skin folder.
+    pub ini: crate::skin_ini::SkinIniDoc,
+    /// Procedural SDF element creator (`Create` page) and its cached canvas texture.
+    pub creator: crate::element_creator::CreatorState,
+    creator_tex: Option<(u64, bool, bool, [u8; 3], TextureHandle)>,
+    /// Saved reusable filter stacks persisted in `filter-presets.json`.
+    pub preset_name: String,
+    pub presets: Vec<(String, Vec<Op>)>,
+    presets_loaded: bool,
+    /// Unsaved edit stacks stashed per picture path so switching pictures in a skin never drops work.
+    stash: HashMap<PathBuf, (Vec<Op>, std::collections::HashSet<usize>, Vec<(Vec<Op>, std::collections::HashSet<usize>)>, Vec<(Vec<Op>, std::collections::HashSet<usize>)>, bool)>,
 }
 
 impl Default for SkinEditor {
     fn default() -> Self {
-        SkinEditor { dir: None, packed_from: None, files: vec![], filter: String::new(), current: None, source: None, ops: vec![], result: None, result_display: None, output: edit::Output::default(), page: SkinPage::Pictures, add_open: false, collapsed: Default::default(), slot: Arc::new(std::sync::Mutex::new(None)), running: Arc::new(std::sync::atomic::AtomicBool::new(false)), latest: Arc::new(std::sync::atomic::AtomicU64::new(0)), dims: vec![], gen: 0, busy: false, dirty: false, tex: [None, None], zoom: 0.0, pan: Vec2::ZERO, bg: Bg::Dark, show: Show::After, split: 0.5, keep_aspect: true, bufs: HashMap::new(), undo: vec![], redo: vec![], last_edit: None, thumbs: HashMap::new(), thumb_gen: 0 }
+        SkinEditor { dir: None, packed_from: None, files: vec![], filter: String::new(), current: None, source: None, ops: vec![], result: None, result_display: None, output: edit::Output::default(), page: SkinPage::Pictures, add_open: false, collapsed: Default::default(), slot: Arc::new(std::sync::Mutex::new(None)), running: Arc::new(std::sync::atomic::AtomicBool::new(false)), latest: Arc::new(std::sync::atomic::AtomicU64::new(0)), dims: vec![], gen: 0, busy: false, dirty: false, tex: [None, None], zoom: 0.0, pan: Vec2::ZERO, bg: Bg::Dark, show: Show::After, split: 0.5, keep_aspect: true, bufs: HashMap::new(), undo: vec![], redo: vec![], last_edit: None, thumbs: HashMap::new(), thumb_gen: 0, check_tex: None, backups: vec![], disabled: Default::default(), keep_edits: false, boost: false, scale_up_mode: Resample::Crisp, scan_running: false, scan_report: None, ini: Default::default(), creator: Default::default(), creator_tex: None, preset_name: String::new(), presets: vec![], presets_loaded: false, stash: HashMap::new() }
     }
 }
 
@@ -183,18 +220,20 @@ fn unpack(osk: &Path) -> Result<PathBuf, String> {
 /// What a list of edits makes of a picture, and the size after each edit.
 #[cfg(test)]
 pub fn compute(source: &Img, ops: &[Op]) -> (Img, Vec<(usize, usize)>) {
-    compute_until(source, ops, &|| false).unwrap_or_else(|| (source.clone(), vec![]))
+    compute_until(source, ops, &std::collections::HashSet::new(), &|| false).unwrap_or_else(|| (source.clone(), vec![]))
 }
 
 /// The same, but given up (`None`) between two edits as soon as `stale` says that a newer list of edits is waiting.
-fn compute_until(source: &Img, ops: &[Op], stale: &dyn Fn() -> bool) -> Option<(Img, Vec<(usize, usize)>)> {
+fn compute_until(source: &Img, ops: &[Op], disabled: &std::collections::HashSet<usize>, stale: &dyn Fn() -> bool) -> Option<(Img, Vec<(usize, usize)>)> {
     let mut cur = source.clone();
     let mut dims = Vec::with_capacity(ops.len());
-    for op in ops {
+    for (i, op) in ops.iter().enumerate() {
         if stale() {
             return None;
         }
-        cur = edit::apply(&cur, op);
+        if !disabled.contains(&i) {
+            cur = edit::apply(&cur, op);
+        }
         dims.push((cur.w, cur.h));
     }
     Some((cur, dims))
@@ -206,32 +245,161 @@ impl SkinEditor {
     pub fn open_skin(&mut self, path: &Path) -> Result<(), String> {
         let (dir, packed) = if path.is_dir() { (path.to_path_buf(), None) } else { (unpack(path)?, Some(path.to_path_buf())) };
         self.files = list_pngs(&dir);
+        self.ini = crate::skin_ini::SkinIniDoc::load_from_dir(&dir);
+        self.creator.select_kind(self.creator.doc.kind, Some(&dir));
+        self.scan_report = None;
         self.dir = Some(dir);
         self.packed_from = packed;
         self.filter.clear();
         self.page = SkinPage::Pictures;
+        self.stash.clear();
         self.clear_picture();
+        self.refresh_backups();
         Ok(())
+    }
+
+    pub fn refresh_backups(&mut self) {
+        self.backups.clear();
+        let Some(dir) = self.dir.clone() else { return };
+        let mut scan_dir = |parent: &Path, prefix: &str| {
+            let bdir = parent.join(".skin-studio-backup");
+            if let Ok(rd) = std::fs::read_dir(&bdir) {
+                for e in rd.flatten() {
+                    let bp = e.path();
+                    if bp.is_file() {
+                        let fname = e.file_name().to_string_lossy().to_string();
+                        let shown = if prefix.is_empty() { fname.clone() } else { format!("{prefix}/{fname}") };
+                        self.backups.push((shown, bp, parent.join(&fname)));
+                    }
+                }
+            }
+        };
+        scan_dir(&dir, "");
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if p.is_dir() && !name.starts_with('.') {
+                    scan_dir(&p, &name);
+                }
+            }
+        }
+        self.backups.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    }
+
+    pub fn refresh_files(&mut self, tx: &Sender<Msg>, ctx: &egui::Context) {
+        if let Some(dir) = self.dir.clone() {
+            self.files = list_pngs(&dir);
+            self.load_thumbs(tx, ctx);
+        }
+        self.refresh_backups();
+    }
+
+    /// Reconcile in-memory state after a background disk mutation (batch apply, Redo 1x, or full-skin scale).
+    pub fn after_disk_mutation(&mut self, modified: &[PathBuf], resolved_downscale: Option<&Path>, tx: &Sender<Msg>, ctx: &egui::Context) {
+        for p in modified {
+            self.stash.remove(p);
+        }
+        if let Some(res_p) = resolved_downscale {
+            if let Some(rep) = &mut self.scan_report {
+                for item in &mut rep.flagged {
+                    if item.path == res_p {
+                        item.issues.retain(|i| !matches!(i.kind, engine::scan::IssueKind::PoorDownscale));
+                    }
+                }
+                rep.flagged.retain(|item| !item.issues.is_empty());
+            }
+        }
+        self.refresh_files(tx, ctx);
+        if let Some(cur) = self.current.clone() {
+            if modified.iter().any(|p| p == &cur) {
+                self.current = None;
+                self.ops.clear();
+                self.disabled.clear();
+                self.dirty = false;
+                let _ = self.open_picture(&cur, Some((tx, ctx)));
+            }
+        }
+    }
+
+    fn ensure_presets(&mut self) {
+        if self.presets_loaded {
+            return;
+        }
+        self.presets_loaded = true;
+        if cfg!(test) {
+            return;
+        }
+        if let Some(p) = crate::paths::config_dir().map(|d| d.join("filter-presets.json")) {
+            if let Ok(text) = std::fs::read_to_string(p) {
+                if let Ok(list) = serde_json::from_str::<Vec<(String, Vec<Op>)>>(&text) {
+                    self.presets = list;
+                }
+            }
+        }
+    }
+
+    fn save_presets(&self) {
+        if cfg!(test) {
+            return;
+        }
+        if let Some(d) = crate::paths::config_dir() {
+            let _ = std::fs::create_dir_all(&d);
+            if let Ok(json) = serde_json::to_string_pretty(&self.presets) {
+                let _ = std::fs::write(d.join("filter-presets.json"), json);
+            }
+        }
     }
 
     /// Open a single picture (its folder becomes the list when no skin is open).
     pub fn open_picture(&mut self, path: &Path, ctx_tx: Option<(&Sender<Msg>, &egui::Context)>) -> Result<(), String> {
+        if self.current.as_deref() == Some(path) && self.source.is_some() {
+            self.page = SkinPage::Edits;
+            return Ok(());
+        }
         let img = edit::load_png(path)?;
+        let carry_ops = if self.keep_edits { Some((self.ops.clone(), self.disabled.clone())) } else { None };
+        // Stash outgoing picture's unsaved edits only when dirty (saved edits are already baked into disk).
+        if let Some(prev) = self.current.clone() {
+            if self.dirty {
+                self.stash.insert(prev, (self.ops.clone(), self.disabled.clone(), self.undo.clone(), self.redo.clone(), true));
+            } else {
+                self.stash.remove(&prev);
+            }
+        }
         self.page = SkinPage::Edits;
         if self.dir.is_none() {
             if let Some(d) = path.parent() {
                 self.files = list_pngs(d);
+                self.ini = crate::skin_ini::SkinIniDoc::load_from_dir(d);
                 self.dir = Some(d.to_path_buf());
+                self.refresh_backups();
             }
         }
         self.current = Some(path.to_path_buf());
         self.source = Some(Arc::new(img));
-        self.undo.clear();
-        self.redo.clear();
         self.last_edit = None;
-        self.ops.clear();
         self.dims.clear();
-        self.dirty = false;
+        self.collapsed.clear();
+        if let Some((ops, disabled, undo, redo, dirty)) = self.stash.remove(path) {
+            self.ops = ops;
+            self.disabled = disabled;
+            self.undo = undo;
+            self.redo = redo;
+            self.dirty = dirty;
+        } else if let Some((ops, disabled)) = carry_ops.filter(|(o, _)| !o.is_empty()) {
+            self.undo.clear();
+            self.redo.clear();
+            self.ops = ops;
+            self.disabled = disabled;
+            self.dirty = true;
+        } else {
+            self.undo.clear();
+            self.redo.clear();
+            self.ops.clear();
+            self.disabled.clear();
+            self.dirty = false;
+        }
         self.zoom = 0.0;
         self.pan = Vec2::ZERO;
         self.bufs.clear();
@@ -252,6 +420,7 @@ impl SkinEditor {
         self.source = None;
         self.result = None;
         self.ops.clear();
+        self.disabled.clear();
         self.dims.clear();
         self.dirty = false;
         self.tex = [None, None];
@@ -287,29 +456,38 @@ impl SkinEditor {
     }
 
     // ------------------------------------------------------------------------------------------------------------ undo
-    /// The edit list is about to change from `before`: keep it. Changes that follow each other quickly (dragging a slider) are one step.
+    /// The edit list (and visibility set) is about to change from `before`: keep it. Rapid slider drags coalesce into one step.
+    #[allow(dead_code)]
     pub fn push_undo(&mut self, before: Vec<Op>) {
-        let quick = self.last_edit.is_some_and(|t| t.elapsed().as_millis() < 700);
+        self.push_undo_state(before, self.disabled.clone(), true);
+    }
+
+    pub fn push_undo_state(&mut self, before_ops: Vec<Op>, before_disabled: std::collections::HashSet<usize>, coalesce: bool) {
+        let quick = coalesce && self.last_edit.is_some_and(|t| t.elapsed().as_millis() < 700);
         if !quick || self.undo.is_empty() {
-            self.undo.push(before);
+            self.undo.push((before_ops, before_disabled));
             if self.undo.len() > 200 {
                 self.undo.remove(0);
             }
         }
         self.redo.clear();
-        self.last_edit = Some(std::time::Instant::now());
+        self.last_edit = if coalesce { Some(std::time::Instant::now()) } else { None };
     }
 
     pub fn undo(&mut self, tx: &Sender<Msg>, ctx: &egui::Context) {
-        if let Some(prev) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.ops, prev));
+        if let Some((prev_ops, prev_dis)) = self.undo.pop() {
+            let cur_ops = std::mem::replace(&mut self.ops, prev_ops);
+            let cur_dis = std::mem::replace(&mut self.disabled, prev_dis);
+            self.redo.push((cur_ops, cur_dis));
             self.after_history(tx, ctx);
         }
     }
 
     pub fn redo(&mut self, tx: &Sender<Msg>, ctx: &egui::Context) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.ops, next));
+        if let Some((next_ops, next_dis)) = self.redo.pop() {
+            let cur_ops = std::mem::replace(&mut self.ops, next_ops);
+            let cur_dis = std::mem::replace(&mut self.disabled, next_dis);
+            self.undo.push((cur_ops, cur_dis));
             self.after_history(tx, ctx);
         }
     }
@@ -329,7 +507,7 @@ impl SkinEditor {
         self.gen += 1;
         self.busy = true;
         self.latest.store(self.gen, Ordering::SeqCst);
-        *self.slot.lock().unwrap() = Some(Job { gen: self.gen, src, ops: self.ops.clone(), output: self.output });
+        *self.slot.lock().unwrap() = Some(Job { gen: self.gen, src, ops: self.ops.clone(), disabled: self.disabled.clone(), output: self.output });
         if self.running.swap(true, Ordering::SeqCst) {
             return; // the worker that is running picks the new request up when it is done
         }
@@ -339,7 +517,7 @@ impl SkinEditor {
             match job {
                 Some(j) => {
                     let stale = || latest.load(Ordering::SeqCst) != j.gen;
-                    if let Some((img, dims)) = compute_until(&j.src, &j.ops, &stale) {
+                    if let Some((img, dims)) = compute_until(&j.src, &j.ops, &j.disabled, &stale) {
                         if !stale() {
                             let display = make_display(&img, j.output);
                             let _ = tx.send(Msg::SkinResult(j.gen, Arc::new(img), dims, Arc::new(display)));
@@ -394,6 +572,7 @@ impl SkinEditor {
             }
         }
         self.save_as(&path)?;
+        self.refresh_backups();
         Ok(path)
     }
 
@@ -446,13 +625,15 @@ impl SkinEditor {
             }
         }
         let ready = if which == 1 && self.result.as_ref().is_some_and(|r| Arc::as_ptr(r) as usize == key) { self.result_display.clone() } else { None };
-        let ci = match ready {
-            Some(d) => egui::ColorImage::from_rgba_premultiplied(d.size, &d.rgba),
+        let (size, raw_rgba) = match ready {
+            Some(d) => (d.size, d.rgba.clone()),
             None => {
                 let d = make_display(img, self.output);
-                egui::ColorImage::from_rgba_premultiplied(d.size, &d.rgba)
+                (d.size, d.rgba)
             }
         };
+        let rgba = if self.boost { boost_rgba(&raw_rgba) } else { raw_rgba };
+        let ci = egui::ColorImage::from_rgba_premultiplied(size, &rgba);
         let t = ctx.load_texture(if which == 0 { "skin-before" } else { "skin-after" }, ci, egui::TextureOptions::NEAREST);
         self.tex[which] = Some((key, t.clone()));
         t
@@ -482,16 +663,28 @@ pub fn toolbar(ui: &mut Ui, st: &mut Studio, right: f32) {
         }
         shown[k] = false;
     }
+    let tips: [&str; 6] = [
+        "Open a skin archive (.osk or .zip)",
+        "Open a skin folder",
+        "Open a single PNG picture",
+        "Save over the current file (Ctrl+S)",
+        "Save as a new file (Ctrl+Shift+S)",
+        "Pack this skin folder into an .osk",
+    ];
     let mut clicked: Option<usize> = None;
     for (k, (label, kind, enabled, _)) in items.iter().enumerate() {
+        if !shown[k] {
+            continue;
+        }
         if k == 3 || k == 5 {
             ui.add_space(10.0); // opening and saving are two groups, and Export is apart
         }
-        if shown[k] && th::button(ui, label, *kind, *enabled).clicked() {
+        if th::button(ui, label, *kind, *enabled).on_hover_text(tips[k]).clicked() {
             clicked = Some(k);
         }
-        if k == 4 && st.skin_ed.dirty && shown[3] {
-            let (d, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+        if k == 3 && (st.skin_ed.dirty || st.skin_ed.ini.dirty || st.skin_ed.creator.dirty || !st.skin_ed.stash.is_empty()) {
+            let (d, resp) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+            resp.on_hover_text("Unsaved changes");
             ui.painter().circle_filled(d.center(), 3.5, Color32::from_rgb(0xff, 0xad, 0x4d));
         }
     }
@@ -503,7 +696,10 @@ pub fn toolbar(ui: &mut Ui, st: &mut Studio, right: f32) {
                 if shown[k] {
                     continue;
                 }
-                let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(140.0), 30.0), Sense::click());
+                let (r, mut resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(140.0), 30.0), Sense::click());
+                if *enabled {
+                    resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                }
                 if resp.hovered() && *enabled {
                     ui.painter().rect_filled(r, CornerRadius::same(4), DARK3);
                 }
@@ -528,8 +724,47 @@ pub fn toolbar(ui: &mut Ui, st: &mut Studio, right: f32) {
 
 pub fn do_save(st: &mut Studio) {
     match st.skin_ed.save() {
-        Ok(p) => st.status = format!("Saved {}", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+        Ok(p) => {
+            if st.skin_ed.dir.is_some() && st.skin_ed.dir == st.current_skin_folder() {
+                st.load_session = true;
+                st.reroll_map = false;
+            }
+            st.status = format!("Saved {}", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+        }
         Err(e) => st.status = format!("Could not save: {e}"),
+    }
+}
+
+pub fn do_save_ini(st: &mut Studio) {
+    let Some(dir) = st.skin_ed.dir.clone() else { return };
+    match st.skin_ed.ini.save_to_dir(&dir) {
+        Ok(()) => {
+            st.skin_ed.refresh_backups();
+            if st.skin_ed.dir == st.current_skin_folder() {
+                st.load_session = true;
+                st.reroll_map = false;
+            }
+            st.status = "Saved skin.ini".into();
+        }
+        Err(e) => st.status = format!("Could not save skin.ini: {e}"),
+    }
+}
+
+pub fn do_save_creator(st: &mut Studio) {
+    let Some(dir) = st.skin_ed.dir.clone() else { return };
+    let out = st.skin_ed.output;
+    match st.skin_ed.creator.save_to_skin(&dir, out) {
+        Ok((p2, p1)) => {
+            let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+            let name = p2.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            st.skin_ed.after_disk_mutation(&[p2, p1], None, &tx, &ctx);
+            if st.skin_ed.dir == st.current_skin_folder() {
+                st.load_session = true;
+                st.reroll_map = false;
+            }
+            st.status = format!("Saved {name} + 1x pair");
+        }
+        Err(e) => st.status = format!("Could not save element: {e}"),
     }
 }
 
@@ -550,14 +785,46 @@ const SIDEBAR_W: f32 = 152.0;
 /// The whole skin editor under the toolbar: a panel on the left that is laid out like the one of the Followpoints tab (a rail of pages and the
 /// page next to it), the picture on the right.
 pub fn draw(root: &mut Ui, st: &mut Studio) {
-    // Ctrl+Z and Ctrl+Y (or Ctrl+Shift+Z) for the edit list, unless a box is being typed in
+    // Ctrl+Z/Y for the edit list, plus canvas shortcuts (F/0 = Fit, 1 = 100%, B/\ = Before/After, S = Split) when not typing or in a popup
     if !root.ctx().memory(|m| m.focused().is_some()) {
-        let (z, y, zs) = root.input_mut(|i| (i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z), i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y), i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)));
+        let popup_open = egui::Popup::is_any_open(root.ctx());
+        let (redo_k, undo_k, fit_k, one_k, cmp_k, split_k) = root.input_mut(|i| {
+            let none = egui::Modifiers::NONE;
+            (
+                i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
+                !popup_open && (i.consume_key(none, egui::Key::F) || i.consume_key(none, egui::Key::Num0)),
+                !popup_open && i.consume_key(none, egui::Key::Num1),
+                !popup_open && (i.consume_key(none, egui::Key::B) || i.consume_key(none, egui::Key::Backslash)),
+                !popup_open && i.consume_key(none, egui::Key::S),
+            )
+        });
         let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
-        if z {
-            st.skin_ed.undo(&tx, &ctx);
-        } else if y || zs {
-            st.skin_ed.redo(&tx, &ctx);
+        if redo_k {
+            if st.skin_ed.page == SkinPage::Create {
+                st.skin_ed.creator.redo();
+            } else {
+                st.skin_ed.redo(&tx, &ctx);
+            }
+        } else if undo_k {
+            if st.skin_ed.page == SkinPage::Create {
+                st.skin_ed.creator.undo();
+            } else {
+                st.skin_ed.undo(&tx, &ctx);
+            }
+        }
+        if st.skin_ed.source.is_some() || st.skin_ed.page == SkinPage::Create {
+            if fit_k {
+                st.skin_ed.zoom = 0.0;
+                st.skin_ed.pan = Vec2::ZERO;
+            } else if one_k {
+                st.skin_ed.zoom = 1.0 / root.ctx().pixels_per_point();
+                st.skin_ed.pan = Vec2::ZERO;
+            } else if cmp_k {
+                st.skin_ed.show = if st.skin_ed.show == Show::Before { Show::After } else { Show::Before };
+            } else if split_k {
+                st.skin_ed.show = Show::Split;
+            }
         }
     }
     egui::Panel::left("skin_panel").exact_size(PANEL_W).resizable(false).frame(egui::Frame::new().fill(BACKGROUND4).inner_margin(egui::Margin::ZERO)).show(root, |ui| {
@@ -572,16 +839,31 @@ pub fn draw(root: &mut Ui, st: &mut Studio) {
         }
         ui.scope_builder(egui::UiBuilder::new().max_rect(side), |ui| {
             ui.add_space(10.0);
-            for (page, name, icon) in [(SkinPage::Pictures, "Pictures", 1), (SkinPage::Edits, "Edits", 5), (SkinPage::Output, "Output", 8)] {
-                if th::sidebar_item(ui, name, icon, st.skin_ed.page == page).clicked() {
+            for (page, name, icon) in [
+                (SkinPage::Pictures, "Pictures", 1),
+                (SkinPage::Create, "Create", 0),
+                (SkinPage::Edits, "Edits", 5),
+                (SkinPage::Scan, "Scan", 7),
+                (SkinPage::Ini, "skin.ini", 3),
+                (SkinPage::Output, "Output", 9),
+            ] {
+                let resp = th::sidebar_item(ui, name, icon, st.skin_ed.page == page);
+                let show_dot = (page == SkinPage::Ini && st.skin_ed.ini.dirty) || (page == SkinPage::Create && st.skin_ed.creator.dirty);
+                if show_dot {
+                    ui.painter().circle_filled(Pos2::new(resp.rect.right() - 18.0, resp.rect.center().y), 3.0, Color32::from_rgb(0xff, 0xad, 0x4d));
+                }
+                if resp.clicked() {
                     st.skin_ed.page = page;
                 }
             }
         });
         match st.skin_ed.page {
             SkinPage::Pictures => pictures_page(ui, st, body),
-            SkinPage::Edits => scrolled(ui, body, |ui| edits_page(ui, st)),
-            SkinPage::Output => scrolled(ui, body, |ui| output_page(ui, st)),
+            SkinPage::Create => scrolled(ui, "skin-create", body, |ui| create_page(ui, st)),
+            SkinPage::Edits => scrolled(ui, "skin-edits", body, |ui| edits_page(ui, st)),
+            SkinPage::Scan => scrolled(ui, "skin-scan", body, |ui| scan_page(ui, st)),
+            SkinPage::Ini => scrolled(ui, "skin-ini", body, |ui| ini_page(ui, st)),
+            SkinPage::Output => scrolled(ui, "skin-output", body, |ui| output_page(ui, st)),
         }
     });
     egui::CentralPanel::default().frame(egui::Frame::new().fill(BACKGROUND6)).show(root, |ui| {
@@ -589,10 +871,10 @@ pub fn draw(root: &mut Ui, st: &mut Studio) {
     });
 }
 
-/// A page that scrolls on its own inside `body`.
-fn scrolled(ui: &mut Ui, body: Rect, f: impl FnOnce(&mut Ui)) {
+/// A page that scrolls on its own inside `body`, remembering its own scroll position across tab switches.
+fn scrolled(ui: &mut Ui, id: &str, body: Rect, f: impl FnOnce(&mut Ui)) {
     ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
             ui.set_width(body.width());
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             f(ui);
@@ -603,9 +885,9 @@ fn scrolled(ui: &mut Ui, body: Rect, f: impl FnOnce(&mut Ui)) {
 
 /// One line of small text, cut at the start when it is too long (the end of a path is the part that matters).
 fn small_line(ui: &mut Ui, s: &str) {
-    let max = ((ui.available_width() - 40.0) / 6.6).max(10.0) as usize;
-    let n = s.chars().count();
-    let shown = if n > max { format!("…{}", s.chars().skip(n - (max - 1)).collect::<String>()) } else { s.to_string() };
+    let font = FontId::new(13.0, th::light());
+    let max_w = (ui.available_width() - 34.0).max(40.0);
+    let shown = th::fit_text_start(ui.painter(), s, &font, max_w);
     ui.horizontal(|ui| {
         ui.add_space(17.0);
         ui.label(th::text(shown, 13.0, LIGHT3).family(th::light()));
@@ -615,7 +897,7 @@ fn small_line(ui: &mut Ui, s: &str) {
 
 fn pictures_page(ui: &mut Ui, st: &mut Studio, body: Rect) {
     if st.skin_ed.files.is_empty() {
-        scrolled(ui, body, |ui| {
+        scrolled(ui, "skin-pictures-empty", body, |ui| {
             th::section_header(ui, "Pictures");
             if st.skin_ed.dir.is_none() {
                 th::note(ui, "Open a skin (a folder or an .osk) to see its pictures, or open a single picture. Edits are made on a copy in memory: nothing changes on disk until you save, and the first original of every picture you save over is kept in a .skin-studio-backup folder next to it.");
@@ -654,13 +936,16 @@ fn pictures_page(ui: &mut Ui, st: &mut Studio, body: Rect) {
             for i in range {
                 let f = &st.skin_ed.files[rows[i]];
                 let on = st.skin_ed.current.as_deref() == Some(f.path.as_path());
+                let is_dirty = (on && st.skin_ed.dirty) || st.skin_ed.stash.get(&f.path).is_some_and(|s| s.4);
                 let width = ui.available_width() - 22.0;
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(width + 22.0, row_h), Sense::click());
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                 let r = Rect::from_min_size(r.min + Vec2::new(12.0, 1.0), Vec2::new(width, row_h - 2.0));
+                let hov = th::ease(ui, resp.id.with("h"), resp.hovered() && !on);
                 if on {
                     ui.painter().rect_filled(r, CornerRadius::same(5), Color32::from_rgba_unmultiplied(0x8c, 0x66, 0xff, 54));
-                } else if resp.hovered() {
-                    ui.painter().rect_filled(r, CornerRadius::same(5), DARK2);
+                } else if hov > 0.01 {
+                    ui.painter().rect_filled(r, CornerRadius::same(5), Color32::from_rgba_unmultiplied(DARK2.r(), DARK2.g(), DARK2.b(), (hov * 255.0) as u8));
                 }
                 let box_ = Rect::from_center_size(Pos2::new(r.left() + 22.0, r.center().y), Vec2::splat(30.0));
                 ui.painter().rect_filled(box_, CornerRadius::same(3), Color32::from_gray(0x2a));
@@ -670,12 +955,23 @@ fn pictures_page(ui: &mut Ui, st: &mut Studio, body: Rect) {
                     ui.painter().image(t.id(), Rect::from_center_size(box_.center(), size), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
                 }
                 let name_x = r.left() + 46.0;
-                let size_w = if f.size.is_some() { 74.0 } else { 0.0 };
-                let max_chars = (((r.right() - name_x - size_w - 8.0) / 7.4).max(6.0)) as usize;
-                let name: String = if f.name.chars().count() > max_chars { format!("{}…", f.name.chars().take(max_chars - 1).collect::<String>()) } else { f.name.clone() };
-                ui.painter().text(Pos2::new(name_x, r.center().y), Align2::LEFT_CENTER, name, FontId::new(14.0, FontFamily::Proportional), if on { CONTENT1 } else { CONTENT2 });
-                if let Some((w, h)) = f.size {
-                    ui.painter().text(r.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, format!("{w} × {h}"), FontId::new(12.5, FontFamily::Proportional), LIGHT3);
+                let size_text = f.size.map(|(w, h)| format!("{w} × {h}"));
+                let size_font = FontId::new(12.5, FontFamily::Proportional);
+                let size_w = size_text.as_ref().map(|s| ui.painter().layout_no_wrap(s.clone(), size_font.clone(), LIGHT3).size().x + 14.0).unwrap_or(0.0);
+                let dot_w = if is_dirty { 14.0 } else { 0.0 };
+                let name_font = FontId::new(14.0, FontFamily::Proportional);
+                let name_budget = (r.right() - name_x - size_w - dot_w - 8.0).max(24.0);
+                let name = th::fit_text(ui.painter(), &f.name, &name_font, name_budget);
+                let cut = name != f.name;
+                ui.painter().text(Pos2::new(name_x, r.center().y), Align2::LEFT_CENTER, name, name_font, if on { CONTENT1 } else { CONTENT2 });
+                if is_dirty {
+                    ui.painter().circle_filled(Pos2::new(r.right() - size_w - 6.0, r.center().y), 3.0, Color32::from_rgb(0xff, 0xad, 0x4d));
+                }
+                if let Some(stxt) = size_text {
+                    ui.painter().text(r.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, stxt, size_font, LIGHT3);
+                }
+                if cut {
+                    resp.clone().on_hover_text(&f.name);
                 }
                 if resp.clicked() {
                     open = Some(f.path.clone());
@@ -757,14 +1053,14 @@ fn typed_number(s: &str) -> Option<f32> {
     t.replace(',', ".").parse::<f32>().ok()
 }
 
-/// A row with a slider over `min..max`, showing the value; true when it moved. It moves in round steps (Shift while dragging: ten times
-/// slower; the arrow keys over it: one step; a click on the number: type one).
-fn slider(ui: &mut Ui, id: &str, label: &str, v: &mut f32, min: f32, max: f32, show: impl Fn(f32) -> String) -> bool {
+/// A row with a slider over `min..max`, showing the value; true when it moved. Double-clicking resets to `default_v` (when given).
+fn slider_def(ui: &mut Ui, id: &str, label: &str, v: &mut f32, min: f32, max: f32, default_v: Option<f32>, show: impl Fn(f32) -> String) -> bool {
     let range = (max - min).max(1e-6);
     let step = nice_step(range);
     let snap = |x: f32| (((x / step).round() * step * 1e5).round() / 1e5).clamp(min, max);
     let mut f = ((*v - min) / range).clamp(0.0, 1.0);
-    let (moved, typed) = th::slider_row_ex(ui, id, label, &show(*v), &mut f, step / range);
+    let def_f = default_v.map(|d| ((d - min) / range).clamp(0.0, 1.0));
+    let (moved, typed) = th::slider_row_def(ui, id, label, &show(*v), &mut f, step / range, def_f);
     let mut changed = false;
     if moved {
         let x = snap(min + f * range);
@@ -784,6 +1080,10 @@ fn slider(ui: &mut Ui, id: &str, label: &str, v: &mut f32, min: f32, max: f32, s
     changed
 }
 
+fn slider(ui: &mut Ui, id: &str, label: &str, v: &mut f32, min: f32, max: f32, show: impl Fn(f32) -> String) -> bool {
+    slider_def(ui, id, label, v, min, max, None, show)
+}
+
 /// The edits that can be added, with what a new one starts as (for the menu, and for the layout audit).
 pub fn add_menu_items(cw: usize, ch: usize) -> Vec<(&'static str, Op)> {
     vec![
@@ -795,13 +1095,13 @@ pub fn add_menu_items(cw: usize, ch: usize) -> Vec<(&'static str, Op)> {
             ("Rotate left", Op::Rotate { quarter_turns: 3 }),
             ("Trim border", Op::Trim { threshold: 0.0 }),
             ("Expand border", Op::Expand { amount: 16, fill: Fill::Clear }),
-            ("Colour", Op::Adjust { brightness: 0.0, contrast: 0.0, saturation: 0.0, hue: 0.0 }),
+            ("Color", Op::Adjust { brightness: 0.0, contrast: 0.0, saturation: 0.0, hue: 0.0 }),
             ("Tint", Op::Tint { rgb: [1.0, 0.4, 0.6], strength: 0.5 }),
             ("Opacity", Op::Opacity { factor: 1.0 }),
             ("Invert", Op::Invert),
             ("Blur", Op::Blur { sigma: 1.5 }),
             ("Sharpen", Op::Sharpen { amount: 0.8, sigma: 1.2 }),
-            ("Deband", Op::Deband { radius: 64.0, threshold: 6.0, iterations: 4, grain: 0.5, kind: Grain::Gaussian, mono: true, room: true, luma: LumaScale { scaling: 4.0, by_average: false }, limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: Mask { invert: true, ..Mask::off() }, adv: edit::Advanced::default() }),
+            ("Deband", Op::Deband { radius: 64.0, threshold: 6.0, iterations: 4, grain: 0.5, kind: Grain::Gaussian, mono: true, room: true, luma: LumaScale { scaling: 4.0, by_average: false }, limit: 0.0, elast: 3.0, narrowing: false, prefilter: 0.0, protect: Mask { invert: true, ..Mask::off() }, adv: edit::Advanced::default(), target: Target::Both }),
             ("Dehalo", Op::Dehalo(Dehalo::default())),
             ("Denoise", Op::Denoise(Denoise::default())),
             ("Anti-alias", Op::AntiAlias(AntiAlias::default())),
@@ -820,6 +1120,7 @@ fn edits_page(ui: &mut Ui, st: &mut Studio) {
         small_line(ui, &format!("{name}  ·  {} × {} → {w} × {h}", st.skin_ed.source.as_ref().map_or(0, |s| s.w), st.skin_ed.source.as_ref().map_or(0, |s| s.h)));
     }
     let before_ops = st.skin_ed.ops.clone();
+    let before_disabled = st.skin_ed.disabled.clone();
     let mut changed = false;
     let n = st.skin_ed.ops.len();
     st.skin_ed.collapsed.retain(|i| *i < n);
@@ -835,7 +1136,7 @@ fn edits_page(ui: &mut Ui, st: &mut Studio) {
             if th::button(ui, "Redo", Kind::Dark, !st.skin_ed.redo.is_empty()).on_hover_text("Redo it (Ctrl+Y)").clicked() {
                 st.skin_ed.redo(&tx, &ctx);
             }
-            if th::button(ui, if st.skin_ed.add_open { "Cancel" } else { "+ Add edit" }, Kind::Accent, true).clicked() {
+            if th::button_fixed(ui, 112.0, if st.skin_ed.add_open { "Cancel" } else { "+ Add edit" }, Kind::Accent, true).clicked() {
                 st.skin_ed.add_open = !st.skin_ed.add_open;
             }
         });
@@ -855,46 +1156,71 @@ fn edits_page(ui: &mut Ui, st: &mut Studio) {
         }
         ui.add_space(6.0);
     }
-    let (mut remove, mut up) = (None, None);
+    let (mut remove, mut up, mut down, mut toggle_vis) = (None, None, None, None);
     let n = st.skin_ed.ops.len();
+    st.skin_ed.disabled.retain(|i| *i < n);
     for i in 0..n {
         let (iw, ih) = st.skin_ed.input_dims(i);
-        let keep = st.skin_ed.keep_aspect;
         let folded = st.skin_ed.collapsed.contains(&i);
-        // a title line: fold, name, and the buttons that move and remove the edit
+        let is_off = st.skin_ed.disabled.contains(&i);
+        // a title line: fold, name, and the buttons that toggle, move and remove the edit
         let width = ui.available_width() - 22.0;
         let (r, _) = ui.allocate_exact_size(Vec2::new(width + 22.0, 36.0), Sense::hover());
         let r = Rect::from_min_size(r.min + Vec2::new(12.0, 3.0), Vec2::new(width, 30.0));
         let head = ui.interact(r, ui.scope_id().with(("head", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-        ui.painter().rect_filled(r, CornerRadius::same(6), if head.hovered() { th::lighten(BACKGROUND5, 0.04) } else { BACKGROUND5 });
+        let hh = th::ease(ui, head.id.with("h"), head.hovered());
+        ui.painter().rect_filled(r, CornerRadius::same(6), th::lerp_c(BACKGROUND5, th::lighten(BACKGROUND5, 0.04), hh));
         // the fold arrow
         let c = r.left_center() + Vec2::new(16.0, 0.0);
         let arrow = if folded { vec![c + Vec2::new(-2.5, -4.5), c + Vec2::new(3.0, 0.0), c + Vec2::new(-2.5, 4.5)] } else { vec![c + Vec2::new(-4.5, -2.5), c + Vec2::new(0.0, 3.0), c + Vec2::new(4.5, -2.5)] };
-        ui.painter().add(egui::Shape::convex_polygon(arrow, LIGHT1, Stroke::NONE));
-        ui.painter().text(r.left_center() + Vec2::new(32.0, 0.0), Align2::LEFT_CENTER, format!("{}. {}", i + 1, st.skin_ed.ops[i].name()), FontId::new(15.0, th::semibold()), CONTENT1);
-        let btn = |ui: &mut Ui, id: &str, right: f32, label: &str, tip: &str| -> bool {
-            let b = Rect::from_center_size(Pos2::new(r.right() - right, r.center().y), Vec2::new(28.0, 24.0));
+        ui.painter().add(egui::Shape::convex_polygon(arrow, if is_off { LIGHT3 } else { LIGHT1 }, Stroke::NONE));
+        let title_font = FontId::new(15.0, th::semibold());
+        let title_budget = (r.width() - 32.0 - 122.0).max(40.0);
+        let title = th::fit_text(ui.painter(), &format!("{}. {}", i + 1, st.skin_ed.ops[i].name()), &title_font, title_budget);
+        ui.painter().text(r.left_center() + Vec2::new(32.0, 0.0), Align2::LEFT_CENTER, title, title_font, if is_off { LIGHT3 } else { CONTENT1 });
+        let icon_btn = |ui: &mut Ui, id: &str, right: f32, tip: &str, draw: &dyn Fn(&egui::Painter, Pos2, Color32)| -> bool {
+            let b = Rect::from_center_size(Pos2::new(r.right() - right, r.center().y), Vec2::new(26.0, 24.0));
             let resp = ui.interact(b, ui.scope_id().with((id, i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
-            if resp.hovered() {
-                ui.painter().rect_filled(b, CornerRadius::same(5), DARK3);
+            let h = th::ease(ui, resp.id.with("h"), resp.hovered());
+            if h > 0.01 {
+                ui.painter().rect_filled(b, CornerRadius::same(5), Color32::from_rgba_unmultiplied(DARK3.r(), DARK3.g(), DARK3.b(), (h * 255.0) as u8));
             }
-            ui.painter().text(b.center(), Align2::CENTER_CENTER, label, FontId::new(14.0, th::semibold()), if resp.hovered() { CONTENT1 } else { LIGHT1 });
+            draw(ui.painter(), b.center(), th::lerp_c(LIGHT1, CONTENT1, h));
             resp.clicked()
         };
-        let (mut clicked_btn, mut is_rm, mut is_up) = (false, false, false);
-        if btn(ui, "rm", 18.0, "x", "Remove this edit") {
-            is_rm = true;
-            clicked_btn = true;
-        }
-        if i > 0 && btn(ui, "up", 50.0, "^", "Move it up (earlier)") {
-            is_up = true;
-            clicked_btn = true;
-        }
-        if is_rm {
+        let mut clicked_btn = false;
+        if icon_btn(ui, "rm", 16.0, "Remove this edit", &|p, c, col| {
+            p.line_segment([c + Vec2::new(-4.5, -4.5), c + Vec2::new(4.5, 4.5)], Stroke::new(1.8, col));
+            p.line_segment([c + Vec2::new(-4.5, 4.5), c + Vec2::new(4.5, -4.5)], Stroke::new(1.8, col));
+        }) {
             remove = Some(i);
+            clicked_btn = true;
         }
-        if is_up {
+        if i + 1 < n && icon_btn(ui, "dn", 44.0, "Move down (later)", &|p, c, col| {
+            p.add(egui::Shape::line(vec![c + Vec2::new(-4.5, -2.0), c + Vec2::new(0.0, 2.5), c + Vec2::new(4.5, -2.0)], Stroke::new(1.8, col)));
+        }) {
+            down = Some(i);
+            clicked_btn = true;
+        }
+        if i > 0 && icon_btn(ui, "up", 72.0, "Move up (earlier)", &|p, c, col| {
+            p.add(egui::Shape::line(vec![c + Vec2::new(-4.5, 2.0), c + Vec2::new(0.0, -2.5), c + Vec2::new(4.5, 2.0)], Stroke::new(1.8, col)));
+        }) {
             up = Some(i);
+            clicked_btn = true;
+        }
+        if icon_btn(ui, "vis", 100.0, if is_off { "Show this edit (currently hidden)" } else { "Hide this edit (bypass)" }, &|p, c, col| {
+            let ec = if is_off { LIGHT3 } else { col };
+            let pts_top: Vec<Pos2> = (-4..=4).map(|k| { let t = k as f32 / 4.0; c + Vec2::new(t * 7.0, -(1.0 - t * t) * 4.2) }).collect();
+            let pts_bot: Vec<Pos2> = (-4..=4).map(|k| { let t = k as f32 / 4.0; c + Vec2::new(t * 7.0, (1.0 - t * t) * 4.2) }).collect();
+            p.add(egui::Shape::line(pts_top, Stroke::new(1.5, ec)));
+            p.add(egui::Shape::line(pts_bot, Stroke::new(1.5, ec)));
+            p.circle_filled(c, 2.0, ec);
+            if is_off {
+                p.line_segment([c + Vec2::new(-6.0, 5.5), c + Vec2::new(6.0, -5.5)], Stroke::new(1.8, PINK3));
+            }
+        }) {
+            toggle_vis = Some(i);
+            clicked_btn = true;
         }
         if head.clicked() && !clicked_btn {
             if folded {
@@ -904,25 +1230,41 @@ fn edits_page(ui: &mut Ui, st: &mut Studio) {
             }
         }
         if !folded {
-            let SkinEditor { ops, bufs, .. } = &mut st.skin_ed;
-            changed |= op_controls(ui, bufs, &mut ops[i], i, (iw, ih), keep);
+            let SkinEditor { ops, bufs, keep_aspect, .. } = &mut st.skin_ed;
+            changed |= op_controls(ui, bufs, &mut ops[i], i, (iw, ih), keep_aspect);
         }
         ui.add_space(6.0);
+    }
+    let mut vis_changed = false;
+    if let Some(i) = toggle_vis {
+        if !st.skin_ed.disabled.remove(&i) {
+            st.skin_ed.disabled.insert(i);
+        }
+        vis_changed = true;
     }
     if let Some(i) = remove {
         st.skin_ed.ops.remove(i);
         st.skin_ed.collapsed = st.skin_ed.collapsed.iter().filter(|c| **c != i).map(|c| if *c > i { c - 1 } else { *c }).collect();
+        st.skin_ed.disabled = st.skin_ed.disabled.iter().filter(|c| **c != i).map(|c| if *c > i { c - 1 } else { *c }).collect();
         st.skin_ed.bufs.clear();
         changed = true;
     }
     if let Some(i) = up {
         st.skin_ed.ops.swap(i - 1, i);
-        let (a, b) = (st.skin_ed.collapsed.remove(&(i - 1)), st.skin_ed.collapsed.remove(&i));
-        if a {
-            st.skin_ed.collapsed.insert(i);
+        for set in [&mut st.skin_ed.collapsed, &mut st.skin_ed.disabled] {
+            let (a, b) = (set.remove(&(i - 1)), set.remove(&i));
+            if a { set.insert(i); }
+            if b { set.insert(i - 1); }
         }
-        if b {
-            st.skin_ed.collapsed.insert(i - 1);
+        st.skin_ed.bufs.clear();
+        changed = true;
+    }
+    if let Some(i) = down {
+        st.skin_ed.ops.swap(i, i + 1);
+        for set in [&mut st.skin_ed.collapsed, &mut st.skin_ed.disabled] {
+            let (a, b) = (set.remove(&i), set.remove(&(i + 1)));
+            if a { set.insert(i + 1); }
+            if b { set.insert(i); }
         }
         st.skin_ed.bufs.clear();
         changed = true;
@@ -933,14 +1275,276 @@ fn edits_page(ui: &mut Ui, st: &mut Studio) {
     if n > 1 && th::button_wide(ui, "Remove every edit", Kind::Dark, true).clicked() {
         st.skin_ed.ops.clear();
         st.skin_ed.collapsed.clear();
+        st.skin_ed.disabled.clear();
         st.skin_ed.bufs.clear();
         changed = true;
     }
-    if changed && st.skin_ed.ops != before_ops {
-        st.skin_ed.push_undo(before_ops);
+    th::switch_row(ui, "sk-keep", "Carry edits to next picture", &mut st.skin_ed.keep_edits);
+    // Saved reusable filter presets
+    st.skin_ed.ensure_presets();
+    th::subsection_header(ui, "Filter presets");
+    if !st.skin_ed.presets.is_empty() {
+        let names: Vec<String> = st.skin_ed.presets.iter().map(|(n, _)| n.clone()).collect();
+        if let Some(k) = th::dropdown_row(ui, "sk-preset-load", "Apply saved preset", "Choose a preset...", &names) {
+            let ops = st.skin_ed.presets[k].1.clone();
+            st.skin_ed.ops = ops;
+            st.skin_ed.disabled.clear();
+            st.skin_ed.collapsed.clear();
+            st.skin_ed.bufs.clear();
+            changed = true;
+        }
+        if let Some(k) = th::dropdown_row(ui, "sk-preset-del", "Delete a preset", "Pick preset to remove...", &names) {
+            let removed = st.skin_ed.presets.remove(k).0;
+            st.skin_ed.save_presets();
+            st.status = format!("Deleted preset \"{removed}\"");
+        }
+    }
+    th::text_row(ui, "sk-preset-name", "Preset name", &mut st.skin_ed.preset_name);
+    if th::button_wide(ui, "Save current edits as preset", Kind::Dark, !st.skin_ed.ops.is_empty() && !st.skin_ed.preset_name.trim().is_empty()).clicked() {
+        let name = st.skin_ed.preset_name.trim().to_string();
+        let active_ops: Vec<Op> = st.skin_ed.ops.iter().enumerate().filter(|(i, _)| !st.skin_ed.disabled.contains(i)).map(|(_, o)| o.clone()).collect();
+        if !active_ops.is_empty() {
+            if let Some(slot) = st.skin_ed.presets.iter_mut().find(|(n, _)| n == &name) {
+                slot.1 = active_ops;
+            } else {
+                st.skin_ed.presets.push((name.clone(), active_ops));
+            }
+            st.skin_ed.save_presets();
+            st.skin_ed.preset_name.clear();
+            st.status = format!("Saved preset \"{name}\"");
+        }
+    }
+    // Batch-apply active edits to currently filtered pictures in the skin
+    let active_ops: Vec<Op> = st.skin_ed.ops.iter().enumerate().filter(|(i, _)| !st.skin_ed.disabled.contains(i)).map(|(_, o)| o.clone()).collect();
+    if !active_ops.is_empty() && st.skin_ed.dir.is_some() {
+        let q = st.skin_ed.filter.trim().to_lowercase();
+        let targets: Vec<PathBuf> = st.skin_ed.files.iter().filter(|f| q.is_empty() || f.name.to_lowercase().contains(&q)).map(|f| f.path.clone()).collect();
+        if targets.len() > 1 {
+            th::subsection_header(ui, "Batch apply");
+            let lbl = if q.is_empty() {
+                format!("Apply active edits to all {} pictures", targets.len())
+            } else {
+                format!("Apply active edits to {} filtered pictures", targets.len())
+            };
+            if th::button_wide(ui, &lbl, Kind::Purple, true).clicked() {
+                let output = st.skin_ed.output;
+                let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+                st.status = format!("Applying edits to {} pictures...", targets.len());
+                std::thread::spawn(move || {
+                    let mut done = 0usize;
+                    let mut skipped = 0usize;
+                    let mut failed = 0usize;
+                    let mut modified = Vec::new();
+                    for p in targets {
+                        let Ok(img) = edit::load_png(&p) else { failed += 1; continue };
+                        if img.w <= 1 && img.h <= 1 {
+                            skipped += 1;
+                            continue;
+                        }
+                        if let (Some(dir), Some(name)) = (p.parent(), p.file_name()) {
+                            let backup = dir.join(".skin-studio-backup");
+                            let kept = backup.join(name);
+                            if !kept.exists() {
+                                let _ = std::fs::create_dir_all(&backup);
+                                let _ = std::fs::copy(&p, &kept);
+                            }
+                        }
+                        let mut cur = img;
+                        for op in &active_ops {
+                            cur = edit::apply(&cur, op);
+                        }
+                        if edit::save_png_with(&p, &cur, output).is_ok() {
+                            done += 1;
+                            modified.push(p);
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    let msg = if failed > 0 {
+                        format!("Batch applied to {done} pictures ({skipped} skipped, {failed} failed)")
+                    } else {
+                        format!("Batch applied to {done} pictures ({skipped} skipped)")
+                    };
+                    let _ = tx.send(Msg::SkinReloadFiles { msg, modified, resolved_downscale: None });
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
+    if vis_changed {
+        st.skin_ed.push_undo_state(before_ops, before_disabled, false);
         st.skin_ed.dirty = true;
         let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
         st.skin_ed.recompute(&tx, &ctx);
+    } else if changed && st.skin_ed.ops != before_ops {
+        let discrete = remove.is_some() || up.is_some() || down.is_some() || st.skin_ed.ops.len() != before_ops.len();
+        st.skin_ed.push_undo_state(before_ops, before_disabled, !discrete);
+        st.skin_ed.dirty = true;
+        let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+        st.skin_ed.recompute(&tx, &ctx);
+    }
+}
+
+/// Skin-wide artifact scanner: finds poor 1x downscales (compared to @2x), banding, bright/dark haloing, aliasing, and noise.
+fn scan_page(ui: &mut Ui, st: &mut Studio) {
+    th::section_header(ui, "Scan");
+    let Some(dir) = st.skin_ed.dir.clone() else {
+        th::note(ui, "Open a skin folder or .osk on the Pictures page to scan its assets for banding, haloing, aliasing, noise, and poor 1x downscales.");
+        return;
+    };
+    let btn_label = if st.skin_ed.scan_running { "Scanning..." } else { "Scan skin for issues" };
+    if th::button_wide(ui, btn_label, Kind::Accent, !st.skin_ed.scan_running).clicked() {
+        st.skin_ed.scan_running = true;
+        st.status = "Scanning skin assets...".into();
+        let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+        std::thread::spawn(move || {
+            let report = engine::scan::scan_skin(&dir);
+            let _ = tx.send(Msg::SkinScanDone(report));
+            ctx.request_repaint();
+        });
+    }
+    th::note(ui, "Checks every PNG for 1x vs @2x downscale ringing, gradient banding, bright/dark edge haloing, diagonal aliasing, and flat-region noise. 1×1 blank files are skipped.");
+    let Some(report) = st.skin_ed.scan_report.clone() else { return };
+    let clean = report.total_files.saturating_sub(report.flagged.len() + report.skipped_blank);
+    small_line(ui, &format!("Scanned {} files · {} flagged · {} clean ({} blank skipped)", report.total_files, report.flagged.len(), clean, report.skipped_blank));
+    if report.flagged.is_empty() {
+        th::note(ui, "No issues spotted across this skin.");
+        return;
+    }
+    let mut inspect: Option<(PathBuf, Vec<Op>)> = None;
+    let mut regen: Option<(PathBuf, PathBuf)> = None;
+    for (idx, item) in report.flagged.iter().enumerate() {
+        let width = ui.available_width() - 22.0;
+        let tags: Vec<&str> = item.issues.iter().map(|i| i.label.as_str()).collect();
+        let summary = tags.join(" · ");
+        let has_regen = item.pair_2x.is_some() && item.issues.iter().any(|i| matches!(i.kind, engine::scan::IssueKind::PoorDownscale));
+        let card_h = 92.0;
+        let (r, _) = ui.allocate_exact_size(Vec2::new(width + 22.0, card_h + 6.0), Sense::hover());
+        let r = Rect::from_min_size(r.min + Vec2::new(12.0, 2.0), Vec2::new(width, card_h));
+        ui.painter().rect_filled(r, CornerRadius::same(6), CONTROL);
+        // Thumbnail box (40x40, bottom at r.top() + 50)
+        let tbox = Rect::from_min_size(r.min + Vec2::new(10.0, 10.0), Vec2::splat(40.0));
+        ui.painter().rect_filled(tbox, CornerRadius::same(4), Color32::from_gray(0x22));
+        if let Some((t, sz)) = st.skin_ed.thumbs.get(&item.path) {
+            let fit = (38.0 / sz[0].max(1) as f32).min(38.0 / sz[1].max(1) as f32);
+            let size = Vec2::new(sz[0] as f32 * fit, sz[1] as f32 * fit).min(Vec2::splat(38.0));
+            ui.painter().image(t.id(), Rect::from_center_size(tbox.center(), size), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+        let tx = tbox.right() + 10.0;
+        // Row 1: full-width filename (never collides with dimensions)
+        let nf = FontId::new(14.5, th::semibold());
+        let name = th::fit_text(ui.painter(), &item.name, &nf, (r.right() - tx - 10.0).max(40.0));
+        ui.painter().text(Pos2::new(tx, r.top() + 10.0), Align2::LEFT_TOP, name, nf, CONTENT1);
+        // Row 2: issue tags on the left, measured dimensions on the right
+        let dims_str = format!("{} × {}", item.dims.0, item.dims.1);
+        let df = FontId::new(12.0, th::light());
+        let dims_w = ui.painter().layout_no_wrap(dims_str.clone(), df.clone(), LIGHT3).size().x;
+        let sf = FontId::new(12.5, FontFamily::Proportional);
+        let shown_sum = th::fit_text(ui.painter(), &summary, &sf, (r.right() - tx - dims_w - 18.0).max(30.0));
+        ui.painter().text(Pos2::new(tx, r.top() + 31.0), Align2::LEFT_TOP, shown_sum, sf, Color32::from_rgb(0xff, 0xad, 0x4d));
+        ui.painter().text(Pos2::new(r.right() - 10.0, r.top() + 32.0), Align2::RIGHT_TOP, dims_str, df, LIGHT3);
+        // Hovering the header always shows full filename, dimensions, and detailed per-issue findings
+        let head_tip_rect = Rect::from_min_max(Pos2::new(tx, r.top() + 6.0), Pos2::new(r.right() - 6.0, r.top() + 52.0));
+        let details = item.issues.iter().map(|i| format!("• {}: {}", i.label, i.detail)).collect::<Vec<_>>().join("\n");
+        ui.interact(head_tip_rect, ui.scope_id().with(("sc-tip", idx)), Sense::hover())
+            .on_hover_text(format!("{} ({} × {})\n{}", item.name, item.dims.0, item.dims.1, details));
+        // Row 3: action buttons cleanly below thumbnail and text (y = r.top() + 58..82)
+        let mut bx = r.left() + 10.0;
+        let by = r.top() + 58.0;
+        if has_regen {
+            if let Some(p2) = &item.pair_2x {
+                let br = Rect::from_min_size(Pos2::new(bx, by), Vec2::new(146.0, 24.0));
+                if th::pill(ui, br, &format!("sc-rg-{idx}"), "Redo 1x from @2x", true, true, "Replace 1x with a clean zero-ringing downscale of @2x (backs up original)") {
+                    regen = Some((item.path.clone(), p2.clone()));
+                }
+                bx += 152.0;
+            }
+        }
+        let has_ops = !item.suggested_ops.is_empty();
+        let ir = Rect::from_min_size(Pos2::new(bx, by), Vec2::new(if has_ops { 116.0 } else { 84.0 }, 24.0));
+        let ilbl = if has_ops { "Inspect & fix" } else { "Inspect" };
+        if th::pill(ui, ir, &format!("sc-in-{idx}"), ilbl, false, true, "Open in Split view with suggested edits loaded") {
+            inspect = Some((item.path.clone(), item.suggested_ops.clone()));
+        }
+    }
+    if let Some((dst_1x, src_2x)) = regen {
+        let output = st.skin_ed.output;
+        let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+        let name = dst_1x.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        std::thread::spawn(move || {
+            let (msg, ok) = match edit::load_png(&src_2x) {
+                Ok(hi) => {
+                    if let (Some(dir), Some(fname)) = (dst_1x.parent(), dst_1x.file_name()) {
+                        let backup = dir.join(".skin-studio-backup");
+                        let kept = backup.join(fname);
+                        if dst_1x.is_file() && !kept.exists() {
+                            let _ = std::fs::create_dir_all(&backup);
+                            let _ = std::fs::copy(&dst_1x, &kept);
+                        }
+                    }
+                    let out = edit::resize(&hi, (hi.w / 2).max(1), (hi.h / 2).max(1), Resample::Smooth);
+                    match edit::save_png_with(&dst_1x, &out, output) {
+                        Ok(()) => (format!("Regenerated {name} from @2x"), true),
+                        Err(e) => (format!("Could not save {name}: {e}"), false),
+                    }
+                }
+                Err(e) => (format!("Could not read @2x: {e}"), false),
+            };
+            let modified = if ok { vec![dst_1x.clone()] } else { vec![] };
+            let resolved_downscale = ok.then_some(dst_1x);
+            let _ = tx.send(Msg::SkinReloadFiles { msg, modified, resolved_downscale });
+            ctx.request_repaint();
+        });
+    }
+    if let Some((path, ops)) = inspect {
+        let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+        if let Err(e) = st.skin_ed.open_picture(&path, Some((&tx, &ctx))) {
+            st.status = e;
+        } else {
+            if !ops.is_empty() {
+                st.skin_ed.ops = ops;
+                st.skin_ed.disabled.clear();
+                st.skin_ed.collapsed.clear();
+                st.skin_ed.dirty = true;
+                st.skin_ed.recompute(&tx, &ctx);
+            }
+            st.skin_ed.show = Show::Split;
+            st.skin_ed.page = SkinPage::Edits;
+        }
+    }
+}
+
+fn create_page(ui: &mut Ui, st: &mut Studio) {
+    let dir = st.skin_ed.dir.clone();
+    match crate::element_creator::draw_panel(ui, &mut st.skin_ed.creator, dir.as_deref()) {
+        crate::element_creator::CreatorAction::None => {}
+        crate::element_creator::CreatorAction::SaveToSkin => do_save_creator(st),
+        crate::element_creator::CreatorAction::SendToEdits => {
+            let img = st.skin_ed.creator.ensure_rendered();
+            let stem = st.skin_ed.creator.doc.name.trim();
+            let stem = if stem.is_empty() { st.skin_ed.creator.doc.kind.file_stem() } else { stem };
+            let target = st.skin_ed.dir.as_ref().map(|d| d.join(format!("{stem}@2x.png"))).unwrap_or_else(|| PathBuf::from(format!("{stem}@2x.png")));
+            st.skin_ed.current = Some(target);
+            st.skin_ed.source = Some(img);
+            st.skin_ed.ops.clear();
+            st.skin_ed.disabled.clear();
+            st.skin_ed.undo.clear();
+            st.skin_ed.redo.clear();
+            st.skin_ed.dirty = true;
+            st.skin_ed.zoom = 0.0;
+            st.skin_ed.pan = Vec2::ZERO;
+            st.skin_ed.page = SkinPage::Edits;
+            let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+            st.skin_ed.recompute(&tx, &ctx);
+            st.status = "Sent rendered @2x element to Edits".into();
+        }
+    }
+}
+
+fn ini_page(ui: &mut Ui, st: &mut Studio) {
+    let has_dir = st.skin_ed.dir.is_some();
+    if crate::skin_ini::draw_page(ui, &mut st.skin_ed.ini, has_dir) {
+        do_save_ini(st);
     }
 }
 
@@ -965,22 +1569,177 @@ fn output_page(ui: &mut Ui, st: &mut Studio) {
         let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
         st.skin_ed.recompute(&tx, &ctx);
     }
+    th::subsection_header(ui, "Scale full skin (@2x / 1x)");
+    let has_dir = st.skin_ed.dir.is_some();
+    if th::button_wide(ui, "Generate missing 1x from @2x", Kind::Purple, has_dir).clicked() {
+        run_skin_scale(st, ScaleJob::DownMissing);
+    }
+    if th::button_wide(ui, "Regenerate all 1x from @2x", Kind::Dark, has_dir).clicked() {
+        run_skin_scale(st, ScaleJob::DownAll);
+    }
+    let modes: Vec<String> = Resample::ALL.iter().map(|m| m.name().to_string()).collect();
+    if let Some(k) = th::dropdown_row(ui, "scaleupmode", "Upscale mode (1x → @2x)", st.skin_ed.scale_up_mode.name(), &modes) {
+        st.skin_ed.scale_up_mode = Resample::ALL[k];
+    }
+    if th::button_wide(ui, "Generate missing @2x from 1x", Kind::Dark, has_dir).clicked() {
+        run_skin_scale(st, ScaleJob::UpMissing(st.skin_ed.scale_up_mode));
+    }
+    th::note(ui, "Downscaling always area-averages with zero ringing. 1×1 blank PNGs are skipped, and overwritten files are backed up into .skin-studio-backup.");
     th::subsection_header(ui, "Export");
-    if th::button_wide(ui, "Export the skin as .osk...", Kind::Purple, st.skin_ed.dir.is_some()).clicked() {
+    if th::button_wide(ui, "Export the skin as .osk...", Kind::Purple, has_dir).clicked() {
         st.pick(PickKind::SkinEditExportOsk);
     }
     th::note(ui, "Save writes the picture over the file it came from (the first original is kept in a .skin-studio-backup folder next to it); Save as writes a new file.");
+    // Backup restore viewer (uses cached `backups` list — zero per-frame filesystem I/O)
+    if let Some(dir) = st.skin_ed.dir.clone() {
+        let backups = st.skin_ed.backups.clone();
+        if !backups.is_empty() {
+            th::subsection_header(ui, &format!("Backups ({})", backups.len()));
+            if th::button_wide(ui, "Restore all original backups", Kind::Dark, true).clicked() {
+                let mut n = 0usize;
+                let mut restored = Vec::new();
+                for (_, bp, dest) in &backups {
+                    if std::fs::copy(bp, dest).is_ok() {
+                        n += 1;
+                        st.skin_ed.stash.remove(dest);
+                        restored.push(dest.clone());
+                    }
+                }
+                let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+                st.skin_ed.ini = crate::skin_ini::SkinIniDoc::load_from_dir(&dir);
+                st.skin_ed.after_disk_mutation(&restored, None, &tx, &ctx);
+                if st.skin_ed.dir == st.current_skin_folder() {
+                    st.load_session = true;
+                    st.reroll_map = false;
+                }
+                st.status = format!("Restored {n} original files from backup");
+            }
+            for (idx, (shown_name, bp, dest)) in backups.iter().enumerate() {
+                let width = ui.available_width() - 22.0;
+                let (r, _) = ui.allocate_exact_size(Vec2::new(width + 22.0, 36.0), Sense::hover());
+                let r = Rect::from_min_size(r.min + Vec2::new(12.0, 2.0), Vec2::new(width, 32.0));
+                ui.painter().rect_filled(r, CornerRadius::same(5), CONTROL);
+                let nf = FontId::new(13.5, FontFamily::Proportional);
+                let shown = th::fit_text(ui.painter(), shown_name, &nf, (r.width() - 86.0).max(30.0));
+                let cut = shown != *shown_name;
+                ui.painter().text(r.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, shown, nf, CONTENT2);
+                if cut {
+                    ui.interact(Rect::from_min_max(r.min, Pos2::new(r.right() - 78.0, r.bottom())), ui.scope_id().with(("bk-tip", idx)), Sense::hover()).on_hover_text(shown_name);
+                }
+                let br = Rect::from_center_size(Pos2::new(r.right() - 40.0, r.center().y), Vec2::new(66.0, 24.0));
+                if th::pill(ui, br, &format!("bk-r-{idx}"), "Restore", false, true, "Copy original backup back over the edited file") {
+                    match std::fs::copy(bp, dest) {
+                        Ok(_) => {
+                            let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+                            st.skin_ed.stash.remove(dest);
+                            if shown_name.eq_ignore_ascii_case("skin.ini") {
+                                st.skin_ed.ini = crate::skin_ini::SkinIniDoc::load_from_dir(&dir);
+                            } else {
+                                st.skin_ed.after_disk_mutation(std::slice::from_ref(dest), None, &tx, &ctx);
+                            }
+                            if st.skin_ed.dir == st.current_skin_folder() {
+                                st.load_session = true;
+                                st.reroll_map = false;
+                            }
+                            st.status = format!("Restored {shown_name}");
+                        }
+                        Err(e) => st.status = format!("Could not restore {shown_name}: {e}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScaleJob {
+    DownMissing,
+    DownAll,
+    UpMissing(Resample),
+}
+
+fn run_skin_scale(st: &mut Studio, job: ScaleJob) {
+    let Some(dir) = st.skin_ed.dir.clone() else { return };
+    let output = st.skin_ed.output;
+    let (tx, ctx) = (st.tx.clone(), st.ctx.clone());
+    st.status = "Scaling skin pictures...".into();
+    std::thread::spawn(move || {
+        let files = list_pngs(&dir);
+        let mut made = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        let mut modified = Vec::new();
+        for f in files {
+            let p = f.path;
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(parent) = p.parent() else { continue };
+            let is_2x = stem.ends_with("@2x");
+            match job {
+                ScaleJob::DownMissing | ScaleJob::DownAll => {
+                    if !is_2x {
+                        continue;
+                    }
+                    let base = &stem[..stem.len() - 3];
+                    let dest = parent.join(format!("{base}.png"));
+                    if matches!(job, ScaleJob::DownMissing) && dest.exists() {
+                        skipped += 1;
+                        continue;
+                    }
+                    let Ok(img) = edit::load_png(&p) else { failed += 1; continue };
+                    if img.w <= 1 && img.h <= 1 {
+                        skipped += 1;
+                        continue;
+                    }
+                    if dest.is_file() {
+                        let backup = parent.join(".skin-studio-backup");
+                        let kept = backup.join(format!("{base}.png"));
+                        if !kept.exists() {
+                            let _ = std::fs::create_dir_all(&backup);
+                            let _ = std::fs::copy(&dest, &kept);
+                        }
+                    }
+                    let out = edit::resize(&img, (img.w / 2).max(1), (img.h / 2).max(1), Resample::Smooth);
+                    if edit::save_png_with(&dest, &out, output).is_ok() { made += 1; modified.push(dest); } else { failed += 1; }
+                }
+                ScaleJob::UpMissing(mode) => {
+                    if is_2x {
+                        continue;
+                    }
+                    let dest = parent.join(format!("{stem}@2x.png"));
+                    if dest.exists() {
+                        skipped += 1;
+                        continue;
+                    }
+                    let Ok(img) = edit::load_png(&p) else { failed += 1; continue };
+                    if img.w <= 1 && img.h <= 1 {
+                        skipped += 1;
+                        continue;
+                    }
+                    let out = edit::resize(&img, img.w * 2, img.h * 2, mode);
+                    if edit::save_png_with(&dest, &out, output).is_ok() { made += 1; modified.push(dest); } else { failed += 1; }
+                }
+            }
+        }
+        let msg = if failed > 0 {
+            format!("Scaled {made} pictures ({skipped} skipped, {failed} failed)")
+        } else {
+            format!("Scaled {made} pictures ({skipped} skipped)")
+        };
+        let _ = tx.send(Msg::SkinReloadFiles { msg, modified, resolved_downscale: None });
+        ctx.request_repaint();
+    });
 }
 
 /// The settings of one edit; true when something changed.
-fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: usize, (iw, ih): (usize, usize), keep_aspect: bool) -> bool {
+fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: usize, (iw, ih): (usize, usize), keep_aspect: &mut bool) -> bool {
     let mut ch = false;
     match op {
         Op::Resize { w, h, mode } => {
+            th::switch_row(ui, &format!("ka{i}"), "Keep aspect ratio", keep_aspect);
             if let Some(v) = num_row(ui, bufs, &format!("rw{i}"), "Width (px)", *w) {
                 if v > 0 {
                     *w = v.min(16384);
-                    if keep_aspect {
+                    if *keep_aspect {
                         *h = ((*w as f64 * ih as f64 / iw.max(1) as f64).round() as usize).clamp(1, 16384);
                         bufs.remove(&format!("rh{i}"));
                     }
@@ -990,7 +1749,7 @@ fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: 
             if let Some(v) = num_row(ui, bufs, &format!("rh{i}"), "Height (px)", *h) {
                 if v > 0 {
                     *h = v.min(16384);
-                    if keep_aspect {
+                    if *keep_aspect {
                         *w = ((*h as f64 * iw as f64 / ih.max(1) as f64).round() as usize).clamp(1, 16384);
                         bufs.remove(&format!("rw{i}"));
                     }
@@ -1042,35 +1801,47 @@ fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: 
             }
         }
         Op::Trim { threshold } => {
-            ch |= slider(ui, &format!("tr{i}"), "Empty up to an alpha of", threshold, 0.0, 0.5, |v| format!("{:.0}%", v * 100.0));
+            ch |= slider_def(ui, &format!("tr{i}"), "Empty up to an alpha of", threshold, 0.0, 0.5, Some(0.0), |v| format!("{:.0}%", v * 100.0));
         }
         Op::Adjust { brightness, contrast, saturation, hue } => {
-            ch |= slider(ui, &format!("ab{i}"), "Brightness", brightness, -1.0, 1.0, |v| format!("{:+.0}", v * 100.0));
-            ch |= slider(ui, &format!("ac{i}"), "Contrast", contrast, -1.0, 1.0, |v| format!("{:+.0}", v * 100.0));
-            ch |= slider(ui, &format!("as{i}"), "Saturation", saturation, -1.0, 1.0, |v| format!("{:+.0}", v * 100.0));
-            ch |= slider(ui, &format!("ah{i}"), "Hue", hue, -180.0, 180.0, |v| format!("{v:+.0}°"));
+            ch |= slider_def(ui, &format!("ab{i}"), "Brightness", brightness, -1.0, 1.0, Some(0.0), |v| format!("{:+.0}", v * 100.0));
+            ch |= slider_def(ui, &format!("ac{i}"), "Contrast", contrast, -1.0, 1.0, Some(0.0), |v| format!("{:+.0}", v * 100.0));
+            ch |= slider_def(ui, &format!("as{i}"), "Saturation", saturation, -1.0, 1.0, Some(0.0), |v| format!("{:+.0}", v * 100.0));
+            ch |= slider_def(ui, &format!("ah{i}"), "Hue", hue, -180.0, 180.0, Some(0.0), |v| format!("{v:+.0}°"));
         }
         Op::Tint { rgb, strength } => {
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                let mut c = Color32::from_rgb((rgb[0] * 255.0) as u8, (rgb[1] * 255.0) as u8, (rgb[2] * 255.0) as u8);
-                if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
-                    *rgb = [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
+            let u = [(rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8, (rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8, (rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8];
+            let cur_hex = format!("#{:02x}{:02x}{:02x}", u[0], u[1], u[2]);
+            let key = format!("tc{i}");
+            let buf = bufs.entry(key.clone()).or_insert_with(|| cur_hex.clone());
+            let (resp, row_rect) = th::text_row_pad(ui, &key, "Color (#rrggbb)", buf, 34.0);
+            let text = buf.clone();
+            if resp.changed() {
+                if let Some(c) = crate::state::hex_to_rgb(&text) {
+                    *rgb = [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
                     ch = true;
                 }
-            });
-            ch |= slider(ui, &format!("ts{i}"), "Strength", strength, 0.0, 1.0, |v| format!("{:.0}%", v * 100.0));
+            } else if !resp.has_focus() && text != cur_hex {
+                bufs.insert(key.clone(), cur_hex);
+            }
+            let sw = Rect::from_center_size(Pos2::new(row_rect.right() - 22.0, row_rect.center().y), Vec2::new(24.0, 24.0));
+            if let Some(c) = crate::ui::swatch_picker(ui, &format!("skt{i}"), sw, u) {
+                *rgb = [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
+                bufs.insert(key, format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
+                ch = true;
+            }
+            ch |= slider_def(ui, &format!("ts{i}"), "Strength", strength, 0.0, 1.0, Some(0.5), |v| format!("{:.0}%", v * 100.0));
         }
         Op::Opacity { factor } => {
-            ch |= slider(ui, &format!("op{i}"), "Opacity", factor, 0.0, 1.0, |v| format!("{:.0}%", v * 100.0));
+            ch |= slider_def(ui, &format!("op{i}"), "Opacity", factor, 0.0, 1.0, Some(1.0), |v| format!("{:.0}%", v * 100.0));
         }
         Op::Invert => {}
         Op::Blur { sigma } => {
-            ch |= slider(ui, &format!("bl{i}"), "Blur radius", sigma, 0.1, 20.0, |v| format!("{v:.1} px"));
+            ch |= slider_def(ui, &format!("bl{i}"), "Blur radius", sigma, 0.1, 20.0, Some(1.5), |v| format!("{v:.1} px"));
         }
         Op::Sharpen { amount, sigma } => {
-            ch |= slider(ui, &format!("sa{i}"), "Amount", amount, 0.0, 3.0, |v| format!("{:.0}%", v * 100.0));
-            ch |= slider(ui, &format!("ss{i}"), "Radius", sigma, 0.3, 6.0, |v| format!("{v:.1} px"));
+            ch |= slider_def(ui, &format!("sa{i}"), "Amount", amount, 0.0, 3.0, Some(0.8), |v| format!("{:.0}%", v * 100.0));
+            ch |= slider_def(ui, &format!("ss{i}"), "Radius", sigma, 0.3, 6.0, Some(1.2), |v| format!("{v:.1} px"));
             th::note(ui, "Held between the pixels around each one, so it leaves no halos.");
         }
         Op::Dehalo(o) => {
@@ -1135,7 +1906,8 @@ fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: 
                 ch = true;
             }
         }
-        Op::Deband { radius, threshold, iterations, grain, kind, mono, room, luma, limit, elast, narrowing, prefilter, protect, adv } => {
+        Op::Deband { radius, threshold, iterations, grain, kind, mono, room, luma, limit, elast, narrowing, prefilter, protect, adv, target } => {
+            ch |= target_row(ui, &format!("dtg{i}"), target);
             ch |= slider(ui, &format!("dr{i}"), "Radius", radius, 2.0, 128.0, |v| format!("{v:.0} px"));
             ch |= slider(ui, &format!("dt{i}"), "Threshold", threshold, 1.0, 40.0, |v| format!("{v:.1} levels"));
             let mut it = *iterations as f32;
@@ -1175,7 +1947,7 @@ fn op_controls(ui: &mut Ui, bufs: &mut HashMap<String, String>, op: &mut Op, i: 
             }
             if *kind != Grain::None {
                 ch |= slider(ui, &format!("dg{i}"), "Grain strength", grain, 0.0, 3.0, |v| format!("{v:.2} levels"));
-                ch |= th::switch_row(ui, &format!("dm{i}"), "Grey grain", mono);
+                ch |= th::switch_row(ui, &format!("dm{i}"), "Gray grain", mono);
             }
             ch |= luma_controls(ui, &format!("dl{i}"), luma);
             ch |= mask_controls(ui, &format!("dmk{i}"), protect, false);
@@ -1226,13 +1998,18 @@ fn mask_controls(ui: &mut Ui, id: &str, m: &mut Mask, with_luma: bool) -> bool {
     if with_luma {
         ch |= luma_controls(ui, &format!("{id}l"), &mut m.luma);
     }
-    ch |= th::switch_row(ui, &format!("{id}v"), "Show the mask", &mut m.show);
+    if m.enabled || (with_luma && m.luma.scaling != 0.0) {
+        ch |= th::switch_row(ui, &format!("{id}v"), "Show the mask", &mut m.show);
+    } else if m.show {
+        m.show = false;
+        ch = true;
+    }
     ch
 }
 
 /// Luma scaling (adaptivegrain, as used by vodesfunc): more of the filter in the dark, hardly any in the light.
 fn luma_controls(ui: &mut Ui, id: &str, l: &mut LumaScale) -> bool {
-    let mut ch = slider(ui, &format!("{id}s"), "Favour dark areas (luma scaling)", &mut l.scaling, -20.0, 20.0, |v| if v == 0.0 { "off".to_string() } else if v > 0.0 { format!("dark {v:.1}") } else { format!("bright {:.1}", -v) });
+    let mut ch = slider_def(ui, &format!("{id}s"), "Favor dark areas (luma scaling)", &mut l.scaling, -20.0, 20.0, Some(0.0), |v| if v == 0.0 { "off".to_string() } else if v > 0.0 { format!("dark {v:.1}") } else { format!("bright {:.1}", -v) });
     if l.scaling != 0.0 {
         ch |= th::switch_row(ui, &format!("{id}a"), "Scale by the average brightness", &mut l.by_average);
     }
@@ -1241,6 +2018,10 @@ fn luma_controls(ui: &mut Ui, id: &str, l: &mut LumaScale) -> bool {
 
 // ==================================================================================================================== the picture
 fn canvas(ui: &mut Ui, st: &mut Studio) {
+    if st.skin_ed.page == SkinPage::Create {
+        creator_canvas(ui, st);
+        return;
+    }
     let full = ui.max_rect();
     let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), 44.0));
     let area = Rect::from_min_max(Pos2::new(full.left(), bar.bottom()), full.max);
@@ -1256,10 +2037,7 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
         r
     };
     let pill = |ui: &mut Ui, r: Rect, label: &str, on: bool, tip: &str| -> bool {
-        let resp = ui.interact(r, ui.scope_id().with(("sk-pill", label)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
-        ui.painter().rect_filled(r, CornerRadius::same(6), if on { Color32::from_rgb(0x66, 0x3d, 0xd4) } else if resp.hovered() { DARK3 } else { BACKGROUND6 });
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::new(13.5, th::semibold()), if on || resp.hovered() { CONTENT1 } else { LIGHT1 });
-        resp.clicked()
+        th::pill(ui, r, &format!("sk-{label}"), label, on, true, tip)
     };
     // everything that is in the bar, with how long it stays when the bar is narrow (the larger, the sooner it goes) and the gap before it
     let zooms: [(&str, f32); 4] = [("100%", 1.0 / ppp), ("200%", 2.0 / ppp), ("400%", 4.0 / ppp), ("800%", 8.0 / ppp)];
@@ -1269,19 +2047,22 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
         Fit,
         Zoom(usize),
         Back(Bg, &'static str),
+        Boost,
     }
     let mut pills: Vec<(Pill, f32, u8, f32)> = vec![
-        (Pill::Show(Show::After, "After", "The picture with the edits"), 62.0, 0, 0.0),
-        (Pill::Show(Show::Before, "Before", "The picture as it was loaded"), 62.0, 0, 0.0),
-        (Pill::Show(Show::Split, "Split", "Before on the left, after on the right"), 58.0, 0, 0.0),
+        (Pill::Show(Show::After, "After", "The picture with the edits (B or \\ to compare)"), 62.0, 0, 0.0),
+        (Pill::Show(Show::Before, "Before", "The picture as it was loaded (B or \\ to compare)"), 62.0, 0, 0.0),
+        (Pill::Show(Show::Split, "Split", "Before on the left, after on the right (S)"), 58.0, 0, 0.0),
         (Pill::Fit, 44.0, 0, 12.0),
         (Pill::Zoom(0), 52.0, 2, 0.0),
         (Pill::Zoom(1), 52.0, 3, 0.0),
         (Pill::Zoom(2), 52.0, 4, 0.0),
         (Pill::Zoom(3), 52.0, 5, 0.0),
         (Pill::Back(Bg::Dark, "Black"), 52.0, 1, 12.0),
-        (Pill::Back(Bg::Grey, "Grey"), 52.0, 1, 0.0),
+        (Pill::Back(Bg::Grey, "Gray"), 52.0, 1, 0.0),
         (Pill::Back(Bg::Light, "Light"), 52.0, 1, 0.0),
+        (Pill::Back(Bg::Check, "Check"), 56.0, 1, 0.0),
+        (Pill::Boost, 56.0, 2, 12.0),
     ];
     let fits = |p: &Vec<(Pill, f32, u8, f32)>| p.iter().map(|q| q.1 + 6.0 + q.3).sum::<f32>() + 12.0 <= bar.width();
     while !fits(&pills) {
@@ -1299,14 +2080,15 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
                 }
             }
             Pill::Fit => {
-                if pill(ui, r, "Fit", ed.zoom == 0.0, "Fit the picture in the window") {
+                if pill(ui, r, "Fit", ed.zoom == 0.0, "Fit the picture in the window (F or 0)") {
                     ed.zoom = 0.0;
                     ed.pan = Vec2::ZERO;
                 }
             }
             Pill::Zoom(i) => {
                 let (label, z) = zooms[i];
-                if pill(ui, r, label, (ed.zoom - z).abs() < 1e-3, "Show the picture at this size: one pixel of it is this many pixels of the screen") {
+                let tip = if i == 0 { "Show at 100%: one picture pixel per screen pixel (1)" } else { "Show the picture at this size: one pixel of it is this many pixels of the screen" };
+                if pill(ui, r, label, (ed.zoom - z).abs() < 1e-3, tip) {
                     ed.zoom = z;
                     ed.pan = Vec2::ZERO;
                 }
@@ -1314,6 +2096,12 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
             Pill::Back(b, label) => {
                 if pill(ui, r, label, ed.bg == b, "What is behind the picture") {
                     ed.bg = b;
+                }
+            }
+            Pill::Boost => {
+                if pill(ui, r, "Boost", ed.boost, "Amplify dark tones and banding on screen (does not affect saved file)") {
+                    ed.boost = !ed.boost;
+                    ed.tex = [None, None];
                 }
             }
         }
@@ -1329,12 +2117,24 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
     };
     let before = ed.source.clone().unwrap_or_else(|| after.clone());
     let (iw, ih) = (after.w as f32, after.h as f32);
-    // the line about the picture runs along the bottom: the picture keeps clear of it
-    let stage = Rect::from_min_max(area.min, Pos2::new(area.right(), area.bottom() - 30.0));
+    // Dedicated 30 px bottom status strip so the caption always has clean contrast on every background.
+    let stage = Rect::from_min_max(area.min, Pos2::new(area.right(), (area.bottom() - 30.0).max(area.top() + 1.0)));
+    let status_bar = Rect::from_min_max(Pos2::new(area.left(), stage.bottom()), area.max);
     let fit = ((stage.width() - 40.0) / iw).min((stage.height() - 40.0) / ih).max(0.01);
     let z = if ed.zoom == 0.0 { fit } else { ed.zoom };
-    let resp = ui.interact(area, ui.scope_id().with("sk-canvas"), Sense::click_and_drag());
-    if resp.dragged() && ed.show != Show::Split {
+    // Register canvas first, then split divider on top so the 18 px divider wins hit-testing while panning works everywhere else.
+    let resp = ui.interact(stage, ui.scope_id().with("sk-canvas"), Sense::click_and_drag());
+    let mut split_dragged = false;
+    let sx = stage.left() + stage.width() * ed.split;
+    if ed.show == Show::Split {
+        let h = Rect::from_center_size(Pos2::new(sx, stage.center().y), Vec2::new(18.0, stage.height()));
+        let hr = ui.interact(h, ui.scope_id().with("sk-split"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        if hr.dragged() {
+            ed.split = ((sx + hr.drag_delta().x - stage.left()) / stage.width().max(1.0)).clamp(0.02, 0.98);
+            split_dragged = true;
+        }
+    }
+    if resp.dragged() && !split_dragged {
         ed.pan += resp.drag_delta();
     }
     if resp.hovered() {
@@ -1353,22 +2153,33 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
     let z = if ed.zoom == 0.0 { fit } else { ed.zoom };
     let size = Vec2::new(iw * z, ih * z);
     let rect = Rect::from_center_size(stage.center() + ed.pan, size);
-    let clip = area;
+    let painter = ui.painter().with_clip_rect(stage);
     match ed.bg {
         Bg::Grey => {
-            ui.painter().with_clip_rect(clip).rect_filled(clip, 0.0, Color32::from_gray(0x80));
+            painter.rect_filled(stage, 0.0, Color32::from_gray(0x80));
         }
         Bg::Dark => {
-            // perfectly black, around the picture too: a glow fades into it without anything to compare with
-            ui.painter().with_clip_rect(clip).rect_filled(clip, 0.0, Color32::BLACK);
+            painter.rect_filled(stage, 0.0, Color32::BLACK);
         }
         Bg::Light => {
-            ui.painter().with_clip_rect(clip).rect_filled(rect, 0.0, Color32::from_gray(0xe6));
+            painter.rect_filled(stage, 0.0, Color32::from_gray(0xe6));
+        }
+        Bg::Check => {
+            // Single repeating 2x2 NEAREST quad (2 triangles total instead of thousands of per-tile rects at 480 Hz).
+            let c0 = Color32::from_rgb(0x22, 0x20, 0x29);
+            let c1 = Color32::from_rgb(0x30, 0x2d, 0x3a);
+            let tex = ed.check_tex.get_or_insert_with(|| {
+                let ci = egui::ColorImage { size: [2, 2], source_size: Vec2::new(2.0, 2.0), pixels: vec![c0, c1, c1, c0] };
+                ctx.load_texture("skin-check", ci, egui::TextureOptions::NEAREST_REPEAT)
+            });
+            let tile = 24.0; // 2x2 pixels = 12 pt per checker square
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(stage.width() / tile, stage.height() / tile));
+            painter.image(tex.id(), stage, uv, Color32::WHITE);
         }
     }
-    let painter = ui.painter().with_clip_rect(clip);
     let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
     let tex_after = ed.texture(&ctx, 1, &after);
+    let sx = stage.left() + stage.width() * ed.split;
     match ed.show {
         Show::After => {
             painter.image(tex_after.id(), rect, uv, Color32::WHITE);
@@ -1380,27 +2191,208 @@ fn canvas(ui: &mut Ui, st: &mut Studio) {
         }
         Show::Split => {
             let t = ed.texture(&ctx, 0, &before);
-            let sx = area.left() + area.width() * ed.split;
             let r = Rect::from_center_size(rect.center(), Vec2::new(before.w as f32 * z, before.h as f32 * z));
-            ui.painter().with_clip_rect(Rect::from_min_max(area.min, Pos2::new(sx, area.bottom()))).image(t.id(), r, uv, Color32::WHITE);
-            ui.painter().with_clip_rect(Rect::from_min_max(Pos2::new(sx, area.top()), area.max)).image(tex_after.id(), rect, uv, Color32::WHITE);
-            let h = Rect::from_center_size(Pos2::new(sx, area.center().y), Vec2::new(18.0, area.height()));
-            let hr = ui.interact(h, ui.scope_id().with("sk-split"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-            if hr.dragged() {
-                ed.split = ((sx + hr.drag_delta().x - area.left()) / area.width()).clamp(0.02, 0.98);
+            ui.painter().with_clip_rect(Rect::from_min_max(stage.min, Pos2::new(sx, stage.bottom()))).image(t.id(), r, uv, Color32::WHITE);
+            ui.painter().with_clip_rect(Rect::from_min_max(Pos2::new(sx, stage.top()), stage.max)).image(tex_after.id(), rect, uv, Color32::WHITE);
+            painter.line_segment([Pos2::new(sx, stage.top()), Pos2::new(sx, stage.bottom())], Stroke::new(2.0, Color32::from_rgb(0xff, 0x66, 0xab)));
+            painter.circle_filled(Pos2::new(sx, stage.center().y), 7.0, Color32::from_rgb(0xff, 0x66, 0xab));
+            if stage.width() > 240.0 {
+                let badge_font = FontId::new(12.0, th::semibold());
+                for (lbl, pos, align) in [("Before", Pos2::new(stage.left() + 12.0, stage.top() + 12.0), Align2::LEFT_TOP), ("After", Pos2::new(stage.right() - 12.0, stage.top() + 12.0), Align2::RIGHT_TOP)] {
+                    let g = painter.layout_no_wrap(lbl.to_string(), badge_font.clone(), CONTENT1);
+                    let bsize = g.size() + Vec2::new(14.0, 6.0);
+                    let brect = if align == Align2::LEFT_TOP { Rect::from_min_size(pos, bsize) } else { Rect::from_min_size(Pos2::new(pos.x - bsize.x, pos.y), bsize) };
+                    painter.rect_filled(brect, CornerRadius::same(4), Color32::from_rgba_unmultiplied(0x17, 0x15, 0x1e, 185));
+                    painter.galley(brect.min + Vec2::new(7.0, 3.0), g, CONTENT1);
+                }
             }
-            painter.line_segment([Pos2::new(sx, area.top()), Pos2::new(sx, area.bottom())], Stroke::new(2.0, Color32::from_rgb(0xff, 0x66, 0xab)));
-            painter.circle_filled(Pos2::new(sx, area.center().y), 7.0, Color32::from_rgb(0xff, 0x66, 0xab));
         }
     }
-    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_white_alpha(30)), egui::StrokeKind::Outside);
-    // --- what it is
+    let border_col = if ed.bg == Bg::Light { Color32::from_black_alpha(36) } else { Color32::from_white_alpha(30) };
+    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, border_col), egui::StrokeKind::Outside);
+    // --- bottom status strip
+    ui.painter().rect_filled(status_bar, 0.0, BACKGROUND5);
+    ui.painter().line_segment([status_bar.left_top(), status_bar.right_top()], Stroke::new(1.0, Color32::from_white_alpha(12)));
     let name = ed.current.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let rest = if (before.w, before.h) == (after.w, after.h) { format!("   {} × {} px   {:.0}%", after.w, after.h, z * ppp * 100.0) } else { format!("   {} × {} px  →  {} × {} px   {:.0}%", before.w, before.h, after.w, after.h, z * ppp * 100.0) } + if ed.busy { "   working..." } else { "" };
     let info_font = FontId::new(13.0, FontFamily::Proportional);
-    let rest_w = painter.layout_no_wrap(rest.clone(), info_font.clone(), CONTENT1).size().x;
-    let name = th::fit_text(&painter, &name, &info_font, (area.width() - 32.0 - rest_w).max(40.0));
-    painter.text(Pos2::new(area.left() + 16.0, area.bottom() - 14.0), Align2::LEFT_CENTER, name + &rest, info_font, Color32::from_white_alpha(170));
+    let rest_w = ui.painter().layout_no_wrap(rest.clone(), info_font.clone(), CONTENT1).size().x;
+    let name = th::fit_text(ui.painter(), &name, &info_font, (status_bar.width() - 32.0 - rest_w).max(40.0));
+    ui.painter().text(Pos2::new(status_bar.left() + 16.0, status_bar.center().y), Align2::LEFT_CENTER, name + &rest, info_font, CONTENT2);
+}
+
+/// Live canvas when on the `Create` tab: renders the procedural SDF element with optional osu! alignment guides and combo-color tint preview.
+fn creator_canvas(ui: &mut Ui, st: &mut Studio) {
+    let full = ui.max_rect();
+    let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), 44.0));
+    let area = Rect::from_min_max(Pos2::new(full.left(), bar.bottom()), full.max);
+    let ctx = ui.ctx().clone();
+    let ppp = ctx.pixels_per_point();
+    let ed = &mut st.skin_ed;
+
+    // --- top bar
+    ui.painter().rect_filled(bar, 0.0, BACKGROUND5);
+    let x = std::cell::Cell::new(bar.left() + 12.0);
+    let place = |w: f32| {
+        let r = Rect::from_min_size(Pos2::new(x.get(), bar.top() + 7.0), Vec2::new(w, 30.0));
+        x.set(x.get() + w + 6.0);
+        r
+    };
+    let pill = |ui: &mut Ui, r: Rect, label: &str, on: bool, tip: &str| -> bool {
+        th::pill(ui, r, &format!("cr-p-{label}"), label, on, true, tip)
+    };
+    let zooms: [(&str, f32); 4] = [("100%", 1.0 / ppp), ("200%", 2.0 / ppp), ("400%", 4.0 / ppp), ("800%", 8.0 / ppp)];
+    let is_tinted_kind = ed.creator.doc.kind.is_combo_tinted();
+    #[derive(Clone, Copy)]
+    enum CPill { Fit, Zoom(usize), Back(Bg, &'static str), Boost, Guides, ComboTint }
+    let mut pills: Vec<(CPill, f32, u8, f32)> = vec![
+        (CPill::Fit, 44.0, 0, 0.0),
+        (CPill::Zoom(0), 52.0, 2, 0.0),
+        (CPill::Zoom(1), 52.0, 3, 0.0),
+        (CPill::Zoom(2), 52.0, 4, 0.0),
+        (CPill::Zoom(3), 52.0, 5, 0.0),
+        (CPill::Back(Bg::Dark, "Black"), 52.0, 1, 12.0),
+        (CPill::Back(Bg::Grey, "Gray"), 52.0, 1, 0.0),
+        (CPill::Back(Bg::Light, "Light"), 52.0, 1, 0.0),
+        (CPill::Back(Bg::Check, "Check"), 56.0, 1, 0.0),
+        (CPill::Boost, 56.0, 2, 12.0),
+        (CPill::Guides, 62.0, 0, 6.0),
+    ];
+    if is_tinted_kind {
+        pills.push((CPill::ComboTint, 88.0, 0, 6.0));
+    }
+    let fits = |p: &Vec<(CPill, f32, u8, f32)>| p.iter().map(|q| q.1 + 6.0 + q.3).sum::<f32>() + 48.0 <= bar.width();
+    while !fits(&pills) {
+        let Some(k) = pills.iter().enumerate().filter(|(_, q)| q.2 > 0).max_by_key(|(_, q)| q.2).map(|(k, _)| k) else { break };
+        pills.remove(k);
+    }
+    let combos: Vec<[u8; 3]> = if ed.ini.combos.is_empty() {
+        vec![[255, 192, 0], [0, 202, 0], [18, 124, 255], [242, 24, 57]]
+    } else {
+        ed.ini.combos.clone()
+    };
+    let tint_rgb = combos[ed.creator.combo_idx % combos.len()];
+    for (pk, w, _, gap) in pills {
+        x.set(x.get() + gap);
+        let r = place(w);
+        match pk {
+            CPill::Fit => if pill(ui, r, "Fit", ed.zoom == 0.0, "Fit in view (F or 0)") { ed.zoom = 0.0; ed.pan = Vec2::ZERO; },
+            CPill::Zoom(i) => {
+                let (label, z) = zooms[i];
+                if pill(ui, r, label, (ed.zoom - z).abs() < 1e-3, "Show at this pixel zoom") { ed.zoom = z; ed.pan = Vec2::ZERO; }
+            }
+            CPill::Back(b, label) => if pill(ui, r, label, ed.bg == b, "Canvas background") { ed.bg = b; },
+            CPill::Boost => if pill(ui, r, "Boost", ed.boost, "Amplify dark tones and banding on screen") { ed.boost = !ed.boost; ed.creator_tex = None; },
+            CPill::Guides => if pill(ui, r, "Guides", ed.creator.guides, "Toggle osu! center crosshair and size guide") { ed.creator.guides = !ed.creator.guides; },
+            CPill::ComboTint => {
+                if pill(ui, r, "Combo tint", ed.creator.combo_tint, "Preview osu! combo color multiplication without baking it into the PNG") {
+                    ed.creator.combo_tint = !ed.creator.combo_tint;
+                    ed.creator_tex = None;
+                }
+            }
+        }
+    }
+    if is_tinted_kind && ed.creator.combo_tint && x.get() + 28.0 <= bar.right() - 8.0 {
+        let sw = Rect::from_min_size(Pos2::new(x.get() + 2.0, bar.top() + 10.0), Vec2::splat(24.0));
+        let resp = ui.interact(sw, ui.scope_id().with("cr-combo-cyc"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click to cycle combo color");
+        ui.painter().rect_filled(sw, CornerRadius::same(4), Color32::from_rgb(tint_rgb[0], tint_rgb[1], tint_rgb[2]));
+        ui.painter().rect_stroke(sw, CornerRadius::same(4), Stroke::new(1.5, CONTENT1), egui::StrokeKind::Inside);
+        if resp.clicked() {
+            ed.creator.combo_idx = (ed.creator.combo_idx + 1) % combos.len();
+            ed.creator_tex = None;
+        }
+    }
+
+    // --- stage & rendering
+    let img = ed.creator.ensure_rendered();
+    let (iw, ih) = (img.w as f32, img.h as f32);
+    let stage = Rect::from_min_max(area.min, Pos2::new(area.right(), (area.bottom() - 30.0).max(area.top() + 1.0)));
+    let status_bar = Rect::from_min_max(Pos2::new(area.left(), stage.bottom()), area.max);
+    let fit = ((stage.width() - 40.0) / iw).min((stage.height() - 40.0) / ih).max(0.01);
+    let z0 = if ed.zoom == 0.0 { fit } else { ed.zoom };
+    let resp = ui.interact(stage, ui.scope_id().with("cr-canvas"), Sense::click_and_drag());
+    if resp.dragged() {
+        ed.pan += resp.drag_delta();
+    }
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > 0.1 {
+            let new = (z0 * (scroll * 0.003).exp()).clamp(0.02, 64.0);
+            if let Some(m) = ui.input(|i| i.pointer.hover_pos()) {
+                let c = stage.center() + ed.pan;
+                ed.pan = (m - stage.center()) - (m - c) * (new / z0);
+            }
+            ed.zoom = new;
+        }
+    }
+    let z = if ed.zoom == 0.0 { fit } else { ed.zoom };
+    let rect = Rect::from_center_size(stage.center() + ed.pan, Vec2::new(iw * z, ih * z));
+
+    let painter = ui.painter().with_clip_rect(stage);
+    match ed.bg {
+        Bg::Grey => { painter.rect_filled(stage, 0.0, Color32::from_gray(0x80)); }
+        Bg::Dark => { painter.rect_filled(stage, 0.0, Color32::BLACK); }
+        Bg::Light => { painter.rect_filled(stage, 0.0, Color32::from_gray(0xe6)); }
+        Bg::Check => {
+            let c0 = Color32::from_rgb(0x22, 0x20, 0x29);
+            let c1 = Color32::from_rgb(0x30, 0x2d, 0x3a);
+            let tex = ed.check_tex.get_or_insert_with(|| {
+                let ci = egui::ColorImage { size: [2, 2], source_size: Vec2::new(2.0, 2.0), pixels: vec![c0, c1, c1, c0] };
+                ctx.load_texture("skin-check", ci, egui::TextureOptions::NEAREST_REPEAT)
+            });
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(stage.width() / 24.0, stage.height() / 24.0));
+            painter.image(tex.id(), stage, uv, Color32::WHITE);
+        }
+    }
+
+    let apply_tint = is_tinted_kind && ed.creator.combo_tint;
+    let gen_key = ed.creator.render_gen;
+    let tex = if let Some((k, b, at, rgb, t)) = &ed.creator_tex {
+        if *k == gen_key && *b == ed.boost && *at == apply_tint && (!apply_tint || *rgb == tint_rgb) {
+            t.clone()
+        } else {
+            ed.creator_tex = None;
+            let shown_img = if apply_tint { crate::element_creator::apply_preview_tint(&img, tint_rgb) } else { (*img).clone() };
+            let d = make_display(&shown_img, ed.output);
+            let rgba = if ed.boost { boost_rgba(&d.rgba) } else { d.rgba };
+            let t = ctx.load_texture("cr-preview", egui::ColorImage::from_rgba_premultiplied(d.size, &rgba), egui::TextureOptions::NEAREST);
+            ed.creator_tex = Some((gen_key, ed.boost, apply_tint, tint_rgb, t.clone()));
+            t
+        }
+    } else {
+        let shown_img = if apply_tint { crate::element_creator::apply_preview_tint(&img, tint_rgb) } else { (*img).clone() };
+        let d = make_display(&shown_img, ed.output);
+        let rgba = if ed.boost { boost_rgba(&d.rgba) } else { d.rgba };
+        let t = ctx.load_texture("cr-preview", egui::ColorImage::from_rgba_premultiplied(d.size, &rgba), egui::TextureOptions::NEAREST);
+        ed.creator_tex = Some((gen_key, ed.boost, apply_tint, tint_rgb, t.clone()));
+        t
+    };
+
+    painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+    let border_col = if ed.bg == Bg::Light { Color32::from_black_alpha(36) } else { Color32::from_white_alpha(30) };
+    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, border_col), egui::StrokeKind::Outside);
+
+    // Optional osu! guides: center crosshair + exact 236 px (@2x = 118 px radius) official osu! hitcircle boundary ring
+    if ed.creator.guides {
+        let gc = if ed.bg == Bg::Light { Color32::from_rgba_unmultiplied(0x59, 0x33, 0xcc, 90) } else { Color32::from_rgba_unmultiplied(0x8c, 0x66, 0xff, 90) };
+        let c = rect.center();
+        painter.line_segment([Pos2::new(rect.left(), c.y), Pos2::new(rect.right(), c.y)], Stroke::new(1.0, gc));
+        painter.line_segment([Pos2::new(c.x, rect.top()), Pos2::new(c.x, rect.bottom())], Stroke::new(1.0, gc));
+        if matches!(ed.creator.doc.kind, engine::create::ElementKind::HitCircle | engine::create::ElementKind::HitCircleOverlay | engine::create::ElementKind::ApproachCircle | engine::create::ElementKind::SliderBall) {
+            painter.circle_stroke(c, 118.0 * z, Stroke::new(1.0, gc));
+        }
+    }
+
+    // --- bottom status strip
+    ui.painter().rect_filled(status_bar, 0.0, BACKGROUND5);
+    ui.painter().line_segment([status_bar.left_top(), status_bar.right_top()], Stroke::new(1.0, Color32::from_white_alpha(12)));
+    let stem = ed.creator.doc.name.trim();
+    let stem = if stem.is_empty() { ed.creator.doc.kind.file_stem() } else { stem };
+    let boost_tag = if ed.boost { "   Boost on" } else { "" };
+    let info = format!("{stem}@2x.png   {} × {} px  (1x: {} × {})   {:.0}%{boost_tag}", img.w, img.h, (img.w / 2).max(1), (img.h / 2).max(1), z * ppp * 100.0);
+    let info_font = FontId::new(13.0, FontFamily::Proportional);
+    let shown = th::fit_text(ui.painter(), &info, &info_font, (status_bar.width() - 32.0).max(40.0));
+    ui.painter().text(Pos2::new(status_bar.left() + 16.0, status_bar.center().y), Align2::LEFT_CENTER, shown, info_font, CONTENT2);
 }
 
 #[cfg(test)]
@@ -1622,7 +2614,7 @@ mod tests {
         st.skin_ed.result = Some(Arc::new(img));
         for (w, h) in [(400.0, 300.0), (1280.0, 720.0), (2560.0, 1440.0)] {
             for show in [Show::After, Show::Before, Show::Split] {
-                for bg in [Bg::Grey, Bg::Dark, Bg::Light] {
+                for bg in [Bg::Grey, Bg::Dark, Bg::Light, Bg::Check] {
                     st.skin_ed.show = show;
                     st.skin_ed.bg = bg;
                     let mut raw = egui::RawInput::default();

@@ -167,6 +167,16 @@ mod tests {
     #[test]
     fn nothing_overlaps_or_is_cut_in_the_followpoints_tab() {
         let (ctx, mut st) = studio();
+        // Turn on Outline, Drop shadow, and Debanding so the expanded Look controls are audited at every size.
+        st.settings["outline_on"] = serde_json::json!(true);
+        st.settings["shadow_on"] = serde_json::json!(true);
+        st.settings["deband_on"] = serde_json::json!(true);
+        st.cfg.mod_hr = true;
+        st.cfg.mod_hd = true;
+        st.cfg.cs_override_on = true;
+        st.cfg.cs_override = 4.5;
+        st.cfg.ar_override_on = true;
+        st.cfg.ar_override = 9.5;
         let sv = session();
         let mut all = vec![];
         for size in sizes() {
@@ -181,6 +191,9 @@ mod tests {
                     report(&format!("{}x{} {:?} curves={curves} lane={lane}", size.x, size.y, tab as u8), problems(&shapes, screen, TOLERATED), &mut all);
                 }
             }
+            // Unloaded transport bar state
+            let (shapes, screen) = frame(&ctx, &mut st, size, &SessionView::default());
+            report(&format!("{}x{} unloaded", size.x, size.y), problems(&shapes, screen, TOLERATED), &mut all);
         }
         let lines = unique(all);
         assert!(lines.is_empty(), "{} problems:
@@ -194,6 +207,7 @@ mod tests {
         st.history = (0..4)
             .map(|i| crate::state::HistoryEntry { id: format!("h{i}"), name: format!("Chevron (bold) | 250-ease-in-out fast start slow end | speed 0.917 | shift -100 ms {i}"), when: "2026-11-19 13:10".into(), settings: serde_json::json!({}) })
             .collect();
+        st.hist_confirm = Some(("h0".into(), std::time::Instant::now()));
         st.skins = (0..6).map(|i| (format!("-     # owoTuna {{1.4}} CK # -     - [- # owoTuna {{1.4}} CK # -] (osu!lazer) {i}"), format!("C:/skins/{i}"))).collect();
         st.cfg.skin = st.skins[0].1.clone();
         st.status = "A status line that is much longer than the room that is left for it in the corner of the window, to see what happens".into();
@@ -241,7 +255,7 @@ mod tests {
         let mut all = vec![];
         for size in sizes() {
             st.skin_ed = crate::skin_editor::SkinEditor::default();
-            for page in [SkinPage::Pictures, SkinPage::Edits, SkinPage::Output] {
+            for page in [SkinPage::Pictures, SkinPage::Create, SkinPage::Edits, SkinPage::Scan, SkinPage::Ini, SkinPage::Output] {
                 st.skin_ed.page = page;
                 let (shapes, screen) = frame(&ctx, &mut st, size, &sv);
                 report(&format!("{}x{} empty {}", size.x, size.y, page as u8), problems(&shapes, screen, TOLERATED), &mut all);
@@ -256,7 +270,34 @@ mod tests {
                 let (shapes, screen) = frame(&ctx, &mut st, size, &sv);
                 report(&format!("{}x{} edit {name}", size.x, size.y), problems(&shapes, screen, TOLERATED), &mut all);
             }
-            for page in [SkinPage::Pictures, SkinPage::Output] {
+            // Split view + multiple edit cards + Check bg + Boost + expanded skin.ini + cached backups
+            st.skin_ed.show = crate::skin_editor::Show::Split;
+            st.skin_ed.bg = crate::skin_editor::Bg::Check;
+            st.skin_ed.boost = true;
+            st.skin_ed.dirty = true;
+            st.skin_ed.ini.dirty = true;
+            st.skin_ed.ini.slider_border = Some([255, 255, 255]);
+            st.skin_ed.ini.slider_track_override = Some([16, 16, 24]);
+            st.skin_ed.backups = vec![("a-really-long-backup-file-name-for-audit@2x.png".into(), pic.clone(), pic.clone())];
+            st.skin_ed.ops = vec![engine::edit::Op::Invert, engine::edit::Op::Flip { horizontal: true }];
+            st.skin_ed.page = SkinPage::Edits;
+            let (shapes, screen) = frame(&ctx, &mut st, size, &sv);
+            report(&format!("{}x{} split-multi", size.x, size.y), problems(&shapes, screen, TOLERATED), &mut all);
+            st.skin_ed.scan_report = Some(engine::scan::ScanReport {
+                total_files: 5,
+                skipped_blank: 1,
+                flagged: vec![
+                    engine::scan::ScanItem {
+                        path: pic.clone(),
+                        name: "a-really-long-picture-name-that-is-longer-than-the-list-is-wide@2x.png".into(),
+                        dims: (2880, 1360),
+                        pair_2x: Some(pic.clone()),
+                        issues: vec![engine::scan::Issue { kind: engine::scan::IssueKind::PoorDownscale, label: "Poor 1x downscale (ringing)".into(), detail: "Overshoot".into(), severity: 0.7 }],
+                        suggested_ops: vec![engine::edit::Op::Invert],
+                    },
+                ],
+            });
+            for page in [SkinPage::Pictures, SkinPage::Create, SkinPage::Scan, SkinPage::Ini, SkinPage::Output] {
                 st.skin_ed.page = page;
                 let (shapes, screen) = frame(&ctx, &mut st, size, &sv);
                 report(&format!("{}x{} skin {}", size.x, size.y, page as u8), problems(&shapes, screen, TOLERATED), &mut all);

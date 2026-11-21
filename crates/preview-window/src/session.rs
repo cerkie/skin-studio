@@ -318,12 +318,18 @@ pub struct SessionConfig {
     pub snake_out: bool,
     /// Playback speed, 1.0 = as played.
     pub speed: f32,
+    /// Optional preview overrides for Circle Size (0..10), Approach Rate (0..11), Hard Rock, and Hidden.
+    pub override_cs: Option<f32>,
+    pub override_ar: Option<f32>,
+    pub hard_rock: bool,
+    pub hidden: bool,
     /// Carry on from this map time (and play or pause state) instead of the start, as after a skin change.
     pub resume: Option<(f32, bool)>,
 }
 
 /// Everything about a session that needs no GPU or audio device, so it can be built on a worker thread.
 pub struct Prepared {
+    raw_map: Beatmap,
     map: Arc<Beatmap>,
     skin: Arc<Skin>,
     base: Sheet,
@@ -345,7 +351,10 @@ impl Prepared {
 /// Load the map and skin, rasterize the sheet at the given pixels-per-view-unit and decode the hit sounds.
 pub fn prepare(cfg: SessionConfig, ss: f32) -> Result<Prepared, String> {
     let t = std::time::Instant::now();
-    let map = Arc::new(Beatmap::parse_file(&cfg.map)?);
+    let raw_map = Beatmap::parse_file(&cfg.map)?;
+    let mut mod_map = raw_map.clone();
+    mod_map.override_difficulty(cfg.override_cs, cfg.override_ar, cfg.hard_rock);
+    let map = Arc::new(mod_map);
     let skin = Arc::new(Skin::open(&cfg.skin)?);
     let base = base_sheet(&skin, &map, ss);
     let events = game::hitsound::events(&map);
@@ -363,10 +372,11 @@ pub fn prepare(cfg: SessionConfig, ss: f32) -> Result<Prepared, String> {
     } else {
         Default::default()
     };
-    Ok(Prepared { map, skin, base, ss, samples, events, loops, cfg, load_ms: t.elapsed().as_secs_f64() * 1000.0 })
+    Ok(Prepared { raw_map, map, skin, base, ss, samples, events, loops, cfg, load_ms: t.elapsed().as_secs_f64() * 1000.0 })
 }
 
 pub struct Session {
+    raw_map: Beatmap,
     pub map: Arc<Beatmap>,
     pub skin: Arc<Skin>,
     scene: Scene,
@@ -392,7 +402,7 @@ pub struct Session {
 
 impl Session {
     pub fn finish(p: Prepared, device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat, size: (u32, u32)) -> Session {
-        let Prepared { map, skin, base, ss, samples, events, loops, cfg, load_ms } = p;
+        let Prepared { raw_map, map, skin, base, ss, samples, events, loops, cfg, load_ms } = p;
         let (sheet, follow) = with_follow(&base, &skin, cfg.follow.as_deref());
         let sheet = Arc::new(sheet);
         let mut scene = Scene::new(map.clone(), skin.clone(), sheet.clone(), follow);
@@ -400,6 +410,7 @@ impl Session {
         scene.hit_lighting = cfg.hit_lighting;
         scene.snake_in = cfg.snake_in;
         scene.snake_out = cfg.snake_out;
+        scene.hidden = cfg.hidden;
         let renderer = GameRenderer::new(device, queue, format, size, &sheet.rgba, (sheet.w, sheet.h), &scene.geoms, ss);
         let first = map.objects.first().map(|o| o.time).unwrap_or(0.0);
         let last = map.objects.last().map(|o| o.end_time).unwrap_or(first + 1000.0);
@@ -414,16 +425,9 @@ impl Session {
             a.player.set_speed(cfg.speed.clamp(0.05, 4.0));
             a.speed = cfg.speed.clamp(0.05, 4.0);
         }
-        let info = format!(
-            "{} [{}] | skin {} | {} objects | loaded in {:.0} ms | audio {}",
-            map.title,
-            map.version,
-            skin.name,
-            map.objects.len(),
-            load_ms,
-            if audio.is_some() { format!("on, {n_samples} sounds, {n_events} hit events, {n_loops} loops") } else { "off".into() }
-        );
-        let s = Session { map, skin, scene, base, renderer, frame: Frame::default(), audio, follow: cfg.follow.clone(), built_ss: ss, clock_ms: clock0, start_ms, end_ms, ended: false, playing: cfg.resume.map(|(_, p)| p).unwrap_or(true), offset_ms: cfg.offset_ms, speed: cfg.speed.clamp(0.05, 4.0), info, sprites: 0, sliders: 0 };
+        let _ = (load_ms, n_samples, n_events, n_loops);
+        let info = format_info(&map, &skin);
+        let s = Session { raw_map, map, skin, scene, base, renderer, frame: Frame::default(), audio, follow: cfg.follow.clone(), built_ss: ss, clock_ms: clock0, start_ms, end_ms, ended: false, playing: cfg.resume.map(|(_, p)| p).unwrap_or(true), offset_ms: cfg.offset_ms, speed: cfg.speed.clamp(0.05, 4.0), info, sprites: 0, sliders: 0 };
         if !s.playing {
             if let Some(a) = &s.audio {
                 a.player.pause();
@@ -442,8 +446,17 @@ impl Session {
     }
 
     /// Show a new follow-point animation (or the skin's own when `None`).
+    /// Fast path uploads ONLY the followpoint atlas rows directly into the existing GPU sheet (~1 ms vs ~110 ms).
     pub fn set_follow(&mut self, atlas: Option<Arc<Atlas>>) {
         self.follow = atlas;
+        if let Some(a) = &self.follow {
+            let y0 = self.base.h;
+            if self.renderer.update_sheet_region(y0, &a.rgba, (a.width, a.height)) {
+                let rects = a.frames.iter().map(|f| f.origin.map(|(ox, oy)| Rect { x: ox, y: y0 + oy, w: f.w, h: f.h })).collect();
+                self.scene.follow = Some(FollowFrames { rects, fps: a.fps, ratio: 1.0, ini_set: true, additive: false });
+                return;
+            }
+        }
         let (sheet, ff) = with_follow(&self.base, &self.skin, self.follow.as_deref());
         let sheet = Arc::new(sheet);
         self.renderer.set_sheet(&sheet.rgba, (sheet.w, sheet.h));
@@ -553,6 +566,36 @@ impl Session {
         self.scene.snake_out = snake_out;
     }
 
+    pub fn set_hidden(&mut self, on: bool) {
+        self.scene.hidden = on;
+    }
+
+    /// Update CS/AR/HR live in-memory without re-reading disk or restarting audio.
+    pub fn set_difficulty(&mut self, cs: Option<f32>, ar: Option<f32>, hard_rock: bool) {
+        let old_cs = self.map.cs;
+        let mut mod_map = self.raw_map.clone();
+        mod_map.override_difficulty(cs, ar, hard_rock);
+        let new_cs = mod_map.cs;
+        self.map = Arc::new(mod_map);
+        if matches!(self.skin.style, game::skin::Style::Argon { .. }) && (new_cs - old_cs).abs() > 1e-4 {
+            self.base = base_sheet(&self.skin, &self.map, self.built_ss);
+            let (sheet, ff) = with_follow(&self.base, &self.skin, self.follow.as_deref());
+            let sheet = Arc::new(sheet);
+            self.renderer.set_sheet(&sheet.rgba, (sheet.w, sheet.h));
+            self.scene.sheet = sheet;
+            self.scene.follow = ff;
+        }
+        let mut scene = Scene::new(self.map.clone(), self.skin.clone(), self.scene.sheet.clone(), self.scene.follow.take());
+        scene.cursor_scale = self.scene.cursor_scale;
+        scene.hit_lighting = self.scene.hit_lighting;
+        scene.snake_in = self.scene.snake_in;
+        scene.snake_out = self.scene.snake_out;
+        scene.hidden = self.scene.hidden;
+        self.renderer.set_geoms(&scene.geoms);
+        self.scene = scene;
+        self.info = format_info(&self.map, &self.skin);
+    }
+
     pub fn set_hit_lighting(&mut self, on: bool) {
         self.scene.hit_lighting = on;
     }
@@ -604,4 +647,12 @@ impl Session {
         self.sliders = self.frame.sliders.len();
         self.renderer.render(view, &self.frame, &self.scene.geoms, [0.0, 0.0, 0.0, 1.0]);
     }
+}
+
+fn format_info(map: &Beatmap, skin: &Skin) -> String {
+    let cs = format!("{:.1}", map.cs);
+    let cs = cs.trim_end_matches(".0");
+    let ar = format!("{:.1}", map.ar);
+    let ar = ar.trim_end_matches(".0");
+    format!("{} [{}]\nCS {} · AR {} · {}", map.title, map.version, cs, ar, skin.name)
 }

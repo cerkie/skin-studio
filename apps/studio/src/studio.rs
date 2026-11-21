@@ -57,6 +57,8 @@ pub enum Msg {
     SkinResult(u64, Arc<engine::img::Img>, Vec<(usize, usize)>, Arc<crate::skin_editor::Display>),
     /// A thumbnail of a picture of the skin: the list it belongs to, the file, its size and premultiplied RGBA.
     SkinThumb(u64, PathBuf, [usize; 2], Vec<u8>),
+    SkinScanDone(engine::scan::ScanReport),
+    SkinReloadFiles { msg: String, modified: Vec<PathBuf>, resolved_downscale: Option<PathBuf> },
     /// The hit sound of the picked skin, found and decoded in the background: (the skin and the sound skin it is for, where it is, the sound).
     LogoSound((String, String), Option<PathBuf>, Option<preview_window::sfx::Clip>),
     Frames { frames: Vec<Frame>, atlas: Arc<Atlas>, fps: f32 },
@@ -107,8 +109,10 @@ pub struct Studio {
     pub status_at: std::time::Instant,
     pub regen_pending: bool,
     regen_busy: bool,
+    last_regen: Instant,
     pub map_cs_ar: Option<(f32, f32)>,
     pub history: Vec<HistoryEntry>,
+    pub hist_confirm: Option<(String, Instant)>,
     pub import: ImportState,
     /// Where the animation card is in its loop (ms), how fast it plays, and the last time it moved.
     pub anim_pos: f32,
@@ -188,8 +192,10 @@ impl Studio {
             status_at: std::time::Instant::now(),
             regen_pending: true,
             regen_busy: false,
+            last_regen: Instant::now() - std::time::Duration::from_secs(1),
             map_cs_ar: None,
             history: vec![],
+            hist_confirm: None,
             import: ImportState::default(),
             anim_pos: 0.0,
             logo_tex: None,
@@ -361,6 +367,10 @@ impl Studio {
             snake_in: self.cfg.snake_in,
             snake_out: self.cfg.snake_out,
             speed: self.cfg.speed,
+            override_cs: self.cfg.cs_override_on.then_some(self.cfg.cs_override),
+            override_ar: self.cfg.ar_override_on.then_some(self.cfg.ar_override),
+            hard_rock: self.cfg.mod_hr,
+            hidden: self.cfg.mod_hd,
             resume: None,
         }
     }
@@ -382,11 +392,13 @@ impl Studio {
         template.resume = if keep_same { self.resume } else { None };
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            let r = paths::resolve_map(&spec, if songs.is_empty() { None } else { Some(&songs) }, &library).and_then(|map| {
-                let mut cfg = template;
-                cfg.map = map;
-                session::prepare(cfg, ss)
-            });
+            let r = paths::ensure_skin(&template.skin)
+                .and_then(|_| paths::resolve_map(&spec, if songs.is_empty() { None } else { Some(&songs) }, &library))
+                .and_then(|map| {
+                    let mut cfg = template;
+                    cfg.map = map;
+                    session::prepare(cfg, ss)
+                });
             let _ = tx.send(Msg::Prepared(r));
             ctx.request_repaint();
         });
@@ -402,8 +414,13 @@ impl Studio {
         if !self.regen_pending || self.regen_busy {
             return;
         }
+        // Throttle full 240 fps frame regeneration during an active motion-key drag so rayon doesn't starve the UI thread.
+        if self.motion.is_dragging() && self.last_regen.elapsed() < std::time::Duration::from_millis(65) {
+            return;
+        }
         self.regen_pending = false;
         self.regen_busy = true;
+        self.last_regen = Instant::now();
         let settings = self.settings.clone();
         let cs_ar = self.map_cs_ar;
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
@@ -456,6 +473,20 @@ impl Studio {
                     self.logo_warm = None;
                 }
                 Msg::SkinThumb(gen, path, size, rgba) => self.skin_ed.got_thumb(&self.ctx, gen, path, size, rgba),
+                Msg::SkinScanDone(report) => {
+                    let msg = format!("Scanned {} files · {} flagged", report.total_files, report.flagged.len());
+                    self.skin_ed.scan_running = false;
+                    self.skin_ed.scan_report = Some(report);
+                    self.status = msg;
+                }
+                Msg::SkinReloadFiles { msg, modified, resolved_downscale } => {
+                    self.skin_ed.after_disk_mutation(&modified, resolved_downscale.as_deref(), &self.tx, &self.ctx);
+                    if self.skin_ed.dir.is_some() && self.skin_ed.dir == self.current_skin_folder() {
+                        self.load_session = true;
+                        self.reroll_map = false;
+                    }
+                    self.status = msg;
+                }
                 Msg::HistoryChanged => self.reload_history(),
                 Msg::ImportDone(r) => {
                     self.import.running = false;
@@ -507,6 +538,8 @@ impl Studio {
             },
             PickKind::OpenSettings => match load_settings_file(&p) {
                 Ok(v) => {
+                    // Switching documents: clear undo/redo so Ctrl+Z cannot restore a previous file's JSON under the new path.
+                    self.motion.clear_history();
                     self.settings = v;
                     self.path = Some(p.clone());
                     self.cfg.settings = ps;
@@ -519,6 +552,7 @@ impl Studio {
             },
             PickKind::SaveSettings => self.save_to(p),
             PickKind::CustomImage => {
+                self.motion.remember(&self.settings);
                 self.settings["image"] = json!(ps);
                 // the canvas follows the picture: room to slide across and for blur or outline around it
                 if let Ok(sp) = engine::sources::load_png(&p) {
@@ -643,10 +677,12 @@ impl Studio {
     }
 
     pub fn new_settings(&mut self) {
+        self.motion.remember(&self.settings);
         self.settings = presets::default_settings();
         self.path = None;
         self.bufs.clear();
         self.edited();
+        self.status = "Reset to new settings (Ctrl+Z to undo)".into();
     }
 
     pub fn export(&mut self) {
@@ -654,12 +690,14 @@ impl Studio {
     }
 
     pub fn apply_effect(&mut self, name: &str) {
+        self.motion.remember(&self.settings);
         presets::apply_effect(&mut self.settings, name);
         self.bufs.clear();
         self.edited();
     }
 
     pub fn set_source(&mut self, name: &str) {
+        self.motion.remember(&self.settings);
         state::set_source(&mut self.settings, name);
         self.bufs.clear();
         self.edited();
@@ -688,6 +726,7 @@ impl Studio {
 
     pub fn use_import(&mut self) {
         if let Some(v) = self.import.result.clone() {
+            self.motion.remember(&self.settings);
             self.settings = state::migrate(v);
             self.path = None;
             self.bufs.clear();
@@ -698,6 +737,7 @@ impl Studio {
 
     pub fn load_history(&mut self, id: &str) {
         if let Some(h) = self.history.iter().find(|h| h.id == id).cloned() {
+            self.motion.remember(&self.settings);
             self.settings = state::migrate(h.settings);
             self.path = None;
             self.bufs.clear();
@@ -722,7 +762,9 @@ impl Studio {
 
     /// Set one top-level setting from edited text (and fix up the buffer when it was out of range).
     pub fn set_field(&mut self, id: &str, text: &str) {
+        let before = self.settings.clone();
         if state::set_field(&mut self.settings, id, text) {
+            self.motion.remember_coalesced(&before);
             if id == "fps" && self.settings["fps"].as_f64().unwrap_or(0.0) > engine::settings::MAX_FPS as f64 {
                 self.settings["fps"] = json!(engine::settings::MAX_FPS as f64);
                 self.bufs.remove(id);

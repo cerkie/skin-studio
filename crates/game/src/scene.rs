@@ -222,6 +222,8 @@ pub struct Scene {
     /// lazer's "snaking in" and "snaking out" slider settings (both on by default).
     pub snake_in: bool,
     pub snake_out: bool,
+    /// Hidden mod preview: hides approach circles (after object 0) and fades hit circles out early.
+    pub hidden: bool,
     pub map: Arc<Beatmap>,
     pub skin: Arc<Skin>,
     pub sheet: Arc<Sheet>,
@@ -238,8 +240,8 @@ pub struct Scene {
     pub(crate) overlap: f32,
     pub(crate) overlay_above: bool,
     pub(crate) ball_tint: bool,
-    /// (time, position) keyframes of the autoplay cursor between objects.
-    cursor_keys: Vec<(f32, P)>,
+    /// (time, position, linear_hold) keyframes of osu!lazer's `OsuAutoGenerator` cursor movement between objects.
+    cursor_keys: Vec<(f32, P, bool)>,
 }
 
 const OFF: P = lazer::FIELD_OFF;
@@ -287,6 +289,7 @@ impl Scene {
             hit_lighting: false,
             snake_in: true,
             snake_out: true,
+            hidden: false,
             map,
             skin,
             sheet,
@@ -307,18 +310,51 @@ impl Scene {
         s
     }
 
-    fn build_cursor_keys(&self) -> Vec<(f32, P)> {
-        let mut k: Vec<(f32, P)> = Vec::new();
+    /// Port of osu!lazer's `OsuAutoGenerator` cursor path:
+    /// starts at (256, 500), waits until `start_time - max(0, preempt - 100)` (100 ms reaction time),
+    /// then moves to the next object with `Easing.Out` (fast snap-out, settling on the target).
+    fn build_cursor_keys(&self) -> Vec<(f32, P, bool)> {
+        let mut k: Vec<(f32, P, bool)> = Vec::new();
+        let Some(first) = self.map.objects.first() else { return k };
+        let reaction = 100.0f32;
+        let move_window = (self.preempt - reaction).max(0.0);
+        let mut last_t = first.time - 1500.0;
+        let mut last_p: P = [256.0, 500.0];
+        k.push((last_t, last_p, true));
+
         for o in &self.map.objects {
-            let p = self.map.stacked(o);
-            if matches!(o.kind, Kind::Spinner) {
-                continue;
+            let target_p = if matches!(o.kind, Kind::Spinner) {
+                let a = self.spinner_info(o).cursor_angle(o.time);
+                [256.0 + 50.0 * a.cos(), 192.0 + 50.0 * a.sin()]
+            } else {
+                self.map.stacked(o)
+            };
+            let wait_t = o.time - move_window;
+            if wait_t > last_t {
+                k.push((wait_t, last_p, true));
+                last_t = wait_t;
             }
-            k.push((o.time, p));
-            if let Kind::Slider(_) = o.kind {
-                let e = o.end_pos();
-                let off = [p[0] - o.pos[0], p[1] - o.pos[1]];
-                k.push((o.end_time, [e[0] + off[0], e[1] + off[1]]));
+            if o.time >= last_t {
+                k.push((o.time, target_p, false));
+                last_t = o.time;
+                last_p = target_p;
+            }
+            match &o.kind {
+                Kind::Slider(_) => {
+                    let e = o.end_pos();
+                    let p = self.map.stacked(o);
+                    let off = [p[0] - o.pos[0], p[1] - o.pos[1]];
+                    last_p = [e[0] + off[0], e[1] + off[1]];
+                    last_t = o.end_time;
+                    k.push((last_t, last_p, true));
+                }
+                Kind::Spinner => {
+                    let a = self.spinner_info(o).cursor_angle(o.end_time);
+                    last_p = [256.0 + 50.0 * a.cos(), 192.0 + 50.0 * a.sin()];
+                    last_t = o.end_time;
+                    k.push((last_t, last_p, true));
+                }
+                Kind::Circle => {}
             }
         }
         k
@@ -394,16 +430,17 @@ impl Scene {
         if k.is_empty() {
             return [256.0, 192.0];
         }
-        let i = k.partition_point(|(kt, _)| *kt <= t);
+        let i = k.partition_point(|(kt, _, _)| *kt <= t);
         if i == 0 {
             return k[0].1;
         }
         if i >= k.len() {
             return k[k.len() - 1].1;
         }
-        let ((t0, a), (t1, b)) = (k[i - 1], k[i]);
+        let ((t0, a, _), (t1, b, hold)) = (k[i - 1], k[i]);
         let u = frac(t, t0, t1);
-        let u = u * u * (3.0 - 2.0 * u);
+        // osu!lazer `Easing.Out` (OutQuad): fast initial snap towards the next hit object
+        let u = if hold { u } else { ease_out_quad(u) };
         [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u]
     }
 
@@ -494,12 +531,21 @@ impl Scene {
         let name = if self.has(base) { base } else { "hitcircle" };
         let overlay = format!("{name}overlay");
         let overlay = if self.has(&overlay) { overlay } else if name == base { "hitcircleoverlay".to_string() } else { overlay };
-        let mut alpha = frac(t, appear, appear + self.fade_in);
+        let mut alpha = if self.hidden {
+            let fi = self.preempt * 0.4;
+            let fo = self.preempt * 0.3;
+            frac(t, appear, appear + fi) * (1.0 - frac(t, appear + fi, appear + fi + fo))
+        } else {
+            frac(t, appear, appear + self.fade_in)
+        };
         let mut sc = self.scale;
         let mut num_alpha = 1.0;
         let mut num_scale = 1.0;
         if let Some(h) = hit_at {
             if t >= h {
+                if self.hidden {
+                    return;
+                }
                 let u = frac(t, h, h + 240.0);
                 alpha = 1.0 - u;
                 sc *= 1.0 + 0.4 * ease_out_quad(u);
@@ -636,10 +682,18 @@ impl Scene {
                     if t > end + 900.0 {
                         continue;
                     }
-                    let mut a = frac(t, appear, appear + self.fade_in);
-                    if t > end {
-                        a *= 1.0 - frac(t, end, end + 240.0);
-                    }
+                    let mut a = if self.hidden {
+                        let fi = self.preempt * 0.4;
+                        let fade_in = frac(t, appear, appear + fi);
+                        let fade_out = 1.0 - frac(t, appear + fi, end.max(appear + fi + 1.0));
+                        fade_in * fade_out
+                    } else {
+                        let mut v = frac(t, appear, appear + self.fade_in);
+                        if t > end {
+                            v *= 1.0 - frac(t, end, end + 240.0);
+                        }
+                        v
+                    };
                     // body, snaking in then out on the final span
                     if let Some(g) = &self.geoms[i] {
                         let nseg = g.quads.len();
@@ -674,7 +728,7 @@ impl Scene {
                         }
                         // After the end: a body that has been snaking out fades over 40 ms (lazer: Body.FadeOut(40), measured linear)
                         // on top of the slider's own 240 ms fade; otherwise the full body fades over 240 ms.
-                        if t > end {
+                        if !self.hidden && t > end {
                             let whole = frac(t, appear, appear + self.fade_in) * (1.0 - frac(t, end, end + 240.0));
                             a = if self.snake_out { whole * (1.0 - frac(t, end, end + 40.0)) } else { whole };
                         }
@@ -848,6 +902,9 @@ impl Scene {
         // approach circles above all objects
         let start = out.sprites.len();
         for &i in approaches.iter().rev() {
+            if self.hidden && i > 0 {
+                continue;
+            }
             let o = &map.objects[i];
             if self.argon {
                 self.argon_approach(out, o, map.stacked(o), t, o.time - self.preempt);
